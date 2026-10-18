@@ -874,6 +874,9 @@ def step9_update(
             last_action=control_after_real.last_action,
             q_trace_weights=ctrl_state.q_trace_weights,
             q_trace_bias=ctrl_state.q_trace_bias,
+            step_count=control_after_real.step_count,
+            epsilon=control_after_real.epsilon,
+            step_words=control_after_real.step_words,
         )
         next_ctrl = cast(
             DifferentialSARSAState,
