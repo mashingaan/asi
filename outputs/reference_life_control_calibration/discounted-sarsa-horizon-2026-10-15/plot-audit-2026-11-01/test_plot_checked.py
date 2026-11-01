@@ -31,6 +31,16 @@ def test_indices_include_last_point_once() -> None:
         ("schema", "wrong"),
         ("arm", "gamma_099"),
         ("seed", 101002),
+        ("accepted_events", 1),
+        ("config", {}),
+        (
+            "config",
+            {
+                "gamma": 0.9900000095367432,
+                "lamda": 0.800000011920929,
+                "step_size": 0.014000000432133675,
+            },
+        ),
         ("rewards", [0.0]),
         ("rewards", [2.0] * 20000),
         ("rewards", [float("nan")] * 20000),

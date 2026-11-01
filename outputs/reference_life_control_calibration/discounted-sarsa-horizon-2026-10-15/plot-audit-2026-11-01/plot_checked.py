@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import struct
 from pathlib import Path
 
 SCHEMA = "asi.riverswim_sarsa_discount_horizon.shard.v1"
@@ -35,6 +36,22 @@ def load_records(folder: Path) -> dict[tuple[int, str], list[float]]:
                 raise ValueError(f"{path.name}: unexpected seed")
             if record.get("arm") != arm:
                 raise ValueError(f"{path.name}: unexpected arm")
+            if (
+                type(record.get("accepted_events")) is not int
+                or record["accepted_events"] != HORIZON
+            ):
+                raise ValueError(f"{path.name}: invalid accepted event count")
+            config = record.get("config")
+            expected = {
+                "gamma": 0.9 if arm == "gamma_090" else 0.99,
+                "lamda": 0.8,
+                "step_size": 0.014,
+            }
+            if not isinstance(config, dict) or any(
+                config.get(key) != struct.unpack("f", struct.pack("f", value))[0]
+                for key, value in expected.items()
+            ):
+                raise ValueError(f"{path.name}: unexpected configuration")
             for name in ("actions", "positions", "rewards"):
                 values = record.get(name)
                 if not isinstance(values, list) or len(values) != HORIZON:

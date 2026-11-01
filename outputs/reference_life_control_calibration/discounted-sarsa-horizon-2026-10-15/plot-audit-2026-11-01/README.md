@@ -4,7 +4,8 @@ The frozen `plot.py` is retained byte for byte. This independent supplemental
 entry point addresses review observations without changing the collected data,
 original figure or preregistered experiment.
 
-`plot_checked.py` checks each expected arm and seed, the shard schema, all
+`plot_checked.py` checks each expected arm and seed, the corresponding gamma,
+lambda and step-size configuration, accepted event count, shard schema, all
 three trace lengths and finite numeric rewards in the plotted 0 to 1 range
 before rendering. It uses the fixed 20,000-event panel and rejects other horizons instead of silently drawing
 a misleading axis. Endpoint subsampling includes the last point only once.
