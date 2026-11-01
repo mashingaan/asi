@@ -23,5 +23,5 @@ output directory outside the experiment and record directories:
 
 ```text
 python outputs/reference_life_control_calibration/discounted-sarsa-horizon-2026-10-15/plot-audit-2026-11-01/plot_checked.py --records outputs/reference_life_control_calibration/discounted-sarsa-horizon-2026-10-15 --out /new/outside/path
-python -m pytest outputs/reference_life_control_calibration/discounted-sarsa-horizon-2026-10-15/plot-audit-2026-11-01/test_plot_checked.py -q -o addopts=""
+python -m pytest tests/test_riverswim_discount_plot_checked.py -q -o addopts=""
 ```

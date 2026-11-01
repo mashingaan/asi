@@ -11,8 +11,9 @@ from pathlib import Path
 
 import pytest
 
-HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+REPOSITORY = Path(__file__).resolve().parents[1]
+ROOT = REPOSITORY / "outputs/reference_life_control_calibration/discounted-sarsa-horizon-2026-10-15"
+HERE = ROOT / "plot-audit-2026-11-01"
 spec = importlib.util.spec_from_file_location("plot_checked", HERE / "plot_checked.py")
 plot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plot)
@@ -68,6 +69,7 @@ def test_refuses_frozen_paths() -> None:
 
 
 def test_render_creates_nested_output_and_refuses_overwrite(tmp_path: Path) -> None:
+    pytest.importorskip("matplotlib")
     output = tmp_path / "new" / "nested"
     command = [
         sys.executable,
