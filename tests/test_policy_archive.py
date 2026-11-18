@@ -38,6 +38,20 @@ def test_one_model_and_fixed_snapshot_controls() -> None:
     assert [entry.identity for entry in fixed.entries] == ["a"]
 
 
+@pytest.mark.parametrize("mode", ["one_model", "fixed_snapshot"])
+def test_single_policy_controls_reject_adopted_multi_entry_state(mode: str) -> None:
+    first = _entry("first", (0.0,), 1.0)
+    second = _entry("second", (1.0,), 2.0)
+
+    with pytest.raises(ValueError, match="single-policy control"):
+        BoundedPolicyArchive(
+            byte_budget=1024,
+            min_latent_distance=0.0,
+            mode=mode,  # type: ignore[arg-type]
+            entries=(first, second),
+        )
+
+
 def test_archive_rejects_duplicate_identity() -> None:
     archive = BoundedPolicyArchive(byte_budget=42, min_latent_distance=0.0).add(
         _entry("a", (0.0,), 1.0)
@@ -62,7 +76,85 @@ def test_archive_preflights_host_dimensions() -> None:
         )
 
 
+def test_diverse_archive_retrieves_nearest_latent_deterministically() -> None:
+    first = _entry("first", (0.0, 0.0), 1.0)
+    tied = _entry("tied", (2.0, 0.0), 2.0)
+    archive = BoundedPolicyArchive(
+        byte_budget=1024,
+        min_latent_distance=0.1,
+        entries=(first, tied),
+    )
+
+    assert archive.retrieve_nearest((1.0, 0.0)) is first
+    with pytest.raises(ValueError, match="latent width"):
+        archive.retrieve_nearest((1.0,))
+    with pytest.raises(ValueError, match="finite float"):
+        archive.retrieve_nearest((float("nan"), 0.0))
+
+
+def test_empty_archive_has_no_nearest_policy() -> None:
+    archive = BoundedPolicyArchive(byte_budget=1024, min_latent_distance=0.1)
+    assert archive.retrieve_nearest((0.0, 0.0)) is None
+
+
 def test_protocol_is_nonpromoting() -> None:
     assert POLICY_ARCHIVE_PROTOCOL["paper_revision"] == "arXiv:2604.15414v1"
     assert POLICY_ARCHIVE_PROTOCOL["controls"] == ("one_model", "fixed_snapshot")
     assert POLICY_ARCHIVE_PROTOCOL["scientific_promotion_allowed"] is False
+
+
+@pytest.mark.parametrize(
+    "query,far,near",
+    [
+        ((0.0,), (2e200,), (1e200,)),
+        ((0.0,), (2e-200,), (1e-200,)),
+        ((1e308,), (-1e308,), (-9e307,)),
+        ((1e308, 0.0), (1e308, 2e-200), (1e308, 1e-200)),
+    ],
+)
+def test_nearest_archive_preserves_finite_extreme_distances(query, far, near) -> None:
+    first = _entry("far", far, 1.0)
+    second = _entry("near", near, 1.0)
+    archive = BoundedPolicyArchive(
+        byte_budget=1024, min_latent_distance=0.0, entries=(first, second)
+    )
+    assert archive.retrieve_nearest(query) is second
+
+
+def test_archive_constructor_enforces_equal_latent_width() -> None:
+    narrow = _entry("a", (0.0,), 1.0)
+    wide = _entry("b", (1.0, 2.0), 2.0)
+    with pytest.raises(ValueError, match="all latent descriptors must have equal width"):
+        BoundedPolicyArchive(byte_budget=1024, min_latent_distance=1.0, entries=(narrow, wide))
+
+
+def test_control_modes_accept_varying_latent_widths_across_steps() -> None:
+    one = BoundedPolicyArchive(byte_budget=1024, min_latent_distance=0.0, mode="one_model")
+    one = one.add(_entry("a", (0.0,), 1.0)).add(_entry("b", (1.0, 2.0), 2.0))
+    assert [entry.identity for entry in one.entries] == ["b"]
+
+    fixed = BoundedPolicyArchive(byte_budget=1024, min_latent_distance=0.0, mode="fixed_snapshot")
+    fixed = fixed.add(_entry("a", (0.0,), 1.0)).add(_entry("b", (1.0, 2.0), 2.0))
+    assert [entry.identity for entry in fixed.entries] == ["a"]
+
+
+@pytest.mark.parametrize("scale", [1e-200, 1e200])
+def test_archive_add_preserves_separation_across_scales(scale: float) -> None:
+    first = _entry("first", (0.0,), 1.0)
+    second = _entry("second", (scale,), 2.0)
+    archive = BoundedPolicyArchive(
+        byte_budget=1024, min_latent_distance=scale / 2.0, entries=(first,)
+    )
+    assert archive.add(second).entries == (first, second)
+
+
+@pytest.mark.parametrize("scale", [1e-200, 1e200])
+def test_archive_add_replaces_actual_nearest_across_scales(scale: float) -> None:
+    far = _entry("far", (3.0 * scale,), 1.0)
+    near = _entry("near", (scale,), 2.0)
+    improved = _entry("improved", (0.0,), 3.0)
+    archive = BoundedPolicyArchive(
+        byte_budget=1024, min_latent_distance=2.0 * scale, entries=(far, near)
+    )
+    assert archive.add(improved).entries == (far, improved)
+    assert archive.entries == (far, near)

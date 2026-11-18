@@ -312,6 +312,64 @@ def test_soft_bin_features_are_bounded_local_and_boundary_safe() -> None:
         assert float(features.dense.sum()) == pytest.approx(config.projection_dim)
 
 
+@pytest.mark.parametrize(
+    ("boundary", "field"),
+    [
+        ("sparse_features", "observation"),
+        ("sparse_features", "action"),
+        ("predict", "observation"),
+        ("predict", "action"),
+        ("update", "observation"),
+        ("update", "action"),
+        ("update", "next_observation"),
+        ("scan", "observations"),
+        ("scan", "actions"),
+        ("scan", "next_observations"),
+    ],
+)
+def test_model_rejects_complex_transition_arrays(boundary: str, field: str) -> None:
+    model = SparseFTLWorldModel(
+        SparseFTLWorldModelConfig(
+            observation_dim=1,
+            action_dim=1,
+            projection_dim=2,
+            bins=3,
+        )
+    )
+    state = model.init(jr.key(102))
+    real = jnp.array([0.25], dtype=jnp.float32)
+    complex_value = jnp.array([0.25 + 7.0j], dtype=jnp.complex64)
+
+    with pytest.raises(ValueError, match=rf"{field} must not have a complex dtype"):
+        if boundary == "sparse_features":
+            model.sparse_features(
+                state,
+                complex_value if field == "observation" else real,
+                complex_value if field == "action" else real,
+            )
+        elif boundary == "predict":
+            model.predict(
+                state,
+                complex_value if field == "observation" else real,
+                complex_value if field == "action" else real,
+            )
+        elif boundary == "update":
+            model.update(
+                state,
+                complex_value if field == "observation" else real,
+                complex_value if field == "action" else real,
+                complex_value if field == "next_observation" else real,
+            )
+        else:
+            run_sparse_ftl_world_model(
+                model,
+                state,
+                (complex_value if field == "observations" else real)[None, :],
+                complex_value if field == "actions" else real,
+                (complex_value if field == "next_observations" else real)[None, :],
+            )
+
+
 def test_update_reports_prediction_made_before_observing_target() -> None:
     model = SparseFTLWorldModel(
         SparseFTLWorldModelConfig(
@@ -886,3 +944,30 @@ def test_sparse_ftl_world_model_from_config_rejects_non_dict_config(
         ValueError, match="SparseFTLWorldModel config payload must be an exact dict"
     ):
         SparseFTLWorldModel.from_config(payload)
+
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+@pytest.mark.parametrize("magnitude", [1.5e19, -1.5e19, 1.0, 1e20, float("inf"), float("nan")])
+def test_update_preserves_mean_squared_error_diagnostics(
+    disable_jit: bool, magnitude: float
+) -> None:
+    model = SparseFTLWorldModel(SparseFTLWorldModelConfig(
+        observation_dim=2, action_dim=1, projection_dim=2, bins=3,
+    ))
+    with jax.disable_jit(disable_jit):
+        result = model.update(
+            model.init(jr.key(8)), jnp.zeros(2, dtype=jnp.float32),
+            jnp.zeros(1, dtype=jnp.float32),
+            jnp.full(2, magnitude, dtype=jnp.float32),
+        )
+        if np.isnan(magnitude):
+            assert np.isnan(float(result.squared_error))
+            assert np.isnan(float(result.state.prediction_error_ema))
+        elif abs(magnitude) > 1e19 and abs(magnitude) != 1.5e19:
+            assert np.isinf(float(result.squared_error))
+            assert np.isinf(float(result.state.prediction_error_ema))
+        else:
+            expected = float(np.float32(magnitude)) ** 2
+            assert float(result.squared_error) == pytest.approx(expected, rel=2e-6)
+            assert float(result.state.prediction_error_ema) == pytest.approx(expected, rel=2e-6)

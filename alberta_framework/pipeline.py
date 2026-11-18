@@ -26,6 +26,7 @@ runners.
 from __future__ import annotations
 
 import operator
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, SupportsIndex, cast
@@ -103,19 +104,7 @@ _MAX_CONFIG_SEQUENCE_LENGTH: int = 4096
 _PIPELINE_SCAN_BUDGET = ScanBudget("Step 1-4 pipeline", maximum_steps=10_000)
 _PIPELINE_SCAN_MAX: int = _PIPELINE_SCAN_BUDGET.maximum_steps
 
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_ACTUAL_INT_TYPES: tuple[type, ...] = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 
 def _require_exact_str(name: str, value: object) -> str:
     if type(value) is not str:
@@ -1045,7 +1034,14 @@ class AlbertaPipelineSmokeResult:
 def observation_channel_cumulant_fn(
     n_demons: int, observation_dim: int
 ) -> CumulantFn:
-    """Return a cumulant function that maps demons to observation channels."""
+    """Return a cumulant function that maps demons to observation channels.
+
+    Cumulants are float32 Horde targets, so integer token observations (the
+    associative Step 2 mode) are converted; float32 channels pass unchanged.
+    The pipeline admits only those two observation dtypes; a direct caller
+    passing float64 channels under ``jax_enable_x64`` gets them rounded to
+    float32.
+    """
     n_demons = _require_int("n_demons", n_demons, minimum=1, maximum=_INT32_MAX)
     observation_dim = _require_int(
         "observation_dim", observation_dim, minimum=1, maximum=_INT32_MAX
@@ -1057,7 +1053,7 @@ def observation_channel_cumulant_fn(
         observation: Array, _reward: Array, _terminated: Array
     ) -> Array:
         obs_1d = jnp.atleast_1d(observation)
-        return obs_1d[indices]
+        return obs_1d[indices].astype(jnp.float32)
 
     return cumulant_fn
 
@@ -1365,6 +1361,13 @@ class AlbertaPipeline:
             ).probabilities
         else:
             initial_features = initial_observation
+        # The first features are stored without a runtime gate: a non-finite
+        # value here would make every later update refuse the transition.
+        # Traced values pass through to the update-side gates.
+        if not isinstance(initial_features, jax.core.Tracer) and not bool(
+            jnp.all(jnp.isfinite(initial_features))
+        ):
+            raise ValueError("initial features must contain only finite values")
 
         horde_state = init_step3_state(
             self._horde,
@@ -1573,11 +1576,23 @@ class AlbertaPipeline:
                 dtype=jnp.int32,
             )
             auxiliary_cumulants = horde_cumulants[aux_indices] if aux_indices.size else None
+            # Only the value head's discount is a per-transition control
+            # quantity. Zero it at episode boundaries so the value head does
+            # not bootstrap through termination and the actor eligibility
+            # trace decays to zero; auxiliary GVF demons keep their configured
+            # gammas. At ``terminated == 0.0`` this reproduces the value head's
+            # configured gamma bit-for-bit, so the non-terminal path is
+            # unchanged versus omitting ``discount``.
+            value_gamma = self._horde.horde_spec.gammas[value_index]
+            control_discount = jnp.where(
+                terminated == 0.0, value_gamma, jnp.zeros_like(value_gamma)
+            )
             ac_result = ac.update(
                 ac_state,
                 reward,
                 features,
                 auxiliary_cumulants=auxiliary_cumulants,
+                discount=control_discount,
             )
             new_control_state: SARSAState | HordeActorCriticState = ac_result.state
             q_values_or_policy = ac_result.policy
@@ -1747,6 +1762,7 @@ class AlbertaPipeline:
             if associative_labels is not None
             else jnp.zeros((observations.shape[0],), dtype=jnp.int32)
         )
+        use_upgd_targets = self._config.step2 == "upgd" and upgd_targets is not None
         use_associative_labels = (
             self._config.step2 == "associative" and associative_labels is not None
         )
@@ -1791,7 +1807,7 @@ class AlbertaPipeline:
                 reward_t,
                 terminated_t,
                 cumulants_t,
-                upgd_target_t if self._config.step2 == "upgd" else None,
+                upgd_target_t if use_upgd_targets else None,
                 associative_label_t if use_associative_labels else None,
             )
             return result.state, (
@@ -1803,6 +1819,7 @@ class AlbertaPipeline:
                 result.control_td_error,
             )
 
+        t0 = time.time()
         final_state, outputs = jax.lax.scan(
             step_fn,
             state,
@@ -1823,6 +1840,22 @@ class AlbertaPipeline:
             actions,
             control_td_errors,
         ) = outputs
+        elapsed = time.time() - t0
+        # Keep host-only Horde clocks out of the device scan's scalar narrowing.
+        final_horde = final_state.horde_state.replace(  # type: ignore[attr-defined]
+            birth_timestamp=state.horde_state.birth_timestamp,
+            uptime_s=state.horde_state.uptime_s + elapsed,
+        )
+        final_control = final_state.control_state
+        if self._config.control_mode == "horde_ac":
+            final_control = cast(
+                HordeActorCriticState, final_control
+            ).replace(  # type: ignore[attr-defined]
+                critic_state=final_horde
+            )
+        final_state = final_state.replace(  # type: ignore[attr-defined]
+            horde_state=final_horde, control_state=final_control
+        )
         return AlbertaPipelineArrayResult(
             state=final_state,
             features=features,
@@ -1861,7 +1894,7 @@ def run_pipeline_smoke(
 
     observation_dim = pipeline._observation_dim()  # noqa: SLF001
 
-    data_key, state_key = jr.split(jr.key(seed))
+    data_key, state_key = jr.split(jr.key(seed, impl="threefry2x32"))
     if cfg.step2 == "associative" and cfg.associative is not None:
         observations = jr.randint(
             data_key,

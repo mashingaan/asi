@@ -13,6 +13,7 @@ from alberta_framework.benchmarks.bimu import (
     BiMUConfig,
     BiMUState,
     _apply_gradient,
+    _layer_normalize,
     _state_sha256,
     bimu_update,
     bimu_update_transaction,
@@ -119,6 +120,42 @@ def test_binary_and_concrete_samples_are_explicit_and_reproducible() -> None:
     assert bool(jnp.all(jnp.abs(concrete) < 1.0))
     derivative = jax.grad(lambda x: concrete_binary_weights(x, key, temperature=0.7).sum())(natural)
     assert bool(jnp.all(jnp.isfinite(derivative)))
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_layer_normalize_preserves_large_finite_signals(*, compiled: bool) -> None:
+    normalize = jax.jit(_layer_normalize) if compiled else _layer_normalize
+    maximum = np.finfo(np.float32).max
+
+    equal = normalize(jnp.asarray([maximum, maximum], dtype=jnp.float32))
+    centered = normalize(jnp.asarray([-maximum, maximum], dtype=jnp.float32))
+
+    np.testing.assert_array_equal(equal, jnp.zeros(2, dtype=jnp.float32))
+    np.testing.assert_allclose(centered, jnp.asarray([-1.0, 1.0], dtype=jnp.float32))
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_layer_normalize_keeps_relative_magnitudes_at_huge_scale(
+    *, compiled: bool
+) -> None:
+    # The fallback path rescales by the maximum magnitude before
+    # normalizing. Past ~8.5e37 the rescale divides by a scale whose
+    # reciprocal is subnormal, and XLA:CPU flushes it to zero, so every
+    # non-maximum entry collapses to 0 and the fallback normalizes
+    # [+-1, 0, 0, ...] instead of the input. The reference is the float64
+    # layer norm of the same values.
+    normalize = jax.jit(_layer_normalize) if compiled else _layer_normalize
+    for raw in ([2e38, 1e38, 5e37, -1e38], [2e38, 1e38, 5e37]):
+        values = jnp.asarray(raw, dtype=jnp.float32)
+        reference = np.asarray(raw, dtype=np.float64)
+        centered = reference - reference.mean()
+        expected = centered / np.sqrt(np.mean(centered**2) + 1e-5)
+        np.testing.assert_allclose(
+            np.asarray(normalize(values), dtype=np.float64),
+            expected,
+            rtol=1e-5,
+            atol=1e-6,
+        )
 
 
 def test_mechanism_off_removes_only_controlled_forgetting() -> None:
@@ -299,6 +336,17 @@ def test_receipt_derives_metrics_and_disclaims_unverifiable_digests() -> None:
     reported_identity = deepcopy(payload)
     reported_identity["dataset_sha256"] = "0" * 64
     validate_bimu_result(reported_identity)
+
+
+def test_validator_binds_zero_threshold_to_all_label_queries() -> None:
+    payload = run_bimu_development(*_tiny_data(), config=_tiny_config(), seed=37)
+    forged = deepcopy(payload)
+    forged["counters"]["label_queries"] = 0
+    forged["counters"]["optimizer_updates"] = 0
+    forged["counters"]["model_forward_queries"] = 90
+
+    with pytest.raises(ValueError, match="zero query threshold"):
+        validate_bimu_result(forged)
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Iterator, Mapping
 
+import jaxlib
 import pytest
 
 from alberta_framework.benchmarks import development_provenance as provenance
@@ -28,7 +29,12 @@ def test_registry_sha256_rejects_oversized_list_before_dump_hang() -> None:
     started = time.perf_counter()
     with pytest.raises(ValueError, match="collection limit"):
         provenance.registry_sha256(payload)
-    assert time.perf_counter() - started < 0.25
+    # Not a latency contract: gate removal is message-pinned — without the
+    # collection gate the dumps output hits the byte-limit gate, which raises
+    # a different error than the matched "collection limit". The ungated
+    # dumps walk itself measures <1 ms; this budget is an anti-runaway guard
+    # only (same contention class as run 36962287499).
+    assert time.perf_counter() - started < 5.0
 
 
 def test_registry_sha256_accepts_bounded_list_and_mapping() -> None:
@@ -84,3 +90,23 @@ def test_collect_development_identity_hashes_bounded_registries() -> None:
     )
     assert identity.workload_registry_sha256 == provenance.registry_sha256(workload)
     assert identity.paper_registry_sha256 == provenance.registry_sha256(papers)
+
+
+def test_collect_development_identity_binds_jaxlib_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def collect() -> provenance.DevelopmentIdentity:
+        return provenance.collect_development_identity(
+            lane_module=provenance,
+            dependency_modules=(),
+            workload_registry=(),
+            paper_registry=(),
+        )
+
+    original = collect()
+    monkeypatch.setattr(jaxlib, "__version__", "different-compiled-runtime")
+    changed = collect()
+
+    assert dict(original.dependency_versions)["jaxlib"] != "different-compiled-runtime"
+    assert dict(changed.dependency_versions)["jaxlib"] == "different-compiled-runtime"
+    assert changed != original

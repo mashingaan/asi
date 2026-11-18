@@ -303,11 +303,13 @@ def _atomic_publish(path: Path, writer: Callable[[BinaryIO], None]) -> None:
             os.fsync(stream.fileno())
         os.link(temporary, path)
         published = True
-        directory_descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
+        if os.name != "nt":
+            # Windows cannot open directory handles through os.open().
+            directory_descriptor = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
     except BaseException:
         if published:
             path.unlink(missing_ok=True)
@@ -336,6 +338,9 @@ def run_and_publish(
         raise ValueError("mode must be stationary, carried, or full")
     if tasks <= 0:
         raise ValueError("n_tasks must be positive")
+    artifact_path = output_dir / f"{tag}_seed{seed}.npz"
+    if artifact_path.exists():
+        raise FileExistsError(f"refusing to replace {tag} seed {seed} in {output_dir}")
     per_step, per_task, wall_seconds, provenance = run_arm_per_step(
         spec_name, seed, tasks, permutation_mode
     )

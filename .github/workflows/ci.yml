@@ -26,6 +26,14 @@ env:
   XLA_PYTHON_CLIENT_PREALLOCATE: "false"
 
 jobs:
+  triage-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify triage review and merge guards
+        run: python3 .github/tests/test_triage_reviewed_head.py
+
   package:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -186,7 +194,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, windows-latest]
+        os: [macos-15, windows-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -233,6 +241,16 @@ jobs:
             tests/test_step12_production.py::test_step12_narrows_original_real_directly_without_double_rounding \
             tests/test_actor_critic.py::test_actor_critic_update_is_jittable \
             tests/test_action_conditioned_world_model.py::test_action_conditioned_world_model_update_and_prediction_shapes \
+            tests/test_actual_int_types_closure.py \
+            tests/test_behavior_model.py::test_compiled_predict_probabilities_stay_finite_after_large_scale_update \
+            tests/test_behavior_model.py::test_compiled_input_loss_gradient_stays_valid_after_large_scale_update \
+            tests/test_behavior_model.py::test_compiled_follow_up_update_applies_after_large_scale_update \
+            tests/test_behavior_model.py::test_compiled_sample_action_follows_learned_policy_after_large_scale_update \
+            tests/test_behavior_model.py::test_compiled_helpers_match_eager_at_issue_onset_scale \
+            tests/test_behavior_model.py::test_compiled_helpers_stay_finite_when_logit_distance_overflows \
+            tests/test_behavior_model.py::test_opposite_extreme_logits_keep_eager_finiteness_at_moderate_temperature \
+            tests/test_behavior_model.py::test_input_loss_gradient_stays_valid_for_opposite_extreme_logits \
+            tests/test_ipmnist_campaign_tools.py::test_ceiling_publication_refuses_to_replace_existing_bytes \
             -q \
             -o addopts="" \
             --strict-config \
@@ -398,7 +416,7 @@ jobs:
     # A superseded run must terminate instead of scheduling this aggregate
     # after its dependencies were cancelled. Failures still reach the jq gate.
     if: ${{ !cancelled() }}
-    needs: [package, robot-floor, portability, lint, test-plan, test]
+    needs: [triage-contract, package, robot-floor, portability, lint, test-plan, test]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

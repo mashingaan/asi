@@ -44,12 +44,21 @@ contribution via outgoing-weight magnitudes; the gradient form here
 is mathematically related (via the chain rule) and is what the
 original Dohare implementation uses in practice.
 
+Ranking uses the paper's Eq. 8 warm-up debias,
+``u_hat_l[i] = u_l[i] / (1 - decay ** age_l[i])``, exactly as the released
+reference does (``lop/algos/gnt.py``: ``bias_correction = 1 -
+self.decay_rate ** self.ages[layer_idx]``, then ``topk`` over
+``bias_corrected_util``). The ``age`` exponent is per unit and every replaced
+unit restarts at ``age = 0``, so this correction does not cancel across units:
+ranking on the raw EMA understates recently reset units and re-replaces them.
+
 Replacement
 -----------
 On every step, ``replacement_rate * num_mature_units`` fractional
 replacements accrue per layer (units younger than ``maturity_threshold``
 earn no budget), and at most one accumulated replacement is delivered per
-step: the mature unit with the lowest utility in the layer is replaced. Replaced units have their
+step: the mature unit with the lowest bias-corrected utility in the layer is
+replaced. Replaced units have their
 incoming weights re-drawn via :func:`sparse_init` and their outgoing
 weights zeroed (so a freshly initialized unit does not destabilize the
 prediction immediately). The unit's age and utility are reset to 0.
@@ -81,6 +90,7 @@ from jaxtyping import Float, Int
 from alberta_framework.core._float32_scalars import (
     validated_float32_scalar_with_ratio,
 )
+from alberta_framework.core.baseline_optimizers import AdamParamState
 from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.multi_head_learner import (
     MULTI_HEAD_MLP_STATE_SCHEMA,
@@ -89,9 +99,13 @@ from alberta_framework.core.multi_head_learner import (
     MultiHeadMLPState,
     MultiHeadMLPUpdateResult,
 )
-from alberta_framework.core.normalizers import Normalizer
+from alberta_framework.core.normalizers import (
+    Normalizer,
+    _saturating_int32_counter_increment,
+)
 from alberta_framework.core.optimizers import Bounder
 from alberta_framework.core.types import TraceMode
+from alberta_framework.core.update_safety import neutralize_array, select_transaction
 
 _NUMPY_FLOAT_SCALAR_TYPES = frozenset((np.float16, np.float32, np.float64, np.longdouble))
 _NUMPY_INTEGER_SCALAR_TYPES = frozenset(
@@ -137,20 +151,9 @@ _CBP_SINGLE_CONFIG_FIELDS = _CBP_MULTI_CONFIG_FIELDS - {
     "per_head_gamma_lamda",
 }
 _INT32_MAX = 2**31 - 1
+_FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 _ACTUAL_INT_TYPES: frozenset[type] = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
+    {int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")}
 )
 _ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
     {float, Fraction, *(np.dtype(c).type for c in ("e", "f", "d", "g"))}
@@ -332,6 +335,37 @@ class ContinualBackpropState:
 # =============================================================================
 
 
+def _per_element_adam_steps(mlp_state: Any) -> Any:
+    """Give every Adam state one bias-correction step count per parameter.
+
+    A replaced unit's Adam moments restart at zero.  With one shared step
+    count, bias correction then treats those fresh moments as the learner's
+    age, so the unit's first steps miss Adam's nominal size (0.71x after 50
+    updates, 2.5x after 1000, rising toward 5x over the next steps).  A
+    per-element count lets replacement reset the unit's count with its
+    moments, as in the reference CBP Adam.  Adam's update is elementwise in
+    the count, so until a replacement occurs a broadcast count changes the
+    steps only by float32 rounding of the bias-correction power.
+    """
+
+    def expand(leaf: Any) -> Any:
+        if type(leaf) is not AdamParamState or leaf.t.shape == leaf.m.shape:
+            return leaf
+        return leaf.replace(t=jnp.full(leaf.m.shape, leaf.t, dtype=leaf.t.dtype))  # type: ignore[attr-defined]
+
+    def is_adam(leaf: Any) -> bool:
+        return type(leaf) is AdamParamState
+
+    return mlp_state.replace(
+        trunk_optimizer_states=jax.tree_util.tree_map(
+            expand, mlp_state.trunk_optimizer_states, is_leaf=is_adam
+        ),
+        head_optimizer_states=jax.tree_util.tree_map(
+            expand, mlp_state.head_optimizer_states, is_leaf=is_adam
+        ),
+    )
+
+
 def init_cbp_state(
     mlp_state: MultiHeadMLPState,
     hidden_sizes: tuple[int, ...],
@@ -431,7 +465,7 @@ def update_utility(
 
         u_l[i] <- decay * u_l[i] + (1 - decay) * |a_l[i] * g_l[i]|
 
-    Also increments every unit's age by 1.
+    Also saturating-increments every unit's int32 age.
 
     Args:
         cbp_state: Current CBP state.
@@ -471,7 +505,7 @@ def update_utility(
         u_new = decayed + (1.0 - decay) * contribution
         u_new = jnp.where(contribution_finite, u_new, cbp_state.utilities[i])
         new_utilities.append(u_new)
-        new_ages.append(cbp_state.ages[i] + 1)
+        new_ages.append(_saturating_int32_counter_increment(cbp_state.ages[i]))
 
     return cbp_state.replace(  # type: ignore[attr-defined]
         utilities=tuple(new_utilities),
@@ -479,25 +513,49 @@ def update_utility(
     )
 
 
+def _bias_corrected_utility(utility: Array, age: Array, decay_rate: float) -> Array:
+    """Return the warm-up-debiased utility EMA of Dohare et al. 2024, Eq. 8.
+
+    ``u_hat[i] = u[i] / (1 - decay ** age[i])``. The ``age`` exponent is
+    per unit, so the correction does not cancel across units: every replaced
+    unit restarts its EMA at 0 with ``age = 0``, and without the correction a
+    recently reset unit reads systematically lower than an equally useful
+    long-lived one.
+
+    ``1 - decay ** age`` is 0 only at ``age == 0`` (and for ``decay == 0`` it
+    is 1 for every ``age >= 1``). Age-0 units are never eligible for
+    replacement unless ``maturity_threshold == 0``; the denominator is floored
+    at the smallest positive normal float32 so that case stays finite instead
+    of producing NaN.
+    """
+    decay = jnp.asarray(decay_rate, dtype=jnp.float32)
+    correction = 1.0 - decay ** age.astype(jnp.float32)
+    return utility / jnp.maximum(correction, _FLOAT32_MIN_NORMAL)
+
+
 def _select_replacement_index(
     utility: Array,
     age: Array,
     maturity_threshold: int,
+    decay_rate: float,
 ) -> tuple[Array, Array]:
     """Pick the index of the lowest-utility mature unit, if any.
 
-    A unit is "mature" iff ``age >= maturity_threshold``. Among mature
-    units we pick the one with the smallest utility. If no mature unit
-    exists, ``selected`` is ``-1`` (sentinel) and ``has_candidate`` is
-    ``False``.
+    A unit is "mature" iff ``age >= maturity_threshold``. Among mature units
+    we pick the one with the smallest **bias-corrected** utility
+    (:func:`_bias_corrected_utility`). If no mature unit exists, ``selected``
+    is ``-1`` (sentinel) and ``has_candidate`` is ``False``.
 
     Implementation: replace the utility of immature or non-finite units
     with ``+inf`` before taking ``argmin`` so they are never chosen.
+    Eligibility is decided on the raw EMA's finiteness so the existing
+    NaN/inf fail-closed behaviour is unchanged.
 
     Args:
-        utility: Per-unit utility array, shape ``(num_units,)``.
+        utility: Per-unit raw utility EMA, shape ``(num_units,)``.
         age: Per-unit age array (same shape).
         maturity_threshold: Minimum age for eligibility.
+        decay_rate: Utility EMA decay ``eta``, used for the warm-up debias.
 
     Returns:
         Tuple ``(index, has_candidate)`` where ``index`` is the chosen
@@ -505,7 +563,20 @@ def _select_replacement_index(
     """
     mature = age >= jnp.asarray(maturity_threshold, dtype=age.dtype)
     eligible = mature & jnp.isfinite(utility)
-    masked_utility = jnp.where(eligible, utility, jnp.inf)
+    corrected = _bias_corrected_utility(utility, age, decay_rate)
+    finite_corrected = eligible & jnp.isfinite(corrected)
+    # Recover the ordering only when every eligible debiased score overflows.
+    # A common positive scale leaves the per-unit bias correction intact.
+    # Scale by an exact power of two: XLA lowers u / scale to u * (1 / scale),
+    # and 1 / scale flushes to zero for scale > 2**126.
+    scale = jnp.max(jnp.where(eligible, jnp.abs(utility), 0.0))
+    _, scale_exponent = jnp.frexp(scale)
+    scaled = _bias_corrected_utility(
+        jnp.ldexp(utility, -scale_exponent), age, decay_rate
+    )
+    corrected = jnp.where(jnp.any(finite_corrected), corrected, scaled)
+    eligible = eligible & jnp.isfinite(corrected)
+    masked_utility = jnp.where(eligible, corrected, jnp.inf)
     has_candidate = jnp.any(eligible)
     idx = jnp.argmin(masked_utility)
     selected = jnp.where(has_candidate, idx, jnp.int32(-1))
@@ -520,6 +591,8 @@ def _replace_one_unit(
     mlp_state: MultiHeadMLPState,
     cbp_state: ContinualBackpropState,
     key: Array,
+    optimizer: AnyOptimizer | None = None,
+    head_optimizer: AnyOptimizer | None = None,
 ) -> tuple[MultiHeadMLPState, ContinualBackpropState]:
     """Re-initialize a single hidden unit in trunk layer ``layer_idx``.
 
@@ -533,6 +606,12 @@ def _replace_one_unit(
         weight matrix.
     * Reset CBP ``utilities[layer_idx][unit_idx]`` and
       ``ages[layer_idx][unit_idx]`` to 0.
+    * When ``optimizer`` is given, rebuild the replaced unit's optimizer
+      state and eligibility traces so the fresh unit does not inherit the
+      dead unit's adaptation history: the incoming row (and its bias
+      entry) and the zeroed outgoing column are reset to the optimizer's
+      ``init_for_shape`` values, and their traces to zero. Scalar leaves
+      (shared values like a meta step-size) stay untouched.
 
     Args:
         layer_idx: Hidden layer index (Python int, used in indexing
@@ -543,6 +622,10 @@ def _replace_one_unit(
         mlp_state: Current learner state.
         cbp_state: Current CBP state.
         key: PRNG key for sampling new weights.
+        optimizer: The learner's per-parameter trunk optimizer; ``None``
+            leaves optimizer state and traces untouched.
+        head_optimizer: The separate head optimizer when the learner has
+            one; ``None`` falls back to ``optimizer`` for head columns.
 
     Returns:
         Updated ``(mlp_state, cbp_state)``.
@@ -594,9 +677,79 @@ def _replace_one_unit(
         weights=tuple(new_head_weights),
     )
 
+    new_trunk_traces = list(mlp_state.trunk_traces)
+    new_trunk_opt_states = list(mlp_state.trunk_optimizer_states)
+    new_head_traces = list(mlp_state.head_traces)
+    new_head_opt_states = list(mlp_state.head_optimizer_states)
+    if optimizer is not None:
+        row_mask = (
+            jnp.arange(fan_out, dtype=jnp.int32) == unit_idx
+        ) & has_candidate
+
+        def _reset_masked(tree: Any, fresh: Any, mask: Array, axis: int) -> Any:
+            def leaf(value: Array, fresh_value: Array) -> Array:
+                if value.ndim == 0:
+                    return value
+                if value.ndim == 2:
+                    selector = mask[:, None] if axis == 0 else mask[None, :]
+                else:
+                    selector = mask
+                return jnp.where(selector, fresh_value, value)
+
+            return jax.tree_util.tree_map(leaf, tree, fresh)
+
+        fresh_w_opt = optimizer.init_for_shape((fan_out, fan_in))
+        fresh_b_opt = optimizer.init_for_shape((fan_out,))
+        new_trunk_opt_states[2 * layer_idx] = _reset_masked(
+            new_trunk_opt_states[2 * layer_idx], fresh_w_opt, row_mask, 0
+        )
+        new_trunk_opt_states[2 * layer_idx + 1] = _reset_masked(
+            new_trunk_opt_states[2 * layer_idx + 1], fresh_b_opt, row_mask, 0
+        )
+        new_trunk_traces[2 * layer_idx] = jnp.where(
+            row_mask[:, None], 0.0, new_trunk_traces[2 * layer_idx]
+        )
+        new_trunk_traces[2 * layer_idx + 1] = jnp.where(
+            row_mask, 0.0, new_trunk_traces[2 * layer_idx + 1]
+        )
+        if layer_idx < n_layers - 1:
+            next_shape = mlp_state.trunk_params.weights[layer_idx + 1].shape
+            col_mask = (
+                jnp.arange(next_shape[1], dtype=jnp.int32) == unit_idx
+            ) & has_candidate
+            fresh_next_opt = optimizer.init_for_shape(next_shape)
+            new_trunk_opt_states[2 * (layer_idx + 1)] = _reset_masked(
+                new_trunk_opt_states[2 * (layer_idx + 1)], fresh_next_opt, col_mask, 1
+            )
+            new_trunk_traces[2 * (layer_idx + 1)] = jnp.where(
+                col_mask[None, :], 0.0, new_trunk_traces[2 * (layer_idx + 1)]
+            )
+        else:
+            head_opt = optimizer if head_optimizer is None else head_optimizer
+            for h in range(len(new_head_opt_states)):
+                head_shape = mlp_state.head_params.weights[h].shape
+                col_mask = (
+                    jnp.arange(head_shape[1], dtype=jnp.int32) == unit_idx
+                ) & has_candidate
+                fresh_head_opt = head_opt.init_for_shape(head_shape)
+                head_w_opt, head_b_opt = new_head_opt_states[h]
+                new_head_opt_states[h] = (
+                    _reset_masked(head_w_opt, fresh_head_opt, col_mask, 1),
+                    head_b_opt,
+                )
+                head_w_trace, head_b_trace = new_head_traces[h]
+                new_head_traces[h] = (
+                    jnp.where(col_mask[None, :], 0.0, head_w_trace),
+                    head_b_trace,
+                )
+
     new_mlp_state = mlp_state.replace(  # type: ignore[attr-defined]
         trunk_params=new_trunk_params,
         head_params=new_head_params,
+        trunk_traces=tuple(new_trunk_traces),
+        trunk_optimizer_states=tuple(new_trunk_opt_states),
+        head_traces=tuple(new_head_traces),
+        head_optimizer_states=tuple(new_head_opt_states),
     )
 
     # ---- Reset CBP utility & age for the replaced unit. ----
@@ -624,6 +777,8 @@ def maybe_replace_units(
     cbp_state: ContinualBackpropState,
     config: ContinualBackpropConfig,
     sparsity: float,
+    optimizer: AnyOptimizer | None = None,
+    head_optimizer: AnyOptimizer | None = None,
 ) -> tuple[MultiHeadMLPState, ContinualBackpropState]:
     """Possibly replace one low-utility, mature unit per hidden layer.
 
@@ -642,7 +797,7 @@ def maybe_replace_units(
         Updated ``(mlp_state, cbp_state)``.
     """
     new_mlp_state, new_cbp_state, _replaced = replace_units_with_flags(
-        mlp_state, cbp_state, config, sparsity
+        mlp_state, cbp_state, config, sparsity, optimizer, head_optimizer
     )
     return new_mlp_state, new_cbp_state
 
@@ -652,6 +807,8 @@ def replace_units_with_flags(
     cbp_state: ContinualBackpropState,
     config: ContinualBackpropConfig,
     sparsity: float,
+    optimizer: AnyOptimizer | None = None,
+    head_optimizer: AnyOptimizer | None = None,
 ) -> tuple[MultiHeadMLPState, ContinualBackpropState, Array]:
     """Run :func:`maybe_replace_units` and also return the per-layer replacement flags.
 
@@ -682,11 +839,13 @@ def replace_units_with_flags(
         accum = accum_arr[layer_idx] + rate * n_eligible
         # Will we replace one unit this step?
         do_replace = accum >= 1.0
-        # Pick lowest-utility mature unit from the *current* CBP state.
+        # Pick the mature unit with the lowest bias-corrected utility from the
+        # *current* CBP state.
         unit_idx, has_candidate = _select_replacement_index(
             new_cbp_state.utilities[layer_idx],
             new_cbp_state.ages[layer_idx],
             config.maturity_threshold,
+            config.decay_rate,
         )
         # Only replace if we both budgeted for it AND found a mature unit.
         gated = jnp.logical_and(do_replace, has_candidate)
@@ -699,6 +858,8 @@ def replace_units_with_flags(
             new_mlp_state,
             new_cbp_state,
             subkey,
+            optimizer,
+            head_optimizer,
         )
         # Decrement accumulator only if we actually replaced, and never carry
         # more than the one replacement a step can deliver.
@@ -1055,7 +1216,7 @@ class CBPMultiHeadMLPLearner:
             Initial :class:`CBPMultiHeadMLPState`.
         """
         mlp_key, cbp_key = jr.split(key)
-        mlp_state = self._learner.init(feature_dim, mlp_key)
+        mlp_state = _per_element_adam_steps(self._learner.init(feature_dim, mlp_key))
         cbp_state = init_cbp_state(mlp_state, self._hidden_sizes, cbp_key)
         return CBPMultiHeadMLPState(  # type: ignore[call-arg]
             mlp_state=mlp_state,
@@ -1192,12 +1353,17 @@ class CBPMultiHeadMLPLearner:
             new_cbp_state,
             self._cbp_config,
             self._sparsity,
+            self._learner.optimizer,
+            self._learner.head_optimizer,
         )
 
         new_state = CBPMultiHeadMLPState(  # type: ignore[call-arg]
             mlp_state=new_post_state,
             cbp_state=new_cbp_state,
         )
+        # Feature replacement belongs to the underlying learner's transaction.
+        new_state = select_transaction(mlp_result.update_applied, new_state, state)
+        replacements_made = neutralize_array(mlp_result.update_applied, replacements_made)
 
         return CBPUpdateResult(  # type: ignore[call-arg]
             state=new_state,
@@ -1410,9 +1576,16 @@ def run_cbp_learning_loop(
     final_state, (per_head_metrics, replacements_made) = jax.lax.scan(
         step_fn, state, (obs_array, tgt_array)
     )
+    jax.block_until_ready(  # type: ignore[no-untyped-call]
+        (final_state, per_head_metrics, replacements_made)
+    )
     elapsed = time.time() - t0
+    # The scan carries host clocks through the jitted update and narrows them
+    # to float32. Restore the incoming Python values and add this scan's time
+    # to the host uptime base.
     final_mlp = final_state.mlp_state.replace(  # type: ignore[attr-defined]
-        uptime_s=final_state.mlp_state.uptime_s + elapsed
+        birth_timestamp=state.mlp_state.birth_timestamp,
+        uptime_s=state.mlp_state.uptime_s + elapsed,
     )
     final_state = final_state.replace(mlp_state=final_mlp)  # type: ignore[attr-defined]
 

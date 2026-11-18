@@ -196,13 +196,20 @@ def _record_vector(
     return array
 
 
+def _compensated_total(values: NDArray[np.float64]) -> float | Fraction:
+    try:
+        return math.fsum(float(value) for value in values)
+    except OverflowError:
+        # A finite mean (or a cancelling total) may have an unrepresentable
+        # intermediate sum. Keep the original binary values exact on that path.
+        return sum((Fraction.from_float(float(value)) for value in values), Fraction())
+
+
 def _scale_safe_mean(values: NDArray[np.float64], *, name: str) -> float:
     if values.size == 0 or np.any(~np.isfinite(values)):
         raise ValueError(f"{name} must contain finite values")
-    scale = float(np.max(np.abs(values)))
-    if scale == 0.0:
-        return 0.0
-    result = float(np.mean(values / scale) * scale)
+    # Scaling first can erase a small residual beside cancelling large rewards.
+    result = float(_compensated_total(values) / values.size)
     if not math.isfinite(result):
         raise ValueError(f"{name} mean must remain finite")
     return result
@@ -338,6 +345,8 @@ def _performance_matrix(
         raise ValueError("performance_matrix must have shape (checkpoints, tasks)")
     if matrix.shape[0] < 1 or matrix.shape[1] < 1:
         raise ValueError("performance_matrix must be non-empty")
+    if np.any(np.isinf(matrix)):
+        raise ValueError("performance_matrix has an infinite evaluation")
     return matrix
 
 
@@ -383,6 +392,14 @@ def _task_trajectories(
     return matrix, rows, trajectories
 
 
+def _finite_metric_difference(left: float, right: float, *, name: str) -> float:
+    """Reject an unrepresentable derived difference without a NumPy warning."""
+    difference = float(left) - float(right)
+    if not math.isfinite(difference):
+        raise ValueError(f"{name} must remain finite")
+    return difference
+
+
 def compute_per_task_forgetting(
     performance_matrix: NDArray[np.floating] | list[list[float]],
     first_exposure: NDArray[np.integer] | list[int],
@@ -402,7 +419,11 @@ def compute_per_task_forgetting(
     for values in trajectories:
         final = values[-1]
         best = np.max(values) if higher_is_better else np.min(values)
-        degradation = best - final if higher_is_better else final - best
+        degradation = _finite_metric_difference(
+            best if higher_is_better else final,
+            final if higher_is_better else best,
+            name="per-task forgetting",
+        )
         forgetting.append(max(0.0, float(degradation)))
     return np.asarray(forgetting, dtype=np.float64)
 
@@ -429,7 +450,11 @@ def compute_backward_transfer(
     for values in trajectories:
         first = values[0]
         final = values[-1]
-        change = final - first if higher_is_better else first - final
+        change = _finite_metric_difference(
+            final if higher_is_better else first,
+            first if higher_is_better else final,
+            name="backward transfer",
+        )
         transfer.append(float(change))
     return np.asarray(transfer, dtype=np.float64)
 
@@ -447,7 +472,10 @@ def compute_forward_transfer(
     on a task probed *before* it is ever trained on, minus a task-specific
     baseline (in GEM, the untrained-network performance).
 
-    Task 0, and any task without a finite pre-exposure probe, receives ``NaN``.
+    Tasks first exposed at row 0, and any task whose *immediate* pre-exposure
+    checkpoint is missing, receive ``NaN``. Older finite probes are not backfilled
+    when that GEM checkpoint was not evaluated. An infinite immediate
+    pre-exposure is rejected rather than treated as a missing probe.
     The sign is normalized so positive values always mean beneficial transfer.
     """
 
@@ -468,13 +496,16 @@ def compute_forward_transfer(
     for task, first_row in enumerate(rows):
         if first_row == 0:
             continue
-        prior = matrix[:first_row, task]
-        finite_prior = prior[np.isfinite(prior)]
-        if finite_prior.size == 0:
+        # GEM FWT is R_{i-1, i} minus the task baseline: only the checkpoint
+        # immediately before first exposure. An older finite probe is not a
+        # substitute when that row is NaN (not evaluated) or divergent.
+        immediate = matrix[int(first_row) - 1, task]
+        if not np.isfinite(immediate):
             continue
-        pre_exposure = finite_prior[-1]
-        transfer[task] = (
-            pre_exposure - baseline[task] if higher_is_better else baseline[task] - pre_exposure
+        transfer[task] = _finite_metric_difference(
+            immediate if higher_is_better else baseline[task],
+            baseline[task] if higher_is_better else immediate,
+            name="forward transfer",
         )
     return transfer
 
@@ -487,6 +518,8 @@ def compute_prequential_performance(
     values = _numeric_array(online_performance, name="online_performance")
     if values.ndim != 1 or values.size == 0:
         raise ValueError("online_performance must be a non-empty one-dimensional trace")
+    if np.any(np.isinf(values)):
+        raise ValueError("online_performance must not contain infinity")
     finite = values[np.isfinite(values)]
     if finite.size == 0:
         raise ValueError("online_performance must contain at least one finite value")
@@ -524,12 +557,26 @@ def compute_stability_gap(
         raise ValueError(
             "reference_performance must be scalar or match online_performance"
         ) from exc
+    if np.any(np.isinf(values)):
+        raise ValueError("online_performance must not contain infinity")
+    if np.any(np.isinf(broadcast_reference)):
+        raise ValueError("reference_performance must not contain infinity")
 
     valid = np.isfinite(values) & np.isfinite(broadcast_reference)
     if not np.any(valid):
         raise ValueError("stability-gap inputs must contain a finite aligned value")
-    raw_gap = broadcast_reference - values if higher_is_better else values - broadcast_reference
-    per_step = np.where(valid, np.maximum(raw_gap, 0.0), np.nan)
+    # Improving performance has a zero gap. Do not subtract those operands:
+    # their unclipped difference can overflow even though the gap is zero.
+    left, right = (
+        (broadcast_reference, values) if higher_is_better else (values, broadcast_reference)
+    )
+    adverse = valid & (left > right)
+    raw_gap = np.zeros_like(values)
+    with np.errstate(over="ignore", invalid="ignore"):
+        np.subtract(left, right, out=raw_gap, where=adverse)
+    if np.any(~np.isfinite(raw_gap[valid])):
+        raise ValueError("stability gaps must remain finite")
+    per_step = np.where(valid, raw_gap, np.nan)
     finite_gaps = per_step[np.isfinite(per_step)]
     return StabilityGap(
         mean=_scale_safe_mean(finite_gaps, name="stability gaps"),
@@ -562,6 +609,8 @@ def compute_recovery_lengths(
     threshold_value = _require_finite_real("threshold", threshold)
     if values.ndim != 1 or values.size == 0:
         raise ValueError("online_performance must be a non-empty one-dimensional trace")
+    if np.any(np.isinf(values)):
+        raise ValueError("online_performance must not contain infinity")
     if points.ndim != 1 or points.size == 0:
         raise ValueError("change_points must be a non-empty one-dimensional array")
     if np.any(points < 0) or np.any(points >= values.size):
@@ -569,21 +618,30 @@ def compute_recovery_lengths(
     if np.any(np.diff(points) <= 0):
         raise ValueError("change_points must be strictly increasing")
 
+    meets_threshold = np.isfinite(values)
+    if higher_is_better:
+        meets_threshold &= values >= threshold_value
+    else:
+        meets_threshold &= values <= threshold_value
+    failure_prefix = np.empty(values.size + 1, dtype=np.int64)
+    failure_prefix[0] = 0
+    np.cumsum(~meets_threshold, dtype=np.int64, out=failure_prefix[1:])
+
     recoveries = np.full(points.shape, -1, dtype=np.int64)
     for point_index, start in enumerate(points):
         stop = points[point_index + 1] if point_index + 1 < points.size else values.size
-        for window_start in range(int(start), int(stop) - window_size + 1):
-            window = values[window_start : window_start + window_size]
-            meets = np.all(np.isfinite(window)) and (
-                np.all(window >= threshold_value)
-                if higher_is_better
-                else np.all(window <= threshold_value)
-            )
-            if meets:
-                recoveries[point_index] = (
-                    window_start + window_size - int(start)
-                )
-                break
+        start_index = int(start)
+        stop_index = int(stop)
+        if stop_index - start_index < window_size:
+            continue
+        window_failures = (
+            failure_prefix[start_index + window_size : stop_index + 1]
+            - failure_prefix[start_index : stop_index - window_size + 1]
+        )
+        qualifying_windows = window_failures == 0
+        if bool(np.any(qualifying_windows)):
+            first_window = int(np.argmax(qualifying_windows))
+            recoveries[point_index] = first_window + window_size
     return recoveries
 
 
@@ -695,6 +753,46 @@ def compute_cumulative_error(
     return cumulative
 
 
+def _pairwise_rolling_means(values: NDArray[np.float64], window_size: int) -> NDArray[np.float64]:
+    """Reduce each window with local scales, independent of other observations."""
+    leaf_count = 1 << (window_size - 1).bit_length()
+    scales = np.zeros(2 * leaf_count, dtype=np.float64)
+    sums = np.zeros(2 * leaf_count, dtype=np.float64)
+
+    def set_leaf(node: int, value: float) -> None:
+        scales[node] = abs(value)
+        sums[node] = np.sign(value)
+
+    def merge(node: int) -> None:
+        left, right = 2 * node, 2 * node + 1
+        scale = max(scales[left], scales[right])
+        scales[node] = scale
+        sums[node] = (
+            sums[left] * (scales[left] / scale)
+            + sums[right] * (scales[right] / scale)
+            if scale else 0.0
+        )
+
+    for index, value in enumerate(values[:window_size]):
+        set_leaf(leaf_count + index, float(value))
+    for node in range(leaf_count - 1, 0, -1):
+        merge(node)
+
+    means = np.empty(values.size - window_size + 1, dtype=np.float64)
+    means[0] = (sums[1] / window_size) * scales[1]
+    slot = 0
+    for output_index, incoming in enumerate(values[window_size:], start=1):
+        node = leaf_count + slot
+        set_leaf(node, float(incoming))
+        node //= 2
+        while node:
+            merge(node)
+            node //= 2
+        means[output_index] = (sums[1] / window_size) * scales[1]
+        slot = (slot + 1) % window_size
+    return means
+
+
 def compute_running_mean(
     values: NDArray[np.float64] | list[float],
     window_size: int = 100,
@@ -729,17 +827,14 @@ def compute_running_mean(
     if len(values_arr) < window_size:
         return np.full(values_arr.shape, np.nan, dtype=np.float64)
 
-    finite_values = values_arr[np.isfinite(values_arr)]
-    scale = float(np.max(np.abs(finite_values))) if finite_values.size else 1.0
-    if scale == 0.0:
-        scale = 1.0
-    normalized = np.where(np.isfinite(values_arr), values_arr / scale, 0.0)
-    cumsum = np.cumsum(np.insert(normalized, 0, 0.0), dtype=np.float64)
+    normalized = np.where(np.isfinite(values_arr), values_arr, 0.0)
     valid = np.isfinite(values_arr).astype(np.int64)
+    # Always reduce the current window. A per-element threshold cannot bound
+    # cancellation from a long prefix, even when each element exceeds epsilon.
+    # The ring tree costs O(n log(window_size)) time and O(window_size) storage.
+    running_mean = _pairwise_rolling_means(normalized, window_size)
     valid_cumsum = np.cumsum(np.insert(valid, 0, 0), dtype=np.int64)
-    window_sums = cumsum[window_size:] - cumsum[:-window_size]
     valid_counts = valid_cumsum[window_size:] - valid_cumsum[:-window_size]
-    running_mean = (window_sums / window_size) * scale
     running_mean = np.where(valid_counts == window_size, running_mean, np.nan)
     if np.any(np.isinf(running_mean)):
         raise ValueError("running mean must remain finite")
@@ -803,6 +898,8 @@ def compare_learners(
     shorter), estimating settled performance less noisily than the last value.
     ``std`` is the population standard deviation over the complete recorded
     time-step trajectory; it is not a spread estimate across independent seeds.
+    ``cumulative`` uses compensated summation with an exact overflow fallback,
+    so finite cancellation does not overflow merely because of reduction order.
 
     Args:
         results: Dictionary mapping learner name to metrics history
@@ -834,7 +931,10 @@ def compare_learners(
         normalized = values if scale == 0.0 else values / scale
         mean = _scale_safe_mean(values, name=f"learner {name}")
         std = float(np.std(normalized) * (1.0 if scale == 0.0 else scale))
-        cumulative = float(np.sum(values, dtype=np.float64))
+        try:
+            cumulative = float(_compensated_total(values))
+        except OverflowError:
+            raise ValueError(f"learner {name} summaries must remain finite") from None
         tail = values[-100:] if len(values) >= 100 else values
         final_100_mean = _scale_safe_mean(tail, name=f"learner {name} tail")
         if not math.isfinite(std) or not math.isfinite(cumulative):

@@ -19,8 +19,10 @@ the critic-form x actor-form design space:
 
 All actors implement AC(lambda), ``theta += alpha * delta * e``, with an
 eligibility trace over log-policy gradients (Sutton & Barto 2018, Ch. 13).
-The critic update is always delegated unchanged to ``HordeLearner.update()``,
-preserving per-head trace decay and auxiliary demons.
+The critic update is always delegated to ``HordeLearner.update()``,
+preserving per-head trace decay and auxiliary demons. A zero value-head
+discount ends the episode for the value head: the state-value agents clear
+its critic trace after the update, as they clear the actor traces.
 
 References:
     Sutton & Barto (2018). "Reinforcement Learning: An Introduction,"
@@ -47,7 +49,10 @@ from jaxtyping import Bool, Float, Int
 from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.horde import HordeLearner, HordeUpdateResult
 from alberta_framework.core.initializers import sparse_init
-from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
+from alberta_framework.core.learners import (
+    _gradient_step_error,
+    _update_from_gradient_with_diagnostics,
+)
 from alberta_framework.core.multi_head_learner import MultiHeadMLPLearner, MultiHeadMLPState
 from alberta_framework.core.normalizers import _saturating_int32_counter_increment
 from alberta_framework.core.optimizers import (
@@ -65,24 +70,52 @@ from alberta_framework.core.update_safety import (
 )
 
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_FLOAT32_MIN = float(np.finfo(np.float32).min)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _ACTUAL_FLOAT_TYPES = frozenset(
     {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
 )
+
+
+def _temperature_scaled_logits(logits: Array, temperature: float) -> Array:
+    """Scale logits for softmax without exposing a rounded argmax to fusion.
+
+    XLA may recompute ``logits * (1 / temperature)`` inside both fused
+    subcomputations of a compiled ``jax.nn.softmax``/``jax.nn.log_softmax``.
+    The contracted multiply-then-subtract leaves a rounding residual at the
+    argmax instead of an exact zero; once ``|logits / temperature|`` is large
+    enough that residual drives the exponential to ``inf`` or ``0`` and a
+    finite input yields a NaN policy, a silently rejected update, or a dropped
+    gradient (SlopDotCash/asi#2886).
+
+    Both shifts below are exact (softmax and log-softmax are shift invariant),
+    and each blocks one of the two recomputations.  When the temperature
+    exceeds one, halving both operands first is equally exact and keeps the
+    pre-scale centering finite for opposite finite extreme logits whose
+    pairwise distance exceeds the float32 maximum — inputs where the plain
+    ``logits / temperature`` expression stays finite and must stay finite.
+
+    For temperatures at or below one, that centering subtraction and the
+    division itself can still overflow: float32 cannot represent the pairwise
+    distance of ``[3e38, -3e38]``, so the shifted quotient reaches ``-inf``
+    and downstream ``probability * log_probability`` entropy products evaluate
+    ``0 * -inf`` as NaN.  The negative tail is therefore clamped to the finite
+    floating-point minimum, which is exact for every reported quantity:
+    ``exp(floor)`` underflows to zero exactly like ``exp(-inf)``, so softmax
+    results, derived probabilities, and the normalization sum are unchanged,
+    while log-probabilities stay finite and gradients remain finite.
+    """
+    if temperature > 1.0:
+        # Halving both operands is exact and prevents centering opposite finite
+        # extremes from overflowing before a large temperature brings them in range.
+        logits = logits * 0.5
+        temperature *= 0.5
+    # Both shifts preserve softmax/log-softmax while keeping division in range.
+    centered = logits - jax.lax.stop_gradient(jnp.max(logits))
+    scaled = centered / temperature
+    shifted = scaled - jax.lax.stop_gradient(jnp.max(scaled))
+    # NaN propagates through maximum, so genuine NaN inputs still surface.
+    return jnp.maximum(shifted, _FLOAT32_MIN)
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -109,6 +142,14 @@ def _validated_actor_float(name: str, value: object, **bounds: Any) -> float:
     return validated_float32_scalar(name, value, **bounds)
 
 
+def _validated_actor_temperature(value: object) -> float:
+    temperature = _validated_actor_float("temperature", value, positive=True)
+    minimum = float(np.finfo(np.float32).tiny)
+    if temperature < minimum:
+        raise ValueError(f"temperature must be at least {minimum} in float32")
+    return temperature
+
+
 def _exact_config_payload(config: object, expected: frozenset[str]) -> dict[str, Any]:
     if type(config) is not dict:
         raise ValueError("config must be an exact built-in dict")
@@ -116,6 +157,28 @@ def _exact_config_payload(config: object, expected: frozenset[str]) -> dict[str,
     if any(type(key) is not str for key in payload) or set(payload) != expected:
         raise ValueError("config fields do not match the serialized schema")
     return cast(dict[str, Any], dict(payload))
+
+
+def _exact_construction_payload(
+    config: object,
+    *,
+    expected_type: str,
+    expected_fields: frozenset[str],
+) -> dict[str, Any]:
+    """Require the complete outer identity of one serialized agent."""
+
+    try:
+        payload = _exact_config_payload(config, expected_fields | {"type"})
+    except ValueError as error:
+        raise ValueError(
+            f"{expected_type} construction fields do not match the serialized schema"
+        ) from error
+    marker = payload.pop("type")
+    if type(marker) is not str or marker != expected_type:
+        raise ValueError(
+            f"{expected_type} construction fields do not match the serialized schema"
+        )
+    return payload
 
 
 def _check_actor_resources(resources: dict[str, int]) -> dict[str, int]:
@@ -164,10 +227,12 @@ def _require_horde_ac_matching_length(name: str, value: object, *, expected: int
         raise ValueError(f"{name} must share the same leading length as rewards")
 
 
-def _linear_actor_resources(n_actions: int, feature_dim: object) -> dict[str, int]:
+def _linear_actor_resources(
+    n_actions: int, feature_dim: object, *, discount_history: bool = False
+) -> dict[str, int]:
     width = _require_int32("feature_dim", feature_dim, minimum=1)
     parameters = n_actions * (width + 1)
-    float32_state = 2 * parameters + width
+    float32_state = 2 * parameters + width + int(discount_history)
     logical_state = float32_state + 4
     return _check_actor_resources(
         {
@@ -196,7 +261,7 @@ def _nonlinear_actor_resources(
     _check_actor_resources({"head_product": head_product})
     parameters += head_product + n_actions
     tensor_count = 2 * (len(hidden_sizes) + 1)
-    float32_state = 5 * parameters + 2 * tensor_count + 1 + width
+    float32_state = 5 * parameters + 2 * tensor_count + 2 + width
     logical_state = float32_state + 4
     return _check_actor_resources(
         {
@@ -231,6 +296,22 @@ def _commit_scan_safe_actor_state(
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
     """Return 0 when ``scale`` is 0 so a 0*inf product cannot form."""
     return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
+def _require_concrete_finite(name: str, value: Array) -> Array:
+    """Reject non-finite values at an eager, state-committing boundary.
+
+    ``start`` is the only public path that stores an observation into
+    persistent state without a runtime gate. Every ``update`` commits only
+    when the whole stored state is finite, so a non-finite value accepted
+    here would be stored in ``last_observation`` and silently reject every
+    later update with the state bitwise frozen. Traced inputs pass through:
+    under ``jax.jit`` or ``scan`` tracing the runtime state-finiteness gates
+    remain authoritative.
+    """
+    if not isinstance(value, jax.core.Tracer) and not bool(jnp.all(jnp.isfinite(value))):
+        raise ValueError(f"{name} must contain only finite values")
+    return value
 
 
 def _rollback_critic_result(
@@ -279,6 +360,37 @@ def _rollback_critic_result(
     )
 
 
+def _clear_terminal_value_trace(
+    critic: HordeLearner,
+    result: HordeUpdateResult,
+    value_head_index: int,
+    value_discount: Array,
+) -> HordeUpdateResult:
+    """End the value head's critic eligibility after a zero-discount update.
+
+    The terminal update has already credited the finished episode along this
+    trace. Clearing it afterwards keeps that eligibility out of the next
+    episode, as the actor traces are cleared. Auxiliary demons keep their
+    configured gammas and traces. ``HordeLearner`` itself stays unchanged
+    because SARSA passes it zero discounts on continuing transitions.
+    """
+    demon = critic.horde_spec.demons[value_head_index]
+    if np.float32(demon.gamma) * np.float32(demon.lamda) == 0.0:
+        # The next update rebuilds this trace from the gradient alone.
+        return result
+    terminal = value_discount == 0.0
+    head_traces = list(result.state.head_traces)
+    head_traces[value_head_index] = tuple(
+        jnp.where(terminal, jnp.zeros_like(trace), trace) for trace in head_traces[value_head_index]
+    )
+    return cast(
+        HordeUpdateResult,
+        result.replace(  # type: ignore[attr-defined]
+            state=result.state.replace(head_traces=tuple(head_traces)),  # type: ignore[attr-defined]
+        ),
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class HordeActorCriticConfig:
     """Configuration for a Horde-backed discrete actor-critic agent.
@@ -320,7 +432,7 @@ class HordeActorCriticConfig:
         actor_lamda = _validated_actor_float(
             "actor_lamda", self.actor_lamda, lower=0.0, upper=1.0
         )
-        temperature = _validated_actor_float("temperature", self.temperature, positive=True)
+        temperature = _validated_actor_temperature(self.temperature)
         actor_td_error_clip = (
             _validated_actor_float(
                 "actor_td_error_clip",
@@ -334,11 +446,11 @@ class HordeActorCriticConfig:
         object.__setattr__(self, "actor_lamda", actor_lamda)
         object.__setattr__(self, "temperature", temperature)
         object.__setattr__(self, "actor_td_error_clip", actor_td_error_clip)
-        _linear_actor_resources(self.n_actions, 1)
+        _linear_actor_resources(self.n_actions, 1, discount_history=True)
 
     def actor_resource_budget(self, feature_dim: object) -> dict[str, int]:
         """Return the exact actor-only state budget for an input width."""
-        return _linear_actor_resources(self.n_actions, feature_dim)
+        return _linear_actor_resources(self.n_actions, feature_dim, discount_history=True)
 
     def to_config(self) -> dict[str, Any]:
         """Serialize this configuration to a dictionary."""
@@ -360,6 +472,7 @@ class HordeActorCriticState:
         actor_bias: Policy bias vector, shape ``(n_actions,)``.
         actor_trace_weights: Eligibility trace for actor weights.
         actor_trace_bias: Eligibility trace for actor bias.
+        previous_discount: Last accepted value transition discount for actor eligibility.
         critic_state: Underlying Horde learner state.
         last_observation: Previous observation ``s_t``.
         last_action: Previous action ``a_t``.
@@ -371,6 +484,7 @@ class HordeActorCriticState:
     actor_bias: Float[Array, " n_actions"]
     actor_trace_weights: Float[Array, "n_actions feature_dim"]
     actor_trace_bias: Float[Array, " n_actions"]
+    previous_discount: Float[Array, ""]
     critic_state: MultiHeadMLPState
     last_observation: Float[Array, " feature_dim"]
     last_action: Int[Array, ""]
@@ -395,7 +509,12 @@ class HordeActorCriticUpdateResult:
 
 @chex.dataclass(frozen=True)
 class HordeActorCriticArrayResult:
-    """Result from scan-based Horde actor-critic learning."""
+    """Result from scan-based Horde actor-critic learning.
+
+    ``policies[t]`` is the pre-update policy at ``observations[t]`` — the
+    sampling distribution (or the model policy when actions are supplied), matching
+    :class:`~alberta_framework.core.actor_critic.ActorCriticArrayResult`.
+    """
 
     state: HordeActorCriticState
     actions: Int[Array, " num_steps"]
@@ -438,7 +557,7 @@ class QHordeActorCriticConfig:
         actor_lamda = _validated_actor_float(
             "actor_lamda", self.actor_lamda, lower=0.0, upper=1.0
         )
-        temperature = _validated_actor_float("temperature", self.temperature, positive=True)
+        temperature = _validated_actor_temperature(self.temperature)
         actor_td_error_clip = (
             _validated_actor_float(
                 "actor_td_error_clip",
@@ -587,13 +706,16 @@ class QHordeActorCriticAgent:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> QHordeActorCriticAgent:
         """Reconstruct a ``QHordeActorCriticAgent`` from a dictionary."""
-        config = dict(config)
-        config.pop("type", None)
+        payload = _exact_construction_payload(
+            config,
+            expected_type="QHordeActorCriticAgent",
+            expected_fields=frozenset({"config", "critic", "actor_bounder"}),
+        )
         return cls(
-            config=QHordeActorCriticConfig.from_config(config["config"]),
-            critic=HordeLearner.from_config(config["critic"]),
-            actor_bounder=bounder_from_config(config["actor_bounder"])
-            if config.get("actor_bounder") is not None
+            config=QHordeActorCriticConfig.from_config(payload["config"]),
+            critic=HordeLearner.from_config(payload["critic"]),
+            actor_bounder=bounder_from_config(payload["actor_bounder"])
+            if payload["actor_bounder"] is not None
             else None,
         )
 
@@ -623,7 +745,9 @@ class QHordeActorCriticAgent:
     ) -> Float[Array, " n_actions"]:
         """Compute softmax action probabilities for one observation."""
         logits = state.actor_weights @ observation + state.actor_bias
-        return jax.nn.softmax(logits / self._config.temperature)
+        return jax.nn.softmax(
+            _temperature_scaled_logits(logits, self._config.temperature)
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def q_values(self, state: QHordeActorCriticState, observation: Array) -> Array:
@@ -640,16 +764,36 @@ class QHordeActorCriticAgent:
         """Sample one action from the current softmax policy."""
         key, sample_key = jr.split(state.rng_key)
         probs = self.policy(state, observation)
-        action = jr.categorical(sample_key, jnp.log(jnp.maximum(probs, 1e-8))).astype(jnp.int32)
+        action = jr.categorical(
+            sample_key,
+            jnp.log(probs),
+            mode="high",
+        ).astype(jnp.int32)
         return action, key, probs
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def start(
         self,
         state: QHordeActorCriticState,
         observation: Array,
     ) -> tuple[QHordeActorCriticState, Int[Array, ""], Float[Array, " n_actions"]]:
-        """Select and store the first action for a stream or episode."""
+        """Select and store the first action for a stream or episode.
+
+        The observation is validated eagerly at this state-committing
+        boundary: ``update`` commits only when the stored state is finite, so
+        a non-finite value accepted here would be stored in
+        ``last_observation`` and silently reject every later update. Traced
+        inputs pass through to those runtime gates.
+        """
+        observation = _require_concrete_finite("observation", observation)
+        return self._start(state, observation)  # type: ignore[no-any-return]
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _start(
+        self,
+        state: QHordeActorCriticState,
+        observation: Array,
+    ) -> tuple[QHordeActorCriticState, Int[Array, ""], Float[Array, " n_actions"]]:
+        """Jitted implementation of one checked episode start."""
         action, key, probs = self.select_action(state, observation)
         new_state = state.replace(  # type: ignore[attr-defined]
             last_observation=observation,
@@ -696,12 +840,39 @@ class QHordeActorCriticAgent:
         cumulants = cumulants.at[safe_last_action].set(target)
         if prediction_cumulants is not None:
             cumulants = cumulants.at[cfg.n_actions :].set(prediction_cumulants)
-        critic_result = self._critic.update(
+        # A terminal transition must not bootstrap any demon: in continuing
+        # mode the observation is already the next episode's reset
+        # observation, so every discount is zero and a prediction target is
+        # its cumulant plus the demon's terminal reward. Action heads already
+        # use gamma=0, so only the prediction demons change.
+        critic_discounts = jnp.where(
+            terminated,
+            jnp.zeros_like(self._critic.horde_spec.gammas),
+            self._critic.horde_spec.gammas,
+        )
+        critic_result = self._critic.update_with_discounts(
             state.critic_state,
             prev_obs,
             cumulants,
             observation,
+            critic_discounts,
         )
+        # A terminal transition ends the episode for the prediction demons
+        # too: their traces decay by the spec gamma * lamda, so the stored
+        # trace would be credited to the next episode's first TD error.
+        # The terminal update above has already used the traces; clear them
+        # now. Action heads keep theirs: gamma=0 forces gamma * lamda = 0.
+        if self._critic.n_demons > cfg.n_actions:
+            _pred_traces = list(critic_result.state.head_traces)
+            for _i in range(cfg.n_actions, self._critic.n_demons):
+                _w, _b = _pred_traces[_i]
+                _pred_traces[_i] = (
+                    jnp.where(terminated, jnp.zeros_like(_w), _w),
+                    jnp.where(terminated, jnp.zeros_like(_b), _b),
+                )
+            critic_result = critic_result.replace(
+                state=critic_result.state.replace(head_traces=tuple(_pred_traces))
+            )
 
         actor_td_error = (
             td_error
@@ -718,7 +889,8 @@ class QHordeActorCriticAgent:
             else sampled_actor_grad_bias
         )
         actor_grad_weights = actor_grad_bias[:, None] * prev_obs[None, :]
-        actor_decay = effective_gamma * cfg.actor_lamda
+        # Credit retained within-episode eligibility before clearing terminal traces.
+        actor_decay = jnp.asarray(cfg.gamma, dtype=jnp.float32) * cfg.actor_lamda
         actor_trace_weights = (
             _skip_zero_scale(actor_decay, state.actor_trace_weights) + actor_grad_weights
         )
@@ -764,7 +936,8 @@ class QHordeActorCriticAgent:
             rng_key=key,
         )
         inputs_valid = (
-            action_valid
+            (state.step_count >= 0)
+            & action_valid
             & jnp.isfinite(jnp.squeeze(reward))
             & jnp.all(jnp.isfinite(observation))
             & jnp.all(jnp.isfinite(old_policy))
@@ -794,7 +967,7 @@ class QHordeActorCriticAgent:
         )
         return QHordeActorCriticUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=jnp.where(update_applied, next_action, jnp.asarray(0, jnp.int32)),
+            action=jnp.where(update_applied, next_action, state.last_action),
             policy=jnp.where(update_applied, policy, jnp.zeros_like(policy)),
             q_values=jnp.where(update_applied, q_previous, jnp.zeros_like(q_previous)),
             next_q_values=jnp.where(
@@ -817,7 +990,8 @@ class HordeActorCriticAgent:
     ``theta += alpha * delta * e``. The advantage ``delta`` is supplied by the
     configured Horde value head. The critic update is delegated entirely to
     ``HordeLearner.update()``, preserving per-head trace decay and auxiliary
-    prediction demons.
+    prediction demons. After a zero value-head discount the value head's
+    critic trace is cleared, as the actor traces are.
     """
 
     def __init__(
@@ -879,13 +1053,16 @@ class HordeActorCriticAgent:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> HordeActorCriticAgent:
         """Reconstruct a ``HordeActorCriticAgent`` from a dictionary."""
-        config = dict(config)
-        config.pop("type", None)
+        payload = _exact_construction_payload(
+            config,
+            expected_type="HordeActorCriticAgent",
+            expected_fields=frozenset({"config", "critic", "actor_bounder"}),
+        )
         return cls(
-            config=HordeActorCriticConfig.from_config(config["config"]),
-            critic=HordeLearner.from_config(config["critic"]),
-            actor_bounder=bounder_from_config(config["actor_bounder"])
-            if config.get("actor_bounder") is not None
+            config=HordeActorCriticConfig.from_config(payload["config"]),
+            critic=HordeLearner.from_config(payload["critic"]),
+            actor_bounder=bounder_from_config(payload["actor_bounder"])
+            if payload["actor_bounder"] is not None
             else None,
         )
 
@@ -900,6 +1077,7 @@ class HordeActorCriticAgent:
             actor_bias=zeros_bias,
             actor_trace_weights=zeros_actor,
             actor_trace_bias=zeros_bias,
+            previous_discount=jnp.array(1.0, dtype=jnp.float32),
             critic_state=self._critic.init(feature_dim, critic_key),
             last_observation=jnp.zeros((feature_dim,), dtype=jnp.float32),
             last_action=jnp.array(-1, dtype=jnp.int32),
@@ -915,7 +1093,9 @@ class HordeActorCriticAgent:
     ) -> Float[Array, " n_actions"]:
         """Compute softmax action probabilities for one observation."""
         logits = state.actor_weights @ observation + state.actor_bias
-        return jax.nn.softmax(logits / self._config.temperature)
+        return jax.nn.softmax(
+            _temperature_scaled_logits(logits, self._config.temperature)
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def values(self, state: HordeActorCriticState, observation: Array) -> Array:
@@ -943,16 +1123,36 @@ class HordeActorCriticAgent:
         """Sample one action from the current softmax policy."""
         key, sample_key = jr.split(state.rng_key)
         probs = self.policy(state, observation)
-        action = jr.categorical(sample_key, jnp.log(jnp.maximum(probs, 1e-8))).astype(jnp.int32)
+        action = jr.categorical(
+            sample_key,
+            jnp.log(probs),
+            mode="high",
+        ).astype(jnp.int32)
         return action, key, probs
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def start(
         self,
         state: HordeActorCriticState,
         observation: Array,
     ) -> tuple[HordeActorCriticState, Int[Array, ""], Float[Array, " n_actions"]]:
-        """Select and store the first action for a stream or episode."""
+        """Select and store the first action for a stream or episode.
+
+        The observation is validated eagerly at this state-committing
+        boundary: ``update`` commits only when the stored state is finite, so
+        a non-finite value accepted here would be stored in
+        ``last_observation`` and silently reject every later update. Traced
+        inputs pass through to those runtime gates.
+        """
+        observation = _require_concrete_finite("observation", observation)
+        return self._start(state, observation)  # type: ignore[no-any-return]
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _start(
+        self,
+        state: HordeActorCriticState,
+        observation: Array,
+    ) -> tuple[HordeActorCriticState, Int[Array, ""], Float[Array, " n_actions"]]:
+        """Jitted implementation of one checked episode start."""
         action, key, probs = self.select_action(state, observation)
         new_state = state.replace(  # type: ignore[attr-defined]
             last_observation=observation,
@@ -986,11 +1186,14 @@ class HordeActorCriticAgent:
             auxiliary_cumulants: Optional cumulants for all non-value heads,
                 ordered by Horde head index with the value head removed.
             discount: Optional scalar per-transition value-head discount. When
-                omitted, the value head's configured demon gamma is used.
+                omitted, the value head's configured demon gamma is used. This
+                outgoing discount is saved for the next accepted actor update.
 
         Returns:
             ``HordeActorCriticUpdateResult`` with actor and critic metrics.
         """
+        if state.previous_discount.shape != () or state.previous_discount.dtype != jnp.float32:
+            raise ValueError("state.previous_discount must be a scalar float32")
         cfg = self._config
         prev_obs = state.last_observation
         action_valid = (state.last_action >= 0) & (state.last_action < cfg.n_actions)
@@ -1031,6 +1234,9 @@ class HordeActorCriticAgent:
                 observation,
                 discounts,
             )
+        critic_result = _clear_terminal_value_trace(
+            self._critic, critic_result, cfg.value_head_index, value_discount
+        )
         td_error = critic_result.td_errors[cfg.value_head_index]
         actor_td_error = (
             td_error
@@ -1041,7 +1247,9 @@ class HordeActorCriticAgent:
         one_hot = jax.nn.one_hot(safe_last_action, cfg.n_actions, dtype=jnp.float32)
         actor_grad_bias = (one_hot - old_policy) / cfg.temperature
         actor_grad_weights = actor_grad_bias[:, None] * prev_obs[None, :]
-        actor_decay = value_discount * cfg.actor_lamda
+        # Incoming gamma_t retains earlier credit; outgoing gamma_{t+1}
+        # controls bootstrapping and clears traces only after reward learning.
+        actor_decay = state.previous_discount * cfg.actor_lamda
         actor_trace_weights = (
             _skip_zero_scale(actor_decay, state.actor_trace_weights) + actor_grad_weights
         )
@@ -1069,6 +1277,7 @@ class HordeActorCriticAgent:
             actor_trace_bias=jnp.where(
                 carry_traces, actor_trace_bias, jnp.zeros_like(actor_trace_bias)
             ),
+            previous_discount=value_discount,
             critic_state=critic_result.state,
             step_count=_saturating_int32_counter_increment(state.step_count),
         )
@@ -1079,12 +1288,15 @@ class HordeActorCriticAgent:
             rng_key=key,
         )
         inputs_valid = (
-            action_valid
+            (state.step_count >= 0)
+            & action_valid
             & jnp.isfinite(jnp.squeeze(reward))
             & jnp.all(jnp.isfinite(observation))
             & jnp.isfinite(value_discount)
             & (value_discount >= 0.0)
             & (value_discount <= 1.0)
+            & (state.previous_discount >= 0.0)
+            & (state.previous_discount <= 1.0)
             & jnp.all(jnp.isfinite(old_policy))
             & jnp.isfinite(value)
             & ((value_discount == 0.0) | jnp.isfinite(next_value))
@@ -1110,7 +1322,7 @@ class HordeActorCriticAgent:
         )
         return HordeActorCriticUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=jnp.where(update_applied, next_action, jnp.asarray(0, jnp.int32)),
+            action=jnp.where(update_applied, next_action, state.last_action),
             policy=jnp.where(update_applied, next_policy, jnp.zeros_like(next_policy)),
             value=jnp.where(update_applied, value, 0.0),
             next_value=jnp.where(update_applied & (value_discount != 0.0), next_value, 0.0),
@@ -1199,8 +1411,9 @@ def run_horde_actor_critic_from_arrays(
                 last_action=fixed_action.astype(jnp.int32),
             )
             current_action = fixed_action.astype(jnp.int32)
+            current_policy = agent.policy(started_state, obs)
         else:
-            started_state, current_action, _policy = agent.start(carry, obs)
+            started_state, current_action, current_policy = agent.start(carry, obs)
         result = agent.update(
             started_state,
             reward,
@@ -1215,12 +1428,16 @@ def run_horde_actor_critic_from_arrays(
             lambda: carry,
         )
         return committed_state, (
+            # The action for this row was selected (or supplied) even when
+            # the learning update is rejected; only an invalid action
+            # itself falls back to 0. Reporting 0 for a valid action would
+            # falsify the recorded trajectory.
             jnp.where(
-                update_applied,
+                fixed_action_valid,
                 current_action,
                 jnp.asarray(0, dtype=jnp.int32),
             ),
-            jnp.where(update_applied, result.policy, jnp.zeros_like(result.policy)),
+            jnp.where(update_applied, current_policy, jnp.zeros_like(current_policy)),
             jnp.where(update_applied, result.value, 0.0),
             jnp.where(update_applied, result.td_error, 0.0),
             jnp.where(
@@ -1291,10 +1508,18 @@ def _nlhac_log_prob(
         trunk_weights, trunk_biases, obs, leaky_relu_slope, use_layer_norm
     )
     logits = head_w @ hidden + head_b
-    probs = jax.nn.softmax(logits / temperature)
-    n_actions = probs.shape[0]
-    mixed_probs = (1.0 - actor_epsilon) * probs + actor_epsilon / n_actions
-    return jnp.log(jnp.maximum(mixed_probs[action], 1e-8))
+    # Keep the score in log space so finite extreme logits retain finite gradients.
+    log_probs = jax.nn.log_softmax(
+        _temperature_scaled_logits(logits, temperature)
+    )
+    epsilon = jnp.asarray(actor_epsilon, dtype=log_probs.dtype)
+    uniform_log_prob = jnp.log(epsilon) - jnp.log(
+        jnp.asarray(log_probs.shape[0], dtype=log_probs.dtype)
+    )
+    return jnp.logaddexp(
+        jnp.log1p(-epsilon) + log_probs[action],
+        uniform_log_prob,
+    )
 
 
 _nlhac_grad = jax.grad(_nlhac_log_prob, argnums=0)
@@ -1319,7 +1544,7 @@ def _nlqhac_expected_advantage_objective(
         trunk_weights, trunk_biases, obs, leaky_relu_slope, use_layer_norm
     )
     logits = head_w @ hidden + head_b
-    probs = jax.nn.softmax(logits / temperature)
+    probs = jax.nn.softmax(_temperature_scaled_logits(logits, temperature))
     return jnp.dot(probs, advantages)
 
 
@@ -1340,12 +1565,51 @@ def _clip_nlhac_actor_grads(
     for grad in (*grad_trunk_w, *grad_trunk_b):
         squared_norm = squared_norm + jnp.sum(jnp.square(grad))
     norm = jnp.sqrt(squared_norm)
+    # Recover squared-sum overflow of finite gradients by scaling before squaring.
+    grads = (grad_head_w, grad_head_b, *grad_trunk_w, *grad_trunk_b)
+    finite = jnp.all(jnp.stack([jnp.all(jnp.isfinite(grad)) for grad in grads]))
+    largest = jnp.max(jnp.stack([jnp.max(jnp.abs(grad), initial=0.0) for grad in grads]))
+    safe_largest = jnp.where(largest > 0.0, largest, 1.0)
+    _, scale_exponent = jnp.frexp(safe_largest)
+    rescaled = jnp.sum(
+        jnp.stack(
+            [
+                jnp.sum(jnp.square(jnp.ldexp(grad, -scale_exponent)))
+                for grad in grads
+            ]
+        )
+    )
+    recover = jnp.isinf(norm) & finite
+    scaled_norm = jnp.sqrt(rescaled)
     scale = jnp.minimum(1.0, jnp.asarray(max_norm, dtype=jnp.float32) / (norm + 1e-8))
+    scaled_scale = jnp.asarray(max_norm, dtype=jnp.float32) / (scaled_norm + 1e-8)
     return (
-        tuple(scale * grad for grad in grad_trunk_w),
-        tuple(scale * grad for grad in grad_trunk_b),
-        scale * grad_head_w,
-        scale * grad_head_b,
+        tuple(
+            jnp.where(
+                recover,
+                scaled_scale * jnp.ldexp(grad, -scale_exponent),
+                scale * grad,
+            )
+            for grad in grad_trunk_w
+        ),
+        tuple(
+            jnp.where(
+                recover,
+                scaled_scale * jnp.ldexp(grad, -scale_exponent),
+                scale * grad,
+            )
+            for grad in grad_trunk_b
+        ),
+        jnp.where(
+            recover,
+            scaled_scale * jnp.ldexp(grad_head_w, -scale_exponent),
+            scale * grad_head_w,
+        ),
+        jnp.where(
+            recover,
+            scaled_scale * jnp.ldexp(grad_head_b, -scale_exponent),
+            scale * grad_head_b,
+        ),
     )
 
 
@@ -1408,7 +1672,7 @@ class NonlinearHordeActorCriticConfig:
         actor_lamda = _validated_actor_float(
             "actor_lamda", self.actor_lamda, lower=0.0, upper=1.0
         )
-        temperature = _validated_actor_float("temperature", self.temperature, positive=True)
+        temperature = _validated_actor_temperature(self.temperature)
         actor_sparsity = _validated_actor_float(
             "actor_sparsity", self.actor_sparsity, lower=0.0, upper=1.0
         )
@@ -1496,6 +1760,8 @@ class NonlinearHordeActorCriticState:
         actor_head_opt_b: Optimizer state for ``actor_head_b``.
         actor_td_error_normalizer: EMA scale for actor-only TD-error
             normalization.
+        previous_discount: Last accepted value transition discount for actor
+            eligibility. The shared nonlinear Q actor leaves this field unused.
         critic_state: Underlying Horde learner state.
         last_observation: Previous observation for the next update call.
         last_action: Previous action index.
@@ -1513,6 +1779,7 @@ class NonlinearHordeActorCriticState:
     actor_head_opt_w: AutostepParamState
     actor_head_opt_b: AutostepParamState
     actor_td_error_normalizer: Float[Array, ""]
+    previous_discount: Float[Array, ""]
     critic_state: MultiHeadMLPState
     last_observation: Float[Array, " feature_dim"]
     last_action: Int[Array, ""]
@@ -1537,7 +1804,12 @@ class NonlinearHordeActorCriticUpdateResult:
 
 @chex.dataclass(frozen=True)
 class NonlinearHordeActorCriticArrayResult:
-    """Result from a scan-based nonlinear Horde actor-critic loop."""
+    """Result from a scan-based nonlinear Horde actor-critic loop.
+
+    ``policies[t]`` is the pre-update policy at ``observations[t]`` — the
+    sampling distribution (or the model policy when actions are supplied), matching
+    :class:`~alberta_framework.core.actor_critic.ActorCriticArrayResult`.
+    """
 
     state: NonlinearHordeActorCriticState
     actions: Int[Array, " num_steps"]
@@ -1553,8 +1825,10 @@ class NonlinearHordeActorCriticAgent:
 
     This is the canonical nonlinear Step 4 agent.  The actor is an MLP whose
     policy gradient is computed by ``jax.grad`` through the full softmax
-    forward pass.  The critic is delegated unchanged to a
-    :class:`~alberta_framework.core.horde.HordeLearner`.
+    forward pass.  The critic is delegated to a
+    :class:`~alberta_framework.core.horde.HordeLearner`; after a zero
+    value-head discount the value head's critic trace is cleared, as the
+    actor traces are.
 
     The update rule is AC(lambda) with MLP actor:
 
@@ -1645,18 +1919,23 @@ class NonlinearHordeActorCriticAgent:
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> NonlinearHordeActorCriticAgent:
         """Reconstruct from :meth:`to_config` output."""
-        cfg = dict(cfg)
-        cfg.pop("type", None)
+        payload = _exact_construction_payload(
+            cfg,
+            expected_type="NonlinearHordeActorCriticAgent",
+            expected_fields=frozenset(
+                {"config", "critic", "actor_optimizer", "actor_bounder"}
+            ),
+        )
         actor_opt: Autostep | None = None
-        actor_optimizer_cfg = cfg.get("actor_optimizer")
+        actor_optimizer_cfg = payload["actor_optimizer"]
         if actor_optimizer_cfg is not None:
             actor_opt = cast(Autostep, optimizer_from_config(actor_optimizer_cfg))
         return cls(
-            config=NonlinearHordeActorCriticConfig.from_config(cfg["config"]),
-            critic=HordeLearner.from_config(cfg["critic"]),
+            config=NonlinearHordeActorCriticConfig.from_config(payload["config"]),
+            critic=HordeLearner.from_config(payload["critic"]),
             actor_optimizer=actor_opt,
-            actor_bounder=bounder_from_config(cfg["actor_bounder"])
-            if cfg.get("actor_bounder") is not None
+            actor_bounder=bounder_from_config(payload["actor_bounder"])
+            if payload["actor_bounder"] is not None
             else None,
         )
 
@@ -1707,6 +1986,7 @@ class NonlinearHordeActorCriticAgent:
             actor_head_opt_w=self._actor_optimizer.init_for_shape(actor_head_w.shape),
             actor_head_opt_b=self._actor_optimizer.init_for_shape(actor_head_b.shape),
             actor_td_error_normalizer=jnp.array(0.0, dtype=jnp.float32),
+            previous_discount=jnp.array(1.0, dtype=jnp.float32),
             critic_state=self._critic.init(feature_dim, critic_key),
             last_observation=jnp.zeros((feature_dim,), dtype=jnp.float32),
             last_action=jnp.array(-1, dtype=jnp.int32),
@@ -1730,7 +2010,9 @@ class NonlinearHordeActorCriticAgent:
             cfg.use_layer_norm,
         )
         logits = state.actor_head_w @ hidden + state.actor_head_b
-        probs = jax.nn.softmax(logits / cfg.temperature)
+        probs = jax.nn.softmax(
+            _temperature_scaled_logits(logits, cfg.temperature)
+        )
         return (1.0 - cfg.actor_epsilon) * probs + cfg.actor_epsilon / cfg.n_actions
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -1752,16 +2034,36 @@ class NonlinearHordeActorCriticAgent:
         """Sample one action from the current softmax policy."""
         key, sample_key = jr.split(state.rng_key)
         probs = self.policy(state, observation)
-        action = jr.categorical(sample_key, jnp.log(jnp.maximum(probs, 1e-8))).astype(jnp.int32)
+        action = jr.categorical(
+            sample_key,
+            jnp.log(probs),
+            mode="high",
+        ).astype(jnp.int32)
         return action, key, probs
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def start(
         self,
         state: NonlinearHordeActorCriticState,
         observation: Array,
     ) -> tuple[NonlinearHordeActorCriticState, Int[Array, ""], Float[Array, " n_actions"]]:
-        """Select and store the first action for a stream or episode."""
+        """Select and store the first action for a stream or episode.
+
+        The observation is validated eagerly at this state-committing
+        boundary: ``update`` commits only when the stored state is finite, so
+        a non-finite value accepted here would be stored in
+        ``last_observation`` and silently reject every later update. Traced
+        inputs pass through to those runtime gates.
+        """
+        observation = _require_concrete_finite("observation", observation)
+        return self._start(state, observation)  # type: ignore[no-any-return]
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _start(
+        self,
+        state: NonlinearHordeActorCriticState,
+        observation: Array,
+    ) -> tuple[NonlinearHordeActorCriticState, Int[Array, ""], Float[Array, " n_actions"]]:
+        """Jitted implementation of one checked episode start."""
         action, key, probs = self.select_action(state, observation)
         new_state = state.replace(  # type: ignore[attr-defined]
             last_observation=observation,
@@ -1786,11 +2088,15 @@ class NonlinearHordeActorCriticAgent:
             reward: Scalar reward for the value head.
             observation: Next observation.
             auxiliary_cumulants: Optional cumulants for non-value heads.
-            discount: Optional per-transition value-head discount.
+            discount: Optional outgoing value-head discount, saved for the
+                next accepted actor update; prior eligibility uses the last
+                accepted transition discount.
 
         Returns:
             :class:`NonlinearHordeActorCriticUpdateResult`.
         """
+        if state.previous_discount.shape != () or state.previous_discount.dtype != jnp.float32:
+            raise ValueError("state.previous_discount must be a scalar float32")
         cfg = self._config
         prev_obs = state.last_observation
         action_valid = (state.last_action >= 0) & (state.last_action < cfg.n_actions)
@@ -1822,6 +2128,9 @@ class NonlinearHordeActorCriticAgent:
             critic_result = self._critic.update_with_discounts(
                 state.critic_state, prev_obs, cumulants, observation, discounts
             )
+        critic_result = _clear_terminal_value_trace(
+            self._critic, critic_result, idx, value_discount
+        )
         td_error = critic_result.td_errors[idx]
         actor_td_error = (
             td_error
@@ -1834,7 +2143,15 @@ class NonlinearHordeActorCriticAgent:
             actor_td_error_normalizer = _skip_zero_scale(decay, actor_td_error_normalizer) + (
                 1.0 - decay
             ) * jnp.abs(actor_td_error)
-            actor_td_error = actor_td_error / jnp.maximum(actor_td_error_normalizer, 1e-3)
+            # Divide by the EMA itself. Because the EMA always contains the
+            # (1 - decay) * |td| term, |td / EMA| <= 1 / (1 - decay), so no
+            # stability floor is needed; a fixed positive floor would silently
+            # substitute its own scale whenever the recent magnitude drops
+            # below it and distort the normalized magnitude there.
+            normalizer_denominator = jnp.where(
+                actor_td_error_normalizer > 0.0, actor_td_error_normalizer, 1.0
+            )
+            actor_td_error = actor_td_error / normalizer_denominator
 
         # Policy gradient via jax.grad through the full MLP forward pass
         actor_params = (
@@ -1861,7 +2178,9 @@ class NonlinearHordeActorCriticAgent:
             cfg.actor_gradient_clip_norm,
         )
 
-        actor_decay = value_discount * cfg.actor_lamda
+        # Incoming gamma_t retains earlier credit; outgoing gamma_{t+1}
+        # controls bootstrapping and clears traces only after reward learning.
+        actor_decay = state.previous_discount * cfg.actor_lamda
         n_hidden = len(cfg.hidden_sizes)
 
         new_trunk_traces: list[Array] = []
@@ -1887,12 +2206,14 @@ class NonlinearHordeActorCriticAgent:
                 state.actor_trunk_opt_states[2 * i],
                 new_trunk_traces[2 * i],
                 error=actor_td_error,
+                param=state.actor_trunk.weights[i],
             )
             raw_b, new_opt_b, b_update_applied = _update_from_gradient_with_diagnostics(
                 self._actor_optimizer,
                 state.actor_trunk_opt_states[2 * i + 1],
                 new_trunk_traces[2 * i + 1],
                 error=actor_td_error,
+                param=state.actor_trunk.biases[i],
             )
             new_trunk_opt_states.extend([new_opt_w, new_opt_b])
             trunk_w_steps.append(raw_w)
@@ -1904,16 +2225,19 @@ class NonlinearHordeActorCriticAgent:
             state.actor_head_opt_w,
             new_head_trace_w,
             error=actor_td_error,
+            param=state.actor_head_w,
         )
         raw_head_b, new_head_opt_b, head_b_update_applied = _update_from_gradient_with_diagnostics(
             self._actor_optimizer,
             state.actor_head_opt_b,
             new_head_trace_b,
             error=actor_td_error,
+            param=state.actor_head_b,
         )
         optimizer_updates_applied.extend((head_w_update_applied, head_b_update_applied))
         head_w_step = raw_head_w
         head_b_step = raw_head_b
+        step_error = _gradient_step_error(self._actor_optimizer, actor_td_error)
 
         bound_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._actor_bounder is not None:
@@ -1931,17 +2255,17 @@ class NonlinearHordeActorCriticAgent:
             )
             bounded_steps, bound_metric = self._actor_bounder.bound(
                 flat_steps,
-                actor_td_error,
+                step_error,
                 flat_params,
             )
             trunk_w_steps = list(bounded_steps[:n_hidden])
             trunk_b_steps = list(bounded_steps[n_hidden : 2 * n_hidden])
             head_w_step = bounded_steps[2 * n_hidden]
             head_b_step = bounded_steps[2 * n_hidden + 1]
-        trunk_w_steps = [actor_td_error * step for step in trunk_w_steps]
-        trunk_b_steps = [actor_td_error * step for step in trunk_b_steps]
-        head_w_step = actor_td_error * head_w_step
-        head_b_step = actor_td_error * head_b_step
+        trunk_w_steps = [step_error * step for step in trunk_w_steps]
+        trunk_b_steps = [step_error * step for step in trunk_b_steps]
+        head_w_step = step_error * head_w_step
+        head_b_step = step_error * head_b_step
 
         new_trunk_weights = tuple(
             w + step for w, step in zip(state.actor_trunk.weights, trunk_w_steps)
@@ -1974,6 +2298,7 @@ class NonlinearHordeActorCriticAgent:
             actor_head_opt_w=new_head_opt_w,
             actor_head_opt_b=new_head_opt_b,
             actor_td_error_normalizer=actor_td_error_normalizer,
+            previous_discount=value_discount,
             critic_state=critic_result.state,
             step_count=_saturating_int32_counter_increment(state.step_count),
         )
@@ -1984,12 +2309,15 @@ class NonlinearHordeActorCriticAgent:
             rng_key=key,
         )
         inputs_valid = (
-            action_valid
+            (state.step_count >= 0)
+            & action_valid
             & jnp.isfinite(jnp.squeeze(reward))
             & jnp.all(jnp.isfinite(observation))
             & jnp.isfinite(value_discount)
             & (value_discount >= 0.0)
             & (value_discount <= 1.0)
+            & (state.previous_discount >= 0.0)
+            & (state.previous_discount <= 1.0)
             & jnp.isfinite(value)
             & ((value_discount == 0.0) | jnp.isfinite(next_value))
             & jnp.isfinite(td_error)
@@ -2022,7 +2350,7 @@ class NonlinearHordeActorCriticAgent:
         )
         return NonlinearHordeActorCriticUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=jnp.where(update_applied, next_action, jnp.asarray(0, jnp.int32)),
+            action=jnp.where(update_applied, next_action, state.last_action),
             policy=jnp.where(update_applied, next_policy, jnp.zeros_like(next_policy)),
             value=jnp.where(update_applied, value, 0.0),
             next_value=jnp.where(update_applied & (value_discount != 0.0), next_value, 0.0),
@@ -2089,7 +2417,7 @@ def run_nonlinear_horde_actor_critic_from_arrays(
         tuple[Array, Array, Array, Array, Array, Array],
     ]:
         obs, reward, next_obs, aux, disc = inputs
-        started, current_action, _policy = agent.start(carry, obs)
+        started, current_action, current_policy = agent.start(carry, obs)
         result = agent.update(started, reward, next_obs, aux, disc)
         committed_state = jax.lax.cond(
             result.update_applied,
@@ -2097,12 +2425,12 @@ def run_nonlinear_horde_actor_critic_from_arrays(
             lambda: carry,
         )
         return committed_state, (
-            jnp.where(
-                result.update_applied,
-                current_action,
-                jnp.asarray(0, dtype=jnp.int32),
-            ),
-            result.policy,
+            # The action for this row was sampled even when the learning
+            # update is rejected; reporting 0 would falsify the recorded
+            # trajectory. (This runner samples on-policy only, so the
+            # action is always a valid index.)
+            current_action,
+            jnp.where(result.update_applied, current_policy, jnp.zeros_like(current_policy)),
             result.value,
             result.td_error,
             result.critic_result.td_errors,
@@ -2169,7 +2497,7 @@ class NonlinearQHordeActorCriticConfig:
         actor_lamda = _validated_actor_float(
             "actor_lamda", self.actor_lamda, lower=0.0, upper=1.0
         )
-        temperature = _validated_actor_float("temperature", self.temperature, positive=True)
+        temperature = _validated_actor_temperature(self.temperature)
         actor_sparsity = _validated_actor_float(
             "actor_sparsity", self.actor_sparsity, lower=0.0, upper=1.0
         )
@@ -2339,10 +2667,15 @@ class NonlinearQHordeActorCriticAgent:
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> NonlinearQHordeActorCriticAgent:
         """Reconstruct from :meth:`to_config` output."""
-        payload = dict(config)
-        payload.pop("type", None)
+        payload = _exact_construction_payload(
+            config,
+            expected_type="NonlinearQHordeActorCriticAgent",
+            expected_fields=frozenset(
+                {"config", "critic", "actor_optimizer", "actor_bounder"}
+            ),
+        )
         actor_opt: Autostep | None = None
-        actor_optimizer_cfg = payload.get("actor_optimizer")
+        actor_optimizer_cfg = payload["actor_optimizer"]
         if actor_optimizer_cfg is not None:
             actor_opt = cast(Autostep, optimizer_from_config(actor_optimizer_cfg))
         return cls(
@@ -2350,7 +2683,7 @@ class NonlinearQHordeActorCriticAgent:
             critic=HordeLearner.from_config(payload["critic"]),
             actor_optimizer=actor_opt,
             actor_bounder=bounder_from_config(payload["actor_bounder"])
-            if payload.get("actor_bounder") is not None
+            if payload["actor_bounder"] is not None
             else None,
         )
 
@@ -2399,6 +2732,7 @@ class NonlinearQHordeActorCriticAgent:
             actor_head_opt_w=self._actor_optimizer.init_for_shape(actor_head_w.shape),
             actor_head_opt_b=self._actor_optimizer.init_for_shape(actor_head_b.shape),
             actor_td_error_normalizer=jnp.array(0.0, dtype=jnp.float32),
+            previous_discount=jnp.array(1.0, dtype=jnp.float32),
             critic_state=self._critic.init(feature_dim, critic_key),
             last_observation=jnp.zeros((feature_dim,), dtype=jnp.float32),
             last_action=jnp.array(-1, dtype=jnp.int32),
@@ -2422,7 +2756,9 @@ class NonlinearQHordeActorCriticAgent:
             cfg.use_layer_norm,
         )
         logits = state.actor_head_w @ hidden + state.actor_head_b
-        return jax.nn.softmax(logits / cfg.temperature)
+        return jax.nn.softmax(
+            _temperature_scaled_logits(logits, cfg.temperature)
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def q_values(self, state: NonlinearHordeActorCriticState, observation: Array) -> Array:
@@ -2439,16 +2775,36 @@ class NonlinearQHordeActorCriticAgent:
         """Sample one action from the current softmax policy."""
         key, sample_key = jr.split(state.rng_key)
         probs = self.policy(state, observation)
-        action = jr.categorical(sample_key, jnp.log(jnp.maximum(probs, 1e-8))).astype(jnp.int32)
+        action = jr.categorical(
+            sample_key,
+            jnp.log(probs),
+            mode="high",
+        ).astype(jnp.int32)
         return action, key, probs
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def start(
         self,
         state: NonlinearHordeActorCriticState,
         observation: Array,
     ) -> tuple[NonlinearHordeActorCriticState, Int[Array, ""], Float[Array, " n_actions"]]:
-        """Select and store the first action for a stream or episode."""
+        """Select and store the first action for a stream or episode.
+
+        The observation is validated eagerly at this state-committing
+        boundary: ``update`` commits only when the stored state is finite, so
+        a non-finite value accepted here would be stored in
+        ``last_observation`` and silently reject every later update. Traced
+        inputs pass through to those runtime gates.
+        """
+        observation = _require_concrete_finite("observation", observation)
+        return self._start(state, observation)  # type: ignore[no-any-return]
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _start(
+        self,
+        state: NonlinearHordeActorCriticState,
+        observation: Array,
+    ) -> tuple[NonlinearHordeActorCriticState, Int[Array, ""], Float[Array, " n_actions"]]:
+        """Jitted implementation of one checked episode start."""
         action, key, probs = self.select_action(state, observation)
         return (
             state.replace(  # type: ignore[attr-defined]
@@ -2496,12 +2852,39 @@ class NonlinearQHordeActorCriticAgent:
         cumulants = cumulants.at[safe_last_action].set(target)
         if prediction_cumulants is not None:
             cumulants = cumulants.at[cfg.n_actions :].set(prediction_cumulants)
-        critic_result = self._critic.update(
+        # A terminal transition must not bootstrap any demon: in continuing
+        # mode the observation is already the next episode's reset
+        # observation, so every discount is zero and a prediction target is
+        # its cumulant plus the demon's terminal reward. Action heads already
+        # use gamma=0, so only the prediction demons change.
+        critic_discounts = jnp.where(
+            terminated,
+            jnp.zeros_like(self._critic.horde_spec.gammas),
+            self._critic.horde_spec.gammas,
+        )
+        critic_result = self._critic.update_with_discounts(
             state.critic_state,
             prev_obs,
             cumulants,
             observation,
+            critic_discounts,
         )
+        # A terminal transition ends the episode for the prediction demons
+        # too: their traces decay by the spec gamma * lamda, so the stored
+        # trace would be credited to the next episode's first TD error.
+        # The terminal update above has already used the traces; clear them
+        # now. Action heads keep theirs: gamma=0 forces gamma * lamda = 0.
+        if self._critic.n_demons > cfg.n_actions:
+            _pred_traces = list(critic_result.state.head_traces)
+            for _i in range(cfg.n_actions, self._critic.n_demons):
+                _w, _b = _pred_traces[_i]
+                _pred_traces[_i] = (
+                    jnp.where(terminated, jnp.zeros_like(_w), _w),
+                    jnp.where(terminated, jnp.zeros_like(_b), _b),
+                )
+            critic_result = critic_result.replace(
+                state=critic_result.state.replace(head_traces=tuple(_pred_traces))
+            )
 
         actor_td_error = (
             td_error
@@ -2547,7 +2930,8 @@ class NonlinearQHordeActorCriticAgent:
             cfg.actor_gradient_clip_norm,
         )
 
-        actor_decay = effective_gamma * cfg.actor_lamda
+        # Credit retained within-episode eligibility before clearing terminal traces.
+        actor_decay = jnp.asarray(cfg.gamma, dtype=jnp.float32) * cfg.actor_lamda
         n_hidden = len(cfg.hidden_sizes)
         new_trunk_traces: list[Array] = []
         for i in range(n_hidden):
@@ -2570,12 +2954,14 @@ class NonlinearQHordeActorCriticAgent:
                 state.actor_trunk_opt_states[2 * i],
                 new_trunk_traces[2 * i],
                 error=actor_signal,
+                param=state.actor_trunk.weights[i],
             )
             raw_b, new_opt_b, b_update_applied = _update_from_gradient_with_diagnostics(
                 self._actor_optimizer,
                 state.actor_trunk_opt_states[2 * i + 1],
                 new_trunk_traces[2 * i + 1],
                 error=actor_signal,
+                param=state.actor_trunk.biases[i],
             )
             new_trunk_opt_states.extend([new_opt_w, new_opt_b])
             trunk_w_steps.append(raw_w)
@@ -2587,22 +2973,25 @@ class NonlinearQHordeActorCriticAgent:
             state.actor_head_opt_w,
             new_head_trace_w,
             error=actor_signal,
+            param=state.actor_head_w,
         )
         raw_head_b, new_head_opt_b, head_b_update_applied = _update_from_gradient_with_diagnostics(
             self._actor_optimizer,
             state.actor_head_opt_b,
             new_head_trace_b,
             error=actor_signal,
+            param=state.actor_head_b,
         )
         optimizer_updates_applied.extend((head_w_update_applied, head_b_update_applied))
         head_w_step = raw_head_w
         head_b_step = raw_head_b
+        step_error = _gradient_step_error(self._actor_optimizer, actor_signal)
 
         bound_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._actor_bounder is not None:
             bounded_steps, bound_metric = self._actor_bounder.bound(
                 (*trunk_w_steps, *trunk_b_steps, head_w_step, head_b_step),
-                actor_signal,
+                step_error,
                 (
                     *state.actor_trunk.weights,
                     *state.actor_trunk.biases,
@@ -2614,10 +3003,10 @@ class NonlinearQHordeActorCriticAgent:
             trunk_b_steps = list(bounded_steps[n_hidden : 2 * n_hidden])
             head_w_step = bounded_steps[2 * n_hidden]
             head_b_step = bounded_steps[2 * n_hidden + 1]
-        trunk_w_steps = [actor_signal * step for step in trunk_w_steps]
-        trunk_b_steps = [actor_signal * step for step in trunk_b_steps]
-        head_w_step = actor_signal * head_w_step
-        head_b_step = actor_signal * head_b_step
+        trunk_w_steps = [step_error * step for step in trunk_w_steps]
+        trunk_b_steps = [step_error * step for step in trunk_b_steps]
+        head_w_step = step_error * head_w_step
+        head_b_step = step_error * head_b_step
 
         carry_traces = effective_gamma != 0.0
         updated = state.replace(  # type: ignore[attr-defined]
@@ -2659,7 +3048,8 @@ class NonlinearQHordeActorCriticAgent:
             rng_key=key,
         )
         inputs_valid = (
-            action_valid
+            (state.step_count >= 0)
+            & action_valid
             & jnp.isfinite(jnp.squeeze(reward))
             & jnp.all(jnp.isfinite(observation))
             & jnp.all(jnp.isfinite(next_policy))
@@ -2690,7 +3080,7 @@ class NonlinearQHordeActorCriticAgent:
         )
         return NonlinearQHordeActorCriticUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=jnp.where(update_applied, next_action, jnp.asarray(0, jnp.int32)),
+            action=jnp.where(update_applied, next_action, state.last_action),
             policy=jnp.where(update_applied, policy, jnp.zeros_like(policy)),
             q_values=jnp.where(update_applied, q_previous, jnp.zeros_like(q_previous)),
             next_q_values=jnp.where(

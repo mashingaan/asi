@@ -47,6 +47,7 @@ References:
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from numbers import Integral
@@ -101,6 +102,8 @@ class Step7DynaConfig:
 
     The real transition update always happens first. Planning then performs a
     fixed number of model-generated one-step backups, gated by model warmup.
+    Each imagined rollout starts from empty eligibility traces, and the
+    real-experience traces are restored afterwards.
     """
 
     control: Step6DifferentialSARSAConfig = field(
@@ -176,19 +179,7 @@ _STEP7_CONFIG_FIELDS = frozenset(
         "planning_utility_step_size",
     }
 )
-_ACTUAL_INT_TYPES = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_ACTUAL_INT_TYPES = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 _ACTUAL_REAL_TYPES = _ACTUAL_INT_TYPES + (
     float,
     Fraction,
@@ -644,8 +635,14 @@ def init_step7_state(
     if memory_scalars > _INT32_MAX or 4 * memory_scalars > _INT32_MAX:
         raise ValueError("derived Step 7 planning-memory bytes must fit signed int32")
     control_key, model_key = jr.split(checked_key)
-    control_state = agent.init(feature_dim, control_key)
-    control_state, _ = agent.start(control_state, observation)
+    control_init = agent.init(feature_dim, control_key)
+    control_state, _ = agent.start(control_init, observation)
+    # agent.start is jitted, so the host-only lifecycle clocks it carries
+    # come back narrowed to float32; restore the exact init values.
+    control_state = control_state.replace(  # type: ignore[attr-defined]
+        birth_timestamp=control_init.birth_timestamp,
+        uptime_s=control_init.uptime_s,
+    )
     return Step7DynaState(
         control_state=control_state,
         world_model_state=model.init(model_key),
@@ -685,19 +682,28 @@ def _update_control_with_linear_rng(
     discount: Array | float = 1.0,
 ) -> DifferentialSARSAUpdateResult:
     """Apply a control backup while advancing its RNG on rejection."""
-    next_action, next_key = agent.select_action(state, next_observation)
+    # This caller owns the linear reservation contract. Action selection is
+    # fail-closed and preserves its key when policy inputs are invalid, while
+    # every attempted Step 7 control transaction must still consume the
+    # randomness reserved before planning begins.
+    next_key, _, _, _ = jr.split(state.rng_key, 4)
+    next_action, _ = agent.select_action(state, next_observation)
     advanced_state = cast(
         DifferentialSARSAState,
         state.replace(rng_key=next_key),  # type: ignore[attr-defined]
     )
     return cast(
         DifferentialSARSAUpdateResult,
-        agent.update(
-            advanced_state,
-            reward,
-            next_observation,
-            next_action=next_action,
-            discount=discount,
+        jax.lax.cond(
+            next_action >= 0,
+            lambda: agent.update(
+                advanced_state,
+                reward,
+                next_observation,
+                next_action=next_action,
+                discount=discount,
+            ),
+            lambda: agent._rejected_update_result(advanced_state),
         ),
     )
 
@@ -722,8 +728,8 @@ def _score_planning_actions(
 
     def predict_action(action: Array) -> Array:
         prediction = model.predict(model_state, anchor_observation, action)
-        transition_magnitude = jnp.sqrt(
-            jnp.mean((prediction.next_observation - anchor_observation) ** 2)
+        transition_magnitude = _root_mean_square(
+            prediction.next_observation - anchor_observation
         )
         reward_priority = jnp.abs(prediction.reward)
         return (
@@ -735,6 +741,43 @@ def _score_planning_actions(
     priorities = jax.vmap(predict_action)(actions)
     selected = jnp.argmax(priorities).astype(jnp.int32)
     return selected, priorities[selected]
+
+
+def _root_mean_square(values: Array) -> Array:
+    """Return an RMS without overflowing solely in the square reduction."""
+    direct = jnp.sqrt(jnp.mean(values * values))
+    scale = jnp.max(jnp.abs(values))
+    _, exponent = jnp.frexp(scale)
+    scaled = jnp.ldexp(values, -exponent)
+    stable = jnp.ldexp(jnp.sqrt(jnp.mean(scaled * scaled)), exponent)
+    return jnp.where(jnp.isfinite(direct), direct, stable)
+
+
+def _divide_by_one_plus_mean_square(
+    numerator: Array | float,
+    values: Array,
+    *,
+    axis: int,
+) -> Array:
+    """Evaluate ``numerator / (1 + mean(values**2))`` at finite input range."""
+    direct_distance = jnp.mean(values * values, axis=axis)
+    direct = numerator / (1.0 + direct_distance)
+    scale = jnp.max(jnp.abs(values), axis=axis)
+    _, exponent = jnp.frexp(scale)
+    normalized = jnp.ldexp(values, -jnp.expand_dims(exponent, axis=axis))
+    normalized_mean_square = jnp.mean(normalized * normalized, axis=axis)
+    numerator_mantissa, numerator_exponent = jnp.frexp(
+        jnp.asarray(numerator, dtype=values.dtype)
+    )
+    squared_exponent = 2 * exponent
+    scaled_denominator = normalized_mean_square + jnp.ldexp(
+        jnp.ones_like(normalized_mean_square), -squared_exponent
+    )
+    stable = jnp.ldexp(
+        numerator_mantissa / scaled_denominator,
+        numerator_exponent - squared_exponent,
+    )
+    return jnp.where(jnp.isfinite(direct_distance), direct, stable)
 
 
 def _store_real_transition(
@@ -808,8 +851,9 @@ def _select_planning_anchor(
         memory_utilities + 0.1 * memory_priorities,
         -jnp.inf,
     )
-    predecessor_distance = jnp.mean(
-        (memory_next_observations - reference_observation[None, :]) ** 2,
+    predecessor_similarity = _divide_by_one_plus_mean_square(
+        1.0,
+        memory_next_observations - reference_observation[None, :],
         axis=1,
     )
     # 1/(1 + d) is a bounded similarity kernel on the mean-squared distance
@@ -818,7 +862,7 @@ def _select_planning_anchor(
     # is unavailable), maximal for transitions that lead exactly here.
     predecessor_scores = jnp.where(
         valid,
-        memory_priorities + 1.0 / (1.0 + predecessor_distance),
+        memory_priorities + predecessor_similarity,
         -jnp.inf,
     )
     priority_scores = (
@@ -841,16 +885,37 @@ def _select_planning_anchor(
     return anchor, index, jnp.where(memory_count > 0, score, 0.0)
 
 
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Return ``scale * value``, or exact zero when ``scale`` is zero.
+
+    A zero blend weight means the term is not applied at all, so it must
+    contribute zero even when ``value`` is non-finite.  Taking the raw
+    product first turns ``0 * inf`` into ``NaN``.
+    """
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
 def _update_planning_utility(
     memory_utilities: Array,
     index: Array,
     td_signal: Array,
     step_size: float,
 ) -> Array:
-    """Update learned search-control utility for a planned transition."""
+    """Update learned search-control utility for a planned transition.
+
+    Both blend weights are skipped at exactly zero.  ``step_size`` is a
+    validated unit-interval real, so ``0.0`` (freeze the utility) and
+    ``1.0`` (replace it outright) are both admissible, while
+    ``td_signal`` comes from an unclamped imagined rollout and can be
+    non-finite.  Without the skip, the ignored term's ``0 * inf`` wrote
+    ``NaN`` into the stored utility, and a ``NaN`` utility poisons the
+    ``learned`` strategy's ranking for the rest of the run.
+    """
     alpha = jnp.asarray(step_size, dtype=jnp.float32)
     old_utility = memory_utilities[index]
-    new_utility = (1.0 - alpha) * old_utility + alpha * jnp.abs(td_signal)
+    retained = _skip_zero_scale(1.0 - alpha, old_utility)
+    applied = _skip_zero_scale(alpha, jnp.abs(td_signal))
+    new_utility = retained + applied
     return memory_utilities.at[index].set(new_utility)
 
 
@@ -877,17 +942,27 @@ def _propagate_predecessor_priorities(
     td_error: Array,
     propagation_scale: float,
 ) -> Array:
-    """Propagate backup priority to predecessor transitions in the queue."""
+    """Propagate backup priority to predecessor transitions in the queue.
+
+    ``propagation_scale`` is a validated non-negative real, so ``0.0``
+    (propagation disabled) is admissible, while ``td_error`` comes from an
+    unclamped imagined rollout and can be non-finite.  The scale is skipped
+    at exactly zero: the raw ``0 * inf`` produced ``NaN``, and because
+    ``jnp.maximum`` propagates ``NaN`` that wrote ``NaN`` over every live
+    queue priority — so disabling propagation destroyed the queue instead
+    of leaving it alone.
+    """
     memory_size = memory_priorities.shape[0]
     valid = jnp.arange(memory_size, dtype=jnp.int32) < memory_count
-    predecessor_distance = jnp.mean(
-        (memory_next_observations - anchor_observation[None, :]) ** 2,
+    scale = jnp.asarray(propagation_scale, dtype=jnp.float32)
+    magnitude = jnp.abs(td_error)
+    # Keep the original (scale * |td|) / (1 + d) association on finite direct
+    # distances, while still short-circuiting the disabled zero-scale lane.
+    scaled = jnp.where(scale == 0.0, jnp.zeros_like(magnitude), scale * magnitude)
+    propagated = _divide_by_one_plus_mean_square(
+        scaled,
+        memory_next_observations - anchor_observation[None, :],
         axis=1,
-    )
-    propagated = (
-        jnp.asarray(propagation_scale, dtype=jnp.float32)
-        * jnp.abs(td_error)
-        / (1.0 + predecessor_distance)
     )
     return jnp.where(valid, jnp.maximum(memory_priorities, propagated), memory_priorities)
 
@@ -935,14 +1010,19 @@ def _apply_planning_importance_correction(
         DifferentialSARSAState,
         planned_state.replace(  # type: ignore[attr-defined]
             q_weights=old_state.q_weights
-            + rho * (planned_state.q_weights - old_state.q_weights),
-            q_bias=old_state.q_bias + rho * (planned_state.q_bias - old_state.q_bias),
+            + _skip_zero_scale(rho, planned_state.q_weights - old_state.q_weights),
+            q_bias=old_state.q_bias
+            + _skip_zero_scale(rho, planned_state.q_bias - old_state.q_bias),
             q_trace_weights=old_state.q_trace_weights
-            + rho * (planned_state.q_trace_weights - old_state.q_trace_weights),
+            + _skip_zero_scale(
+                rho, planned_state.q_trace_weights - old_state.q_trace_weights
+            ),
             q_trace_bias=old_state.q_trace_bias
-            + rho * (planned_state.q_trace_bias - old_state.q_trace_bias),
+            + _skip_zero_scale(rho, planned_state.q_trace_bias - old_state.q_trace_bias),
             average_reward=old_state.average_reward
-            + rho * (planned_state.average_reward - old_state.average_reward),
+            + _skip_zero_scale(
+                rho, planned_state.average_reward - old_state.average_reward
+            ),
         ),
     )
 
@@ -1100,7 +1180,9 @@ def step7_update(
         def rollout_step(
             rollout_carry: tuple[DifferentialSARSAState, Array, Array, Array],
             _: Array,
-        ) -> tuple[tuple[DifferentialSARSAState, Array, Array, Array], tuple[Array, Array]]:
+        ) -> tuple[
+            tuple[DifferentialSARSAState, Array, Array, Array], tuple[Array, Array, Array]
+        ]:
             rollout_state, rollout_observation, rollout_action, rollout_key = (
                 rollout_carry
             )
@@ -1125,16 +1207,27 @@ def step7_update(
                 prediction.next_observation,
                 planned.action,
                 planned.state.rng_key,
-            ), (planned.td_error, prediction.reward)
+            ), (planned.td_error, prediction.reward, planned.update_applied)
 
+        # An imagined rollout starts from empty eligibility: the real traces
+        # must neither receive imagined TD errors nor absorb imagined
+        # gradients that the next real TD error would then credit.
+        rollout_start_state = carry_state.replace(  # type: ignore[attr-defined]
+            q_trace_weights=jnp.zeros_like(carry_state.q_trace_weights),
+            q_trace_bias=jnp.zeros_like(carry_state.q_trace_bias),
+        )
         (
             (rollout_state, _rollout_observation, _rollout_action, _rollout_key),
-            (rollout_td_errors, rollout_rewards),
+            (rollout_td_errors, rollout_rewards, rollout_updates_applied),
         ) = jax.lax.scan(
             rollout_step,
-            (carry_state, anchor_observation, action, key),
+            (rollout_start_state, anchor_observation, action, key),
             jnp.arange(config.planning_rollout_depth, dtype=jnp.int32),
         )
+        # A backup counts as accepted only if the core learner actually applied
+        # every imagined update; a rolled-back update leaves the state
+        # unchanged and must not be reported as planning progress.
+        rollout_accepted = planning_ready & jnp.all(rollout_updates_applied)
         rollout_td_signal = jnp.sum(rollout_td_errors)
         root_reward = rollout_rewards[0]
         restored_state = cast(
@@ -1142,6 +1235,12 @@ def step7_update(
             rollout_state.replace(  # type: ignore[attr-defined]
                 last_observation=control_after_real.last_observation,
                 last_action=control_after_real.last_action,
+                epsilon=control_after_real.epsilon,
+                step_count=control_after_real.step_count,
+                step_words=control_after_real.step_words,
+                q_trace_weights=carry_state.q_trace_weights,
+                q_trace_bias=carry_state.q_trace_bias,
+                previous_discount=carry_state.previous_discount,
             ),
         )
         corrected_state = jax.lax.cond(
@@ -1201,6 +1300,7 @@ def step7_update(
             jnp.where(planning_ready, behavior_prob, 0.0),
             jnp.where(planning_ready, target_prob, 0.0),
             jnp.where(planning_ready, importance_ratio, 0.0),
+            rollout_accepted,
         )
 
     (
@@ -1214,19 +1314,30 @@ def step7_update(
             planning_behavior_probs,
             planning_target_probs,
             planning_importance_ratios,
+            planning_accepted,
         ),
     ) = jax.lax.scan(
         planning_step,
         (control_after_real, memory_priorities, memory_utilities),
         jnp.arange(config.planning_steps, dtype=jnp.int32),
     )
-    planning_accepted = jnp.full(
-        (config.planning_steps,),
-        planning_ready,
-        dtype=jnp.bool_,
+    planning_accepted = planning_accepted.astype(jnp.bool_)
+    # The real control and model updates are jitted, so their host-only
+    # lifecycle clocks come back narrowed to float32. One foreground
+    # transition advances neither clock, so restore the exact incoming
+    # values on the returned state.
+    control_state = planned_state.replace(  # type: ignore[attr-defined]
+        birth_timestamp=state.control_state.birth_timestamp,
+        uptime_s=state.control_state.uptime_s,
+    )
+    model_state = model_state.replace(  # type: ignore[attr-defined]
+        learner_state=model_state.learner_state.replace(  # type: ignore[attr-defined]
+            birth_timestamp=state.world_model_state.learner_state.birth_timestamp,
+            uptime_s=state.world_model_state.learner_state.uptime_s,
+        ),
     )
     new_state = Step7DynaState(
-        control_state=planned_state,
+        control_state=control_state,
         world_model_state=model_state,
         memory_observations=memory_observations,
         memory_actions=memory_actions,
@@ -1310,6 +1421,7 @@ def run_step7_scan(
             result.planning_accepted,
         )
 
+    t0 = time.time()
     final_state, (
         real_td_errors,
         average_rewards,
@@ -1325,6 +1437,25 @@ def run_step7_scan(
         planning_importance_ratios,
         planning_accepted,
     ) = jax.lax.scan(scan_step, state, (rewards, next_observations))
+    elapsed = time.time() - t0
+    # Preserve the host-only lifecycle clocks at the batch boundary. The
+    # scan restores the model's clocks already (with elapsed time added);
+    # the control state passes through the same scan and needs its clocks
+    # restored exactly, or its wall-clock birth time comes back narrowed
+    # to float32. Control uptime is kept exact here, not advanced by the
+    # scan's wall time, so repeated scans of the same state stay equal.
+    final_state = final_state.replace(  # type: ignore[attr-defined]
+        control_state=final_state.control_state.replace(  # type: ignore[attr-defined]
+            birth_timestamp=state.control_state.birth_timestamp,
+            uptime_s=state.control_state.uptime_s,
+        ),
+        world_model_state=final_state.world_model_state.replace(  # type: ignore[attr-defined]
+            learner_state=final_state.world_model_state.learner_state.replace(  # type: ignore[attr-defined]
+                birth_timestamp=state.world_model_state.learner_state.birth_timestamp,
+                uptime_s=state.world_model_state.learner_state.uptime_s + elapsed,
+            ),
+        ),
+    )
     return Step7DynaArrayResult(
         state=final_state,
         real_td_errors=real_td_errors,
@@ -1382,7 +1513,7 @@ def run_step7_smoke(
     ):
         raise ValueError("derived Step 7 smoke resources exceed signed-int32 bounds")
     agent, model = make_step7_components(cfg)
-    data_key, state_key = jr.split(jr.key(seed))
+    data_key, state_key = jr.split(jr.key(seed, impl="threefry2x32"))
     observations = jr.normal(
         data_key,
         (steps + 1, cfg.world_model.observation_dim),

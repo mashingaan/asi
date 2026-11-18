@@ -14,6 +14,8 @@ from alberta_framework.core import ActorCriticAgent as CoreActorCriticAgent
 from alberta_framework.core.actor_critic import (
     ActorCriticAgent,
     ActorCriticConfig,
+    ContinuousActorCriticAgent,
+    ContinuousActorCriticConfig,
     _require_discrete_state_resources,
     run_actor_critic_from_arrays,
 )
@@ -52,6 +54,37 @@ def test_actor_critic_init_predict_and_start_shapes() -> None:
     chex.assert_trees_all_close(jnp.sum(policy), 1.0)
     _assert_actor_critic_numeric_state_finite(next_state)
     assert int(next_state.last_action) in range(3)
+
+
+def test_actor_critic_sampling_preserves_reported_rare_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
+    state = agent.init(feature_dim=1, key=jr.key(15)).replace(  # type: ignore[attr-defined]
+        actor_weights=jnp.zeros((2, 1), dtype=jnp.float32),
+        actor_bias=jnp.asarray((0.0, -20.0), dtype=jnp.float32),
+    )
+    observation = jnp.zeros((1,), dtype=jnp.float32)
+    observed_logits: list[jax.Array] = []
+    observed_modes: list[object] = []
+
+    def fake_categorical(
+        _key: jax.Array,
+        logits: jax.Array,
+        **kwargs: object,
+    ) -> jax.Array:
+        observed_logits.append(logits)
+        observed_modes.append(kwargs.get("mode"))
+        return jnp.asarray(0, dtype=jnp.int32)
+
+    monkeypatch.setattr(jr, "categorical", fake_categorical)
+    with jax.disable_jit():
+        action, _next_key, policy = agent.select_action(state, observation)
+
+    assert int(action) == 0
+    assert observed_modes == ["high"]
+    chex.assert_trees_all_close(observed_logits[0], jnp.log(policy))
+    assert float(policy[1]) < 1e-8
 
 
 def test_actor_critic_update_changes_actor_and_critic() -> None:
@@ -595,3 +628,266 @@ def test_actor_critic_state_contract_and_counter_saturation() -> None:
     )
     assert bool(result.update_applied)
     assert int(result.state.step_count) == 2**31 - 1
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, -np.inf])
+def test_actor_critic_start_rejects_nonfinite_observation(bad_value: float) -> None:
+    """The public start boundary refuses non-finite observations.
+
+    ``start`` is the one public path that commits the observation into
+    persistent state without a runtime gate: a non-finite value accepted here
+    poisons ``last_observation`` and permanently wedges every later update
+    (each is rejected by the state-finiteness gate with the state bitwise
+    unchanged). The boundary therefore fails closed eagerly, matching the
+    recurrent-trace actor-critic start contract.
+    """
+    agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
+    state = agent.init(3, jr.key(0))
+    bad_observation = jnp.array([1.0, bad_value, 0.5], dtype=jnp.float32)
+    with pytest.raises(ValueError, match="finite"):
+        agent.start(state, bad_observation)
+
+
+def test_actor_critic_start_rejects_policy_overflow_from_finite_inputs() -> None:
+    """A finite observation must not publish a non-finite action distribution."""
+    agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
+    state = agent.init(1, jr.key(0)).replace(
+        actor_weights=jnp.asarray([[2.0], [-2.0]], dtype=jnp.float32)
+    )
+    observation = jnp.asarray([np.finfo(np.float32).max], dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="start result"):
+        agent.start(state, observation)
+
+
+def test_actor_critic_select_action_rejects_policy_overflow_from_finite_inputs() -> None:
+    """A finite observation must not draw an arbitrary action from NaN probabilities."""
+    agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
+    state = agent.init(1, jr.key(0)).replace(
+        actor_weights=jnp.asarray([[2.0], [-2.0]], dtype=jnp.float32)
+    )
+    observation = jnp.asarray([np.finfo(np.float32).max], dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="action selection"):
+        agent.select_action(state, observation)
+
+
+def test_actor_critic_select_action_keeps_traced_and_finite_draws() -> None:
+    """The eager gate must leave ordinary and jitted action draws unchanged."""
+    agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
+    state = agent.init(1, jr.key(0))
+    observation = jnp.asarray([1.0], dtype=jnp.float32)
+
+    eager = agent.select_action(state, observation)
+    traced = jax.jit(agent.select_action)(state, observation)
+
+    assert int(eager[0]) == int(traced[0])
+    assert np.array_equal(jr.key_data(eager[1]), jr.key_data(traced[1]))
+    assert np.array_equal(np.asarray(eager[2]), np.asarray(traced[2]))
+
+
+def test_actor_critic_start_nonfinite_observation_would_wedge_updates() -> None:
+    """Document the wedge the start gate prevents (traced inputs, pre-fix).
+
+    Under tracing the eager gate passes through and the runtime update gate
+    stays authoritative. A NaN start observation committed by the old code
+    made every subsequent valid update return ``update_applied=False`` with
+    the state bitwise frozen; this test pins the runtime-gate recovery for a
+    mid-stream NaN *update* row and is kept for the boundary semantics.
+    """
+    agent = ActorCriticAgent(ActorCriticConfig(n_actions=2))
+    state = agent.init(2, jr.key(0))
+    observations = jnp.array(
+        [[1.0, 0.0], [np.nan, 1.0], [1.0, 0.0]], dtype=jnp.float32
+    )
+    rewards = jnp.ones((3,), dtype=jnp.float32)
+    next_observations = jnp.zeros((3, 2), dtype=jnp.float32)
+    discounts = jnp.ones((3,), dtype=jnp.float32)
+    result = run_actor_critic_from_arrays(
+        agent, state, observations, rewards, None, next_observations, discounts=discounts
+    )
+    applied = np.asarray(result.updates_applied)
+    # The NaN row itself is rejected by the runtime gate and the scan
+    # recovers on the following valid row: only a committed NaN
+    # ``last_observation`` (the old start behavior) wedged permanently.
+    assert not applied[1]
+    assert applied[0] and applied[2]
+
+
+def test_actor_critic_rejected_update_preserves_last_action() -> None:
+    """A rejected update must report the prior last_action rather than hardcoding action 0.
+
+    When an update fails validation (e.g. nonfinite reward or observation), the
+    state is rolled back to the incoming state atomically and retains
+    ``state.last_action``. The returned result.action must also report
+    ``state.last_action`` so external callers and scans record the actual action
+    maintained by the agent rather than desynchronizing with action 0.
+    """
+    agent = ActorCriticAgent(
+        ActorCriticConfig(n_actions=3, actor_step_size=0.1, critic_step_size=0.1)
+    )
+    state = agent.init(feature_dim=2, key=jr.key(0)).replace(  # type: ignore[attr-defined]
+        last_action=jnp.asarray(2, dtype=jnp.int32)
+    )
+
+    result = agent.update(
+        state,
+        reward=jnp.array(jnp.inf, dtype=jnp.float32),
+        observation=jnp.array([1.0, 0.0], dtype=jnp.float32),
+        discount=0.9,
+    )
+
+    assert not bool(result.update_applied)
+    assert int(result.state.last_action) == 2
+    assert int(result.action) == 2
+
+
+def test_continuous_actor_critic_rejected_update_preserves_last_action() -> None:
+    """Continuous actor-critic must report prior last_action when an update is rejected."""
+    agent = ContinuousActorCriticAgent(
+        ContinuousActorCriticConfig(action_dim=2, actor_step_size=0.1, critic_step_size=0.1)
+    )
+    prior_action = jnp.array([1.5, -2.0], dtype=jnp.float32)
+    state = agent.init(feature_dim=2, key=jr.key(0)).replace(  # type: ignore[attr-defined]
+        last_action=prior_action
+    )
+
+    result = agent.update(
+        state,
+        reward=jnp.array(jnp.inf, dtype=jnp.float32),
+        observation=jnp.array([1.0, 0.0], dtype=jnp.float32),
+        discount=0.9,
+    )
+
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_close(result.state.last_action, prior_action)
+    chex.assert_trees_all_close(result.action, prior_action)
+
+
+def test_terminal_reward_credits_episode_critic_trace() -> None:
+    """Terminal reward must credit the episode's eligibility traces.
+
+    For episodic AC(lambda), the terminating transition's TD error is
+    computed with discount 0 (no bootstrap), but the eligibility traces
+    accumulated over the episode must still be decayed by the *incoming*
+    discount (the prior transition's discount) so the terminal reward
+    credits the whole episode. Decaying with the outgoing (zero) discount
+    wipes the episode trace before the terminal TD error is applied, so
+    only the final step's gradient receives the terminal credit.
+    """
+    agent = ActorCriticAgent(
+        ActorCriticConfig(
+            n_actions=2,
+            gamma=1.0,
+            actor_step_size=0.0,
+            critic_step_size=0.1,
+            actor_lamda=1.0,
+            critic_lamda=1.0,
+        )
+    )
+    state = agent.init(feature_dim=2, key=jr.key(0))
+    state, _, _ = agent.start(state, jnp.array([1.0, 0.0], dtype=jnp.float32))
+
+    first = agent.update(
+        state,
+        reward=jnp.array(0.0, dtype=jnp.float32),
+        observation=jnp.array([0.0, 1.0], dtype=jnp.float32),
+        terminated=jnp.array(False),
+    )
+    assert bool(first.update_applied)
+    # Zero-initialized weights and zero reward: td_error is 0, weights stay 0,
+    # and the critic trace becomes the first observation.
+    np.testing.assert_allclose(
+        np.asarray(first.state.critic_trace_weights), [1.0, 0.0], rtol=1e-6
+    )
+
+    second = agent.update(
+        first.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=jnp.array([0.0, 0.0], dtype=jnp.float32),
+        terminated=jnp.array(True),
+    )
+    assert bool(second.update_applied)
+    assert abs(float(second.td_error) - 1.0) < 1e-6
+
+    # The terminal TD error (1.0) must credit the episode trace
+    # decayed by the incoming discount: [1,0] + [0,1] = [1,1],
+    # so critic_weights += 0.1 * 1.0 * [1, 1].
+    np.testing.assert_allclose(
+        np.asarray(second.state.critic_weights), [0.1, 0.1], rtol=1e-6, atol=1e-7
+    )
+    # Stored traces are still cleared after the terminal update.
+    np.testing.assert_allclose(
+        np.asarray(second.state.critic_trace_weights), [0.0, 0.0], atol=1e-7
+    )
+
+
+def test_terminal_reward_credits_episode_actor_trace() -> None:
+    """Terminal reward must credit the episode's actor eligibility trace.
+
+    With the trace decayed by the *incoming* discount (the prior accepted
+    transition's discount), the terminating transition's TD error credits the
+    accumulated actor trace -- the policy gradients of the whole episode.
+    Decaying with the outgoing (zero) discount wipes the episode trace first,
+    so only the final step's policy gradient receives the terminal credit.
+    """
+    agent = ActorCriticAgent(
+        ActorCriticConfig(
+            n_actions=2,
+            gamma=1.0,
+            actor_step_size=0.1,
+            critic_step_size=0.0,
+            actor_lamda=1.0,
+            critic_lamda=1.0,
+        )
+    )
+    state = agent.init(feature_dim=2, key=jr.key(0))
+    s0 = jnp.array([1.0, 0.0], dtype=jnp.float32)
+    s1 = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    state, action0, _ = agent.start(state, s0)
+    a0 = int(action0)
+
+    first = agent.update(
+        state,
+        reward=jnp.array(0.0, dtype=jnp.float32),
+        observation=s1,
+        terminated=jnp.array(False),
+    )
+    assert bool(first.update_applied)
+    a1 = int(first.state.last_action)
+
+    second = agent.update(
+        first.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=jnp.array([0.0, 0.0], dtype=jnp.float32),
+        terminated=jnp.array(True),
+    )
+    assert bool(second.update_applied)
+    assert abs(float(second.td_error) - 1.0) < 1e-6
+
+    # Weights stay zero through the episode, so both step policies are
+    # uniform and each step's actor gradient is
+    # (one_hot(action) - 0.5) outer observation (temperature 1.0).
+    def _actor_grad_weights(action: int, obs: np.ndarray) -> np.ndarray:
+        bias = np.eye(2, dtype=np.float64)[action] - 0.5
+        return bias[:, None] * np.asarray(obs, dtype=np.float64)[None, :]
+
+    expected_weights = 0.1 * (
+        _actor_grad_weights(a0, np.asarray(s0))
+        + _actor_grad_weights(a1, np.asarray(s1))
+    )
+    # The mutant that decays the actor trace with the outgoing (zero)
+    # discount at the terminal step drops the a0 term above, leaving the
+    # earlier state's column at zero instead of carrying its credit.
+    np.testing.assert_allclose(
+        np.asarray(second.state.actor_weights),
+        expected_weights,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    # Stored traces are still cleared after the terminal update.
+    np.testing.assert_allclose(
+        np.asarray(second.state.actor_trace_weights),
+        np.zeros((2, 2)),
+        atol=1e-7,
+    )

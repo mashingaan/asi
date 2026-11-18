@@ -9,10 +9,12 @@ change, retain and reuse useful knowledge, build state and models, plan and act,
 within explicit compute, memory, and latency budgets. The intended application envelope
 includes useful ongoing work and embodied systems such as robotics.
 
-The goal is a state-of-the-art continual-learning application. That is an aspiration and a
-comparative research target, not a claim about the current checkout. ASI does not yet have a
-completed whole-agent L3 protocol or result, state-of-the-art application evidence, or
-robotics readiness.
+ASI is a hill-climbing project: at every stage, the objective is to outperform the current
+best internal benchmark result under the same protocol and resource accounting. Each accepted
+improvement becomes the new baseline for the next climb. The broader goal is a state-of-the-art
+continual-learning application. That is an aspiration and comparative research target, not a
+claim about the current checkout. ASI does not yet have a completed whole-agent L3 protocol or
+result, state-of-the-art application evidence, or robotics readiness.
 
 The repository provides a JAX package of online learners, adaptive optimizers, prediction and
 control agents, learned-state and memory mechanisms, world models, planning and option
@@ -54,6 +56,20 @@ package keeps Python 3.12 compatibility and a NumPy 1.26 floor. The name labels 
 program; it is not a claim about the current software's level of intelligence.
 
 ## Current status
+
+**Progress snapshot (2026-11-07).** The completed 144-life development scorecard recorded
+`valid_baseline_failure` because its RiverSwim controls did not qualify. Follow-up probes
+identified two RiverSwim controls for a fresh matched run, discounted SARSA with initial
+Q = 10 and differential SARSA with initial average reward = 1. On SwitchingTwoState,
+Prototype's step 0.20 led step 0.10 and differential SARSA on three fresh matched seeds.
+The [hillclimb status](docs/status.md#reference-life-hillclimb) links the retained comparisons.
+
+In the [IPMNIST development lane](docs/research/ipmnist-campaign-index.md), the zero-decay,
+constant-step 0.02 arm is the leading candidate. Its retained 200-task confirmation cleared the
+annealed zero-decay comparator on all 20 seeds. A fresh 200-task pair also favored it over
+constant step 0.005625. All of these runs are permanently nonpromoting.
+The campaign index also records the replayed historical controls and the repaired
+diagonal and block covariance controls, whose distinct live configurations await measurement.
 
 Individual mechanisms range from contract-tested kernels to narrow historical evidence
 packages. The retained `PrototypeAgent` is a candidate composition surface, not a completed
@@ -145,6 +161,10 @@ machinery is L0 and permanently nonpromoting: implementation, a valid plan, or p
 does not select `reference-dev`, attest execution, or constitute a completed run, performance
 result, or scientific evidence.
 
+The [completed hosted scorecard](outputs/reference_life_scorecard_development/run2-2026-10-09/README.md)
+retains all 144 lives and an independently recomputed aggregate. Its frozen result is
+`valid_baseline_failure`: RiverSwim controls do not qualify, so no candidate is selected.
+
 The package also contains inherited surfaces related to all twelve steps of the Alberta Plan.
 That crosswalk is useful for finding gaps, but completing a checklist of Plan mechanisms would
 not by itself establish the ASI north star.
@@ -194,6 +214,16 @@ environment for every command:
 
 ```bash
 .venv/bin/python -m pip install -e '.[dev]'
+```
+
+### Windows (PowerShell)
+
+These instructions cover the CPU development setup with the `.[dev]` extra, which the Windows CI lane tests. The `.[gpu]` extra installs JAX with CUDA; JAX does not support NVIDIA GPU use on native Windows, and its WSL2 GPU support is experimental. The `.[forager]` extra is not covered by the Windows CI lane.
+
+Create a virtual environment with `py -3.12 -m venv .venv`. For later Python commands in this README that start with `.venv/bin/python`, use `.\.venv\Scripts\python.exe` instead. For example:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e '.[dev]'
 ```
 
 ## Quick start
@@ -251,6 +281,14 @@ The console scripts are grouped by responsibility; every command supports `--hel
 | `asi-ipmnist-ceiling` | Produce new, atomic no-replace stationary/carried/full or batch ceiling diagnostics |
 | `asi-ipmnist-campaign` | Recompute paired frontiers or ceiling summaries from explicit input directories |
 | `asi-rule-discovery-summary` | Rebuild the nonpromoting rule-discovery comparison from explicit inputs |
+| `asi-action-conditioned-latent` | Run the bounded, permanently nonpromoting action-conditioned latent-control lane |
+| `asi-jepa-transfer-feasibility` | Assess frozen-encoder transfer feasibility for live control; permanently nonpromoting |
+| `asi-l2er-matched-development` | Run the bounded, permanently nonpromoting L2-ER development comparison |
+| `asi-bimu-matched-development` | Inspect the bounded BiMU comparison; execution remains gated on separate authorization |
+| `asi-nap-ipmnist` | Run the bounded, permanently nonpromoting Normalize-and-Project IPMNIST comparator |
+| `asi-activation-feature-ipmnist` | Run the permanently nonpromoting activation/feature IPMNIST screening lane |
+| `asi-activation-feature-campaign` | Inspect or aggregate the permanently nonpromoting activation/feature campaign; execution remains gated |
+| `asi-new-directions-audit` | Audit historical V5/V6 development records without rewriting their source artifacts |
 | `alberta-evidence-status` | Validate the complete five-claim evidence registry |
 | `alberta-recurring-feature-evidence`, `alberta-scale-robust-evidence`, `alberta-ftl-evidence`, `alberta-multiagent-evidence`, `alberta-ia-evidence` | Validate or build one claim's versioned artifact under its strict protocol |
 | `alberta-forager-benchmark`, `alberta-historical-forager` | Run development Forager comparisons or inspect reconstructed historical families |
@@ -414,6 +452,7 @@ consumed seeds, or modify immutable `outputs/` records. See
 ### Mission and strategy
 
 - [ASI research roadmap and whole-life scorecard](docs/research/asi-roadmap.md)
+- [October 2026 issue review and dispositions](docs/research/issue-review-2026-10.md)
 - [Proposed ASI reference-agent protocol](docs/design/asi-reference-agent-protocol.md)
 
 ### Status and evidence

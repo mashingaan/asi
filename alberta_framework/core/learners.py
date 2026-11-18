@@ -114,21 +114,7 @@ _MLP_CONFIG_FIELDS = frozenset(
         "neuron_utility_decay",
     }
 )
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 def _require_int32(name: str, value: object, *, minimum: int) -> int:
@@ -148,8 +134,20 @@ def _require_learning_loop_steps(name: str, value: object) -> int:
 def _require_learning_loop_keys(keys: object) -> int:
     if not isinstance(keys, jax.Array):
         raise TypeError("keys must be a JAX array")
-    if keys.ndim not in (1, 2):
-        raise ValueError("keys must have shape (num_seeds,) or (num_seeds, 2)")
+    try:
+        typed = jnp.issubdtype(keys.dtype, jax.dtypes.prng_key)
+        implementation = str(jax.random.key_impl(keys))
+        words = jax.random.key_data(keys)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError("keys must be typed threefry2x32 JAX PRNG keys") from error
+    if (
+        not typed
+        or implementation != "threefry2x32"
+        or words.dtype != jnp.dtype(jnp.uint32)
+    ):
+        raise TypeError("keys must be typed threefry2x32 JAX PRNG keys")
+    if keys.ndim != 1 or words.shape != (*keys.shape, 2):
+        raise ValueError("keys must have shape (num_seeds,)")
     num_seeds = int(keys.shape[0])
     if num_seeds < 1 or num_seeds > _LEARNING_LOOP_MAX_SEEDS:
         raise ValueError(
@@ -206,6 +204,14 @@ def _require_exact_bool(name: str, value: object) -> bool:
     return value
 
 
+def _require_prediction_observation(observation: Observation, feature_dim: int) -> None:
+    """Reject inputs ``dot`` would broadcast into many predictions or keep complex."""
+    if jnp.shape(observation) != (feature_dim,):
+        raise ValueError(f"observation must have shape ({feature_dim},)")
+    if jnp.iscomplexobj(observation):
+        raise ValueError("observation must be real")
+
+
 def _preflight_float32_resources(name: str, scalar_count: int) -> None:
     byte_count = 4 * scalar_count
     if scalar_count > _INT32_MAX or byte_count > _INT32_MAX:
@@ -233,6 +239,23 @@ def _learner_clock_has_capacity(step_count: Array) -> Bool[Array, ""]:
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
     """Skip a collapsed 0*inf product before it becomes NaN."""
     return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
+def _reduction_safe_row_l2_norm(values: Array) -> Array:
+    """Keep representable row norms finite when their square sum overflows."""
+
+    direct = jnp.sqrt(jnp.sum(values * values, axis=1) + 1e-12)
+    scale = jnp.max(jnp.abs(values), axis=1, keepdims=True)
+    _, exponents = jnp.frexp(scale)
+    scaled = jnp.ldexp(values, -exponents)
+    stable = jnp.ldexp(
+        jnp.sqrt(jnp.sum(scaled * scaled, axis=1)),
+        jnp.squeeze(exponents, axis=1),
+    )
+    reduction_only_overflow = ~jnp.isfinite(direct) & jnp.all(
+        jnp.isfinite(values), axis=1
+    )
+    return jnp.where(reduction_only_overflow, stable, direct)
 
 
 # Type variable for TD stream state
@@ -368,16 +391,31 @@ class LinearLearner:
         )
 
     def predict(self, state: LearnerState, observation: Observation) -> Prediction:
-        """Compute prediction for an observation.
+        """Compute prediction for a raw observation.
+
+        When a normalizer is configured the observation is normalized with the
+        statistics held in ``state`` first, so the prediction is the one the
+        learned weights were trained to produce. ``update`` reports the same
+        prediction for the statistics it commits.
 
         Args:
             state: Current learner state
-            observation: Input feature vector
+            observation: Raw input feature vector
 
         Returns:
-            Scalar prediction ``y = w @ x + b``
+            Scalar prediction ``y = w @ phi(x) + b`` where ``phi`` is the
+            configured normalizer (identity when none is configured)
         """
-        return jnp.atleast_1d(jnp.dot(state.weights, observation) + state.bias)
+        _require_prediction_observation(observation, state.weights.size)
+        obs = observation
+        if self._normalizer is not None and state.normalizer_state is not None:
+            obs = self._normalizer.normalize_only(state.normalizer_state, observation)
+        return self._predict_normalized(state, obs)
+
+    @staticmethod
+    def _predict_normalized(state: LearnerState, normalized: Observation) -> Prediction:
+        """Affine map on an observation the normalizer has already processed."""
+        return jnp.atleast_1d(jnp.dot(state.weights, normalized) + state.bias)
 
     def update(
         self,
@@ -414,18 +452,7 @@ class LinearLearner:
             new_normalizer_state = normalizer_result.state
             normalizer_update_applied = normalizer_result.update_applied
 
-        prediction = self.predict(
-            LearnerState(
-                weights=state.weights,
-                bias=state.bias,
-                optimizer_state=state.optimizer_state,
-                normalizer_state=new_normalizer_state,
-                step_count=state.step_count,
-                birth_timestamp=state.birth_timestamp,
-                uptime_s=state.uptime_s,
-            ),
-            obs,
-        )
+        prediction = self._predict_normalized(state, obs)
 
         error = jnp.squeeze(target) - jnp.squeeze(prediction)
 
@@ -454,6 +481,12 @@ class LinearLearner:
 
         if self._normalizer is not None and new_normalizer_state is not None:
             normalizer_mean_var = jnp.mean(new_normalizer_state.var)
+            # Recover reduction overflow only when each variance is finite.
+            normalizer_mean_var = jnp.where(
+                jnp.isinf(normalizer_mean_var) & jnp.all(jnp.isfinite(new_normalizer_state.var)),
+                jnp.sum(new_normalizer_state.var / new_normalizer_state.var.size),
+                normalizer_mean_var,
+            )
             metrics = jnp.array(
                 [squared_error, error, mean_step_size, normalizer_mean_var],
                 dtype=jnp.float32,
@@ -611,8 +644,12 @@ def run_learning_loop[StreamStateT](
         (final_learner, _), metrics = jax.lax.scan(
             step_fn, (learner_state, stream_state), jnp.arange(num_steps)
         )
+        jax.block_until_ready((final_learner, metrics))  # type: ignore[no-untyped-call]
         elapsed = time.time() - t0
-        final_learner = final_learner.replace(uptime_s=final_learner.uptime_s + elapsed)  # type: ignore[attr-defined]
+        final_learner = final_learner.replace(  # type: ignore[attr-defined]
+            birth_timestamp=learner_state.birth_timestamp,
+            uptime_s=learner_state.uptime_s + elapsed,
+        )
 
         return final_learner, metrics
 
@@ -620,8 +657,8 @@ def run_learning_loop[StreamStateT](
     ss_interval = step_size_tracking.interval if step_size_tracking else num_steps + 1
     norm_interval = normalizer_tracking.interval if normalizer_tracking else num_steps + 1
 
-    ss_num_recordings = num_steps // ss_interval if step_size_tracking else 0
-    norm_num_recordings = num_steps // norm_interval if normalizer_tracking else 0
+    ss_num_recordings = -(-num_steps // ss_interval) if step_size_tracking else 0
+    norm_num_recordings = -(-num_steps // norm_interval) if normalizer_tracking else 0
 
     # Pre-allocate step-size history arrays
     ss_history = (
@@ -795,8 +832,12 @@ def run_learning_loop[StreamStateT](
         ),
         metrics,
     ) = jax.lax.scan(step_fn_with_tracking, initial_carry, jnp.arange(num_steps))
+    jax.block_until_ready((final_learner, metrics))  # type: ignore[no-untyped-call]
     elapsed = time.time() - t0
-    final_learner = final_learner.replace(uptime_s=final_learner.uptime_s + elapsed)  # type: ignore[attr-defined]
+    final_learner = final_learner.replace(  # type: ignore[attr-defined]
+        birth_timestamp=learner_state.birth_timestamp,
+        uptime_s=learner_state.uptime_s + elapsed,
+    )
 
     # Build return values based on what was tracked
     ss_history_result = None
@@ -847,7 +888,7 @@ def run_learning_loop_batched[StreamStateT](
         learner: The learner to train
         stream: Experience stream providing (observation, target) pairs
         num_steps: Number of learning steps to run per seed
-        keys: JAX random keys with shape (num_seeds,) or (num_seeds, 2)
+        keys: Typed Threefry JAX random keys with shape (num_seeds,)
         learner_state: Initial state (if None, will be initialized from stream).
             The same initial state is used for all seeds.
         step_size_tracking: Optional config for recording per-weight step-sizes.
@@ -918,6 +959,9 @@ def run_learning_loop_batched[StreamStateT](
     batched_states, batched_metrics, batched_ss_history, batched_norm_history = jax.vmap(
         single_seed_run
     )(keys)
+    jax.block_until_ready(  # type: ignore[no-untyped-call]
+        (batched_states, batched_metrics, batched_ss_history, batched_norm_history)
+    )
     elapsed = time.time() - t0
     batched_states = batched_states.replace(  # type: ignore[attr-defined]
         uptime_s=batched_states.uptime_s + elapsed
@@ -985,10 +1029,34 @@ def _update_from_gradient_with_diagnostics(
     gradient: Array,
     *,
     error: Array | None,
+    param: Array | None = None,
 ) -> tuple[Array, Any, Bool[Array, ""]]:
-    """Use the checked optimizer boundary for an enclosing transaction."""
-    result = optimizer.update_from_gradient_checked(state, gradient, error=error)
-    return result.step, result.new_state, result.update_applied
+    """Adapt a learner's additive trace direction to the checked optimizer API.
+
+    With no separate error, shared trunks already supply an additive update
+    direction (the negative loss gradient). Baseline optimizers consume loss
+    gradients instead; reverse their input and descent step at this boundary.
+    """
+    loss_gradient_path = error is None and optimizer.gradient_update_returns_delta()
+    optimizer_gradient = -gradient if loss_gradient_path else gradient
+    if optimizer.gradient_update_requires_param():
+        if param is None:
+            raise ValueError(
+                f"{type(optimizer).__name__} requires the current parameter "
+                "for gradient updates"
+            )
+        result = optimizer.update_from_gradient_checked(
+            state, optimizer_gradient, error=error, param=param
+        )
+    else:
+        result = optimizer.update_from_gradient_checked(state, optimizer_gradient, error=error)
+    step = -result.step if loss_gradient_path else result.step
+    return step, result.new_state, result.update_applied
+
+
+def _gradient_step_error(optimizer: Any, error: Array) -> Array:
+    """Multiplier/bounder error for one optimizer's returned gradient step."""
+    return jnp.ones_like(error) if optimizer.gradient_update_returns_delta() else error
 
 
 class MLPLearner:
@@ -1251,6 +1319,33 @@ class MLPLearner:
             if layer_i + 1 < len(new_weights):
                 out_w = new_weights[layer_i + 1]  # shape (h_{i+1}, h_i)
                 new_weights[layer_i + 1] = jnp.where(dormant_mask[None, :], 0.0, out_w)
+                # The zeroed outgoing column must not inherit the dead
+                # neuron's adaptation history either: clear its eligibility
+                # traces and re-initialise its optimizer-state slice, mirroring
+                # continual_backprop._replace_one_unit. Otherwise the first
+                # post-reset updates move the fresh zero weights along
+                # pre-reset trace directions with pre-reset step-sizes.
+                new_traces[2 * (layer_i + 1)] = jnp.where(
+                    dormant_mask[None, :], 0.0, new_traces[2 * (layer_i + 1)]
+                )
+                is_output_layer = layer_i + 1 == len(new_weights) - 1
+                out_optimizer = (
+                    self._head_optimizer
+                    if is_output_layer and self._head_optimizer is not None
+                    else self._optimizer
+                )
+                fresh_out_opt = out_optimizer.init_for_shape(out_w.shape)
+
+                def _reset_out_col(
+                    x: Array, fresh: Array, m: Array = dormant_mask
+                ) -> Array:
+                    if x.ndim != 2:
+                        return x
+                    return jnp.where(m[None, :], fresh, x)
+
+                new_opt_states[2 * (layer_i + 1)] = jax.tree_util.tree_map(
+                    _reset_out_col, new_opt_states[2 * (layer_i + 1)], fresh_out_opt
+                )
             # Reset utility for reset neurons
             new_utility[layer_i] = jnp.where(dormant_mask, 0.0, new_utility[layer_i])
 
@@ -1350,10 +1445,25 @@ class MLPLearner:
             for fan_in, fan_out in zip(layer_sizes, layer_sizes[1:])
         )
         utility_count = sum(self._hidden_sizes) if self._track_neuron_utility else 0
-        # Parameters, traces, optimizer working/state copies, and optional utility.
+        hidden_weight_count = (
+            sum(
+                fan_out * fan_in
+                for fan_in, fan_out in zip(
+                    layer_sizes[:-2], layer_sizes[1:-1], strict=True
+                )
+            )
+            if self._track_neuron_utility
+            else 0
+        )
+        # Parameters, traces, optimizer working/state copies, optional utility,
+        # and the scaled-gradient plus row temporaries for safe utility norms.
         _preflight_float32_resources(
-            "MLP learner state and initialization work",
-            8 * parameter_count + utility_count + 3,
+            "MLP learner state, initialization, and update work",
+            8 * parameter_count
+            + utility_count
+            + hidden_weight_count
+            + 3 * utility_count
+            + 3,
         )
 
         # Build layer sizes: [feature_dim, hidden1, hidden2, ..., 1]
@@ -1454,17 +1564,25 @@ class MLPLearner:
         JIT-compiled automatically. First call triggers tracing; subsequent
         calls with the same learner instance use the cached compilation.
 
+        When a normalizer is configured the observation is normalized with the
+        statistics held in ``state`` first, matching the input ``update``
+        trains the network on.
+
         Args:
             state: Current MLP learner state
-            observation: Input feature vector
+            observation: Raw input feature vector
 
         Returns:
             Scalar prediction
         """
+        _require_prediction_observation(observation, state.params.weights[0].shape[1])
+        obs = observation
+        if self._normalizer is not None and state.normalizer_state is not None:
+            obs = self._normalizer.normalize_only(state.normalizer_state, observation)
         y = self._forward(
             state.params.weights,
             state.params.biases,
-            observation,
+            obs,
             self._leaky_relu_slope,
             self._use_layer_norm,
         )
@@ -1563,6 +1681,15 @@ class MLPLearner:
         # Per-parameter optimizer step from traces
         # Output layer uses head_optimizer if set (last 2 entries: weight + bias)
         n_trace_entries = len(new_traces)
+        all_params = []
+        for i in range(n_layers):
+            all_params.append(state.params.weights[i])
+            all_params.append(state.params.biases[i])
+        direct_steps = self._optimizer.gradient_update_returns_delta() or (
+            self._head_optimizer is not None
+            and self._head_optimizer.gradient_update_returns_delta()
+        )
+        step_error = jnp.ones_like(error) if direct_steps else error
         all_steps = []
         new_opt_states = []
         optimizer_updates_applied = []
@@ -1575,8 +1702,11 @@ class MLPLearner:
                     state.optimizer_states[j],
                     new_traces[j],
                     error=error,
+                    param=all_params[j],
                 )
             )
+            if direct_steps and not opt.gradient_update_returns_delta():
+                step = error * step
             all_steps.append(step)
             new_opt_states.append(new_opt)
             optimizer_updates_applied.append(optimizer_update_applied)
@@ -1584,21 +1714,17 @@ class MLPLearner:
         # Bounding (optional)
         bounding_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._bounder is not None:
-            all_params = []
-            for i in range(n_layers):
-                all_params.append(state.params.weights[i])
-                all_params.append(state.params.biases[i])
             bounded_steps, bounding_metric = self._bounder.bound(
-                tuple(all_steps), error, tuple(all_params)
+                tuple(all_steps), step_error, tuple(all_params)
             )
             all_steps = list(bounded_steps)
 
         new_weights = []
         new_biases = []
         for i in range(n_layers):
-            new_w = state.params.weights[i] + error * all_steps[2 * i]
+            new_w = state.params.weights[i] + step_error * all_steps[2 * i]
             new_weights.append(new_w)
-            new_b = state.params.biases[i] + error * all_steps[2 * i + 1]
+            new_b = state.params.biases[i] + step_error * all_steps[2 * i + 1]
             new_biases.append(new_b)
 
         new_params = MLPParams(
@@ -1616,7 +1742,7 @@ class MLPLearner:
                     decay * state.neuron_utility[i],
                 )
                 + (1.0 - decay)
-                * jnp.sqrt(jnp.sum(weight_grads[i] ** 2, axis=1) + 1e-12)
+                * _reduction_safe_row_l2_norm(weight_grads[i])
                 for i in range(len(self._hidden_sizes))
             )
 
@@ -1662,6 +1788,12 @@ class MLPLearner:
 
         if self._normalizer is not None and new_normalizer_state is not None:
             normalizer_mean_var = jnp.mean(new_normalizer_state.var)
+            # Recover reduction overflow only when each variance is finite.
+            normalizer_mean_var = jnp.where(
+                jnp.isinf(normalizer_mean_var) & jnp.all(jnp.isfinite(new_normalizer_state.var)),
+                jnp.sum(new_normalizer_state.var / new_normalizer_state.var.size),
+                normalizer_mean_var,
+            )
             metrics = jnp.array(
                 [squared_error, error, bounding_metric, normalizer_mean_var],
                 dtype=jnp.float32,
@@ -1757,14 +1889,22 @@ def run_mlp_learning_loop[StreamStateT](
         (final_learner, _), metrics = jax.lax.scan(
             step_fn, (learner_state, stream_state), jnp.arange(num_steps)
         )
+        jax.block_until_ready((final_learner, metrics))  # type: ignore[no-untyped-call]
         elapsed = time.time() - t0
-        final_learner = final_learner.replace(uptime_s=final_learner.uptime_s + elapsed)  # type: ignore[attr-defined]
+        # update() is JIT-compiled, so the scan returns float32 host clocks.
+        # Restore the incoming Python values and add this scan's time to the
+        # original uptime; float32 cannot represent a large uptime plus a
+        # short elapsed interval.
+        final_learner = final_learner.replace(  # type: ignore[attr-defined]
+            birth_timestamp=learner_state.birth_timestamp,
+            uptime_s=learner_state.uptime_s + elapsed,
+        )
 
         return final_learner, metrics
 
     # Tracking enabled
     norm_interval = normalizer_tracking.interval
-    norm_num_recordings = num_steps // norm_interval
+    norm_num_recordings = -(-num_steps // norm_interval)
 
     norm_means = jnp.zeros((norm_num_recordings, feature_dim), dtype=jnp.float32)
     norm_vars = jnp.zeros((norm_num_recordings, feature_dim), dtype=jnp.float32)
@@ -1813,8 +1953,13 @@ def run_mlp_learning_loop[StreamStateT](
         (final_learner, _, final_n_means, final_n_vars, final_n_rec),
         metrics,
     ) = jax.lax.scan(step_fn_with_tracking, initial_carry, jnp.arange(num_steps))
+    jax.block_until_ready((final_learner, metrics))  # type: ignore[no-untyped-call]
     elapsed = time.time() - t0
-    final_learner = final_learner.replace(uptime_s=final_learner.uptime_s + elapsed)  # type: ignore[attr-defined]
+    # Same host-clock restore as the untracked MLP loop above.
+    final_learner = final_learner.replace(  # type: ignore[attr-defined]
+        birth_timestamp=learner_state.birth_timestamp,
+        uptime_s=learner_state.uptime_s + elapsed,
+    )
 
     norm_history = NormalizerHistory(
         means=final_n_means,
@@ -1842,7 +1987,7 @@ def run_mlp_learning_loop_batched[StreamStateT](
         learner: The MLP learner to train
         stream: Experience stream providing (observation, target) pairs
         num_steps: Number of learning steps to run per seed
-        keys: JAX random keys with shape (num_seeds,) or (num_seeds, 2)
+        keys: Typed Threefry JAX random keys with shape (num_seeds,)
         learner_state: Initial state (if None, will be initialized from stream).
             The same initial state is used for all seeds.
         normalizer_tracking: Optional config for recording normalizer state.
@@ -1893,6 +2038,9 @@ def run_mlp_learning_loop_batched[StreamStateT](
 
     t0 = time.time()
     batched_states, batched_metrics, batched_norm_history = jax.vmap(single_seed_run)(keys)
+    jax.block_until_ready(  # type: ignore[no-untyped-call]
+        (batched_states, batched_metrics, batched_norm_history)
+    )
     elapsed = time.time() - t0
     batched_states = batched_states.replace(  # type: ignore[attr-defined]
         uptime_s=batched_states.uptime_s + elapsed
@@ -1997,6 +2145,7 @@ class TDLinearLearner:
         Returns:
             Scalar value prediction ``V(s) = w @ phi(s) + b``
         """
+        _require_prediction_observation(observation, state.weights.size)
         return jnp.atleast_1d(jnp.dot(state.weights, observation) + state.bias)
 
     def update(
@@ -2100,13 +2249,21 @@ class TDLinearLearner:
 
 @chex.dataclass(frozen=True)
 class TrueOnlineTDState:
-    """State for True Online TD(lambda) with Dutch traces."""
+    """State for True Online TD(lambda) with Dutch traces.
+
+    ``previous_gamma`` is the discount from the prior update call, carried so
+    the Dutch trace decays by ``gamma_t`` (the discount of the transition into
+    ``S_t``) while the TD error bootstraps with ``gamma_{t+1}`` (Sutton & Barto
+    2nd ed., eqs. 12.23/12.25). It is seeded to 1.0, which is inert against the
+    zero initial traces.
+    """
 
     weights: Float[Array, " feature_dim"]
     bias: Float[Array, ""]
     eligibility_traces: Float[Array, " feature_dim"]
     bias_eligibility_trace: Float[Array, ""]
     v_old: Float[Array, ""]
+    previous_gamma: Float[Array, ""]
     step_count: Array = None  # type: ignore[assignment]
     birth_timestamp: float = 0.0
     uptime_s: float = 0.0
@@ -2132,9 +2289,13 @@ class TrueOnlineTDLearner:
     """Linear True Online TD(lambda) learner with Dutch traces.
 
     Implements the true-online update for a linear value function with an
-    explicit bias feature. At terminal transitions (``gamma == 0``),
-    ``v_old`` is reset to zero so repeated one-step supervised transitions
-    reduce exactly to LMS.
+    explicit bias feature. The ``gamma`` passed to :meth:`update` is
+    ``gamma_{t+1}`` and enters only the TD-error bootstrap; the Dutch trace
+    decays by the prior call's discount carried in ``state.previous_gamma``,
+    so the update that carries a terminal reward still credits the traces
+    accumulated within the episode. At terminal transitions (``gamma == 0``),
+    the stored traces and ``v_old`` are reset to zero so repeated one-step
+    supervised transitions reduce exactly to LMS.
 
     References:
         van Seijen & Sutton (2014). "True Online TD(lambda)." ICML.
@@ -2152,13 +2313,14 @@ class TrueOnlineTDLearner:
     def init(self, feature_dim: int) -> TrueOnlineTDState:
         """Initialize learner state."""
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
-        _preflight_float32_resources("true-online TD state", 2 * feature_dim + 5)
+        _preflight_float32_resources("true-online TD state", 2 * feature_dim + 6)
         return TrueOnlineTDState(
             weights=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias=jnp.array(0.0, dtype=jnp.float32),
             eligibility_traces=jnp.zeros(feature_dim, dtype=jnp.float32),
             bias_eligibility_trace=jnp.array(0.0, dtype=jnp.float32),
             v_old=jnp.array(0.0, dtype=jnp.float32),
+            previous_gamma=jnp.array(1.0, dtype=jnp.float32),
             step_count=jnp.array(0, dtype=jnp.int32),
             birth_timestamp=time.time(),
             uptime_s=0.0,
@@ -2167,6 +2329,7 @@ class TrueOnlineTDLearner:
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(self, state: TrueOnlineTDState, observation: Observation) -> Prediction:
         """Compute scalar value prediction."""
+        _require_prediction_observation(observation, state.weights.size)
         return jnp.atleast_1d(jnp.dot(state.weights, observation) + state.bias)
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -2186,14 +2349,24 @@ class TrueOnlineTDLearner:
 
         value = jnp.squeeze(self.predict(state, observation))
         next_value = jnp.squeeze(self.predict(state, next_observation))
-        td_error = jnp.squeeze(reward) + _skip_zero_scale(gamma_scalar, next_value) - value
+        # Keep ordinary rounding. Recover only an overflowing partial sum
+        # whose cancellation against V(s) is a finite TD error.
+        reward_scalar = jnp.squeeze(reward)
+        bootstrap = _skip_zero_scale(gamma_scalar, next_value)
+        direct_partial = reward_scalar + bootstrap
+        direct_td = direct_partial - value
+        recovered_td = reward_scalar + (bootstrap - value)
+        td_error = jnp.where(jnp.isfinite(direct_partial), direct_td, recovered_td)
 
         trace_dot = jnp.dot(state.eligibility_traces, observation)
         trace_dot = trace_dot + state.bias_eligibility_trace
+        # The Dutch trace decays by the PRIOR call's discount
+        # (state.previous_gamma = gamma_t, the discount into S_t); only the
+        # TD-error bootstrap above uses this call's gamma_{t+1}.
         decay_scale = jnp.where(
-            (gamma_scalar == 0.0) | (lamda == 0.0),
-            jnp.zeros_like(gamma_scalar),
-            gamma_scalar * lamda,
+            (state.previous_gamma == 0.0) | (lamda == 0.0),
+            jnp.zeros_like(state.previous_gamma),
+            state.previous_gamma * lamda,
         )
         trace_scale = 1.0 - alpha * _skip_zero_scale(decay_scale, trace_dot)
         new_traces = (
@@ -2202,17 +2375,29 @@ class TrueOnlineTDLearner:
         new_bias_trace = _skip_zero_scale(decay_scale, state.bias_eligibility_trace) + trace_scale
 
         correction = value - state.v_old
-        update_scale = alpha * (td_error + correction)
-        new_weights = (
+        # Direct form: alpha * (delta + correction) * e - alpha * correction * phi.
+        # When delta and the correction are both huge, that sum overflows even
+        # though alpha * delta * e + alpha * correction * (e - phi) is finite.
+        direct_scale = alpha * (td_error + correction)
+        direct_weights = (
             state.weights
-            + update_scale * new_traces
+            + direct_scale * new_traces
             - alpha * correction * observation
         )
-        new_bias = (
-            state.bias
-            + update_scale * new_bias_trace
-            - alpha * correction
+        direct_bias = state.bias + direct_scale * new_bias_trace - alpha * correction
+        recovered_weights = state.weights + (alpha * td_error) * new_traces + (
+            alpha * correction
+        ) * (new_traces - observation)
+        recovered_bias = state.bias + (alpha * td_error) * new_bias_trace + (
+            alpha * correction
+        ) * (new_bias_trace - 1.0)
+        direct_update_finite = (
+            jnp.isfinite(direct_scale)
+            & jnp.all(jnp.isfinite(direct_weights))
+            & jnp.isfinite(direct_bias)
         )
+        new_weights = jnp.where(direct_update_finite, direct_weights, recovered_weights)
+        new_bias = jnp.where(direct_update_finite, direct_bias, recovered_bias)
 
         terminal = gamma_scalar == 0.0
         stored_traces = jnp.where(terminal, jnp.zeros_like(new_traces), new_traces)
@@ -2224,6 +2409,7 @@ class TrueOnlineTDLearner:
             eligibility_traces=stored_traces,
             bias_eligibility_trace=stored_bias_trace,
             v_old=new_v_old,
+            previous_gamma=gamma_scalar,
             step_count=_saturating_int32_counter_increment(state.step_count),
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
@@ -2352,7 +2538,10 @@ def run_td_learning_loop[StreamStateT](
         step_fn, (learner_state, stream_state), jnp.arange(num_steps)
     )
     elapsed = time.time() - t0
-    final_learner = final_learner.replace(uptime_s=final_learner.uptime_s + elapsed)  # type: ignore[attr-defined]
+    final_learner = final_learner.replace(  # type: ignore[attr-defined]
+        birth_timestamp=learner_state.birth_timestamp,
+        uptime_s=learner_state.uptime_s + elapsed,
+    )
 
     return final_learner, metrics
 
@@ -2393,7 +2582,11 @@ def run_true_online_td_loop[StreamStateT](
         jnp.arange(num_steps),
     )
     elapsed = time.time() - t0
+    # update() is JIT-compiled, so the scan returns float32 host clocks.
+    # Restore the incoming Python values and add this scan's time to the
+    # original uptime.
     final_learner = final_learner.replace(  # type: ignore[attr-defined]
-        uptime_s=final_learner.uptime_s + elapsed
+        birth_timestamp=learner_state.birth_timestamp,
+        uptime_s=learner_state.uptime_s + elapsed,
     )
     return final_learner, metrics

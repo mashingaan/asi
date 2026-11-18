@@ -86,6 +86,25 @@ def _require_int32(
     return canonical
 
 
+def _require_typed_threefry_key(name: str, value: object) -> Array:
+    """Require one typed scalar Threefry key without accepting legacy words."""
+
+    try:
+        key = jnp.asarray(value)
+        implementation = str(jr.key_impl(value))  # type: ignore[arg-type]
+        words = jr.key_data(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a typed scalar threefry2x32 key") from error
+    if (
+        key.shape != ()
+        or implementation != "threefry2x32"
+        or words.shape != (2,)
+        or words.dtype != jnp.uint32
+    ):
+        raise TypeError(f"{name} must be a typed scalar threefry2x32 key")
+    return key
+
+
 def _require_interaction_feature_loop_steps(name: str, value: object) -> int:
     """Reject scan lengths above the public last-fit before ``jnp.arange``."""
     if type(value) is not int or value < 1 or value > _INTERACTION_FEATURE_LOOP_MAX_STEPS:
@@ -93,6 +112,27 @@ def _require_interaction_feature_loop_steps(name: str, value: object) -> int:
             f"{name} must be an integer in [1, {_INTERACTION_FEATURE_LOOP_MAX_STEPS}]"
         )
     return value
+
+
+def _representable_l2_norm(values: Array) -> Array:
+    """Recover a representable float32 norm when only its reduction overflows."""
+
+    direct = jnp.linalg.norm(values)
+    maximum = jnp.max(jnp.abs(values))
+    mantissa, exponent = jnp.frexp(maximum)
+    safe_mantissa = jnp.where(maximum > 0.0, mantissa, 1.0)
+    scaled = jnp.ldexp(values, -exponent) / safe_mantissa
+    scaled_norm = jnp.sqrt(jnp.sum(jnp.square(scaled)))
+    safe_scaled_norm = jnp.where(scaled_norm > 0.0, scaled_norm, 1.0)
+    float32_max = jnp.asarray(np.finfo(np.float32).max, dtype=jnp.float32)
+    true_norm_overflows = maximum > float32_max / safe_scaled_norm
+    stable = jnp.where(
+        maximum == 0.0,
+        0.0,
+        jnp.where(true_norm_overflows, jnp.inf, maximum * scaled_norm),
+    )
+    reduction_only_overflow = ~jnp.isfinite(direct) & jnp.all(jnp.isfinite(values))
+    return jnp.where(reduction_only_overflow, stable, direct)
 
 
 def _require_resource(name: str, *, scalars: int, nbytes: int) -> None:
@@ -518,6 +558,11 @@ class FixedBudgetInteractionLearner:
     per active feature and candidate plus one per task; this fixed cost is
     exposed by :meth:`memory_accounting`.
 
+    ``candidate_residual_feedback=True`` subtracts each candidate's own
+    prediction when training it on the active bank's residual. This option
+    applies to the unnormalized, non-probe path. Its default preserves the
+    historical candidate recurrence used by the frozen evidence protocols.
+
     ``use_obgd=True`` (default, LMS path only) applies ObGD-style overshoot
     bounding (Observation-bounded Gradient Descent; Elsayed et al. 2024,
     "Streaming Deep Reinforcement Learning Finally Works"): the aggregate
@@ -598,6 +643,8 @@ class FixedBudgetInteractionLearner:
         scale_normalizer_decay: float = 0.99,
         scale_normalizer_epsilon: float = 1e-6,
         task_utility_weights: tuple[float, ...] | None = None,
+        *,
+        candidate_residual_feedback: bool = False,
     ):
         n_features = _require_int32("n_features", n_features, minimum=1)
         n_tasks = _require_int32("n_tasks", n_tasks, minimum=1)
@@ -651,6 +698,7 @@ class FixedBudgetInteractionLearner:
             ("include_squares", include_squares),
             ("use_obgd", use_obgd),
             ("scale_robust", scale_robust),
+            ("candidate_residual_feedback", candidate_residual_feedback),
         ):
             if type(value) is not bool:
                 raise ValueError(f"{name} must be boolean")
@@ -882,10 +930,22 @@ class FixedBudgetInteractionLearner:
                 "the robust loss proxy replaces the raw LMS counterfactual"
             )
 
-        mix = jnp.array(generator_mix, dtype=jnp.float32)
-        if mix.shape != (3,):
-            raise ValueError("generator_mix must have three entries")
-        mix_sum = float(jnp.sum(mix))
+        # ``generator_mix`` is a categorical over the three candidate
+        # generators: every entry must be a finite, non-negative real. A
+        # negative entry passes a positive-sum check but its log inside the
+        # categorical draw is NaN, which collapses the draw onto one generator.
+        if type(generator_mix) is not tuple or len(generator_mix) != 3:
+            raise ValueError("generator_mix must be a tuple of three entries")
+        validated_generator_mix = tuple(
+            validated_float32_scalar(f"generator_mix[{index}]", value, lower=0.0)
+            for index, value in enumerate(generator_mix)
+        )
+        generator_mix = (
+            validated_generator_mix[0],
+            validated_generator_mix[1],
+            validated_generator_mix[2],
+        )
+        mix_sum = sum(generator_mix)
         if mix_sum <= 0.0:
             raise ValueError("generator_mix must contain positive mass")
 
@@ -930,6 +990,7 @@ class FixedBudgetInteractionLearner:
         self._scale_robust = scale_robust
         self._scale_normalizer_decay = scale_normalizer_decay
         self._scale_normalizer_epsilon = scale_normalizer_epsilon
+        self._candidate_residual_feedback = candidate_residual_feedback
 
     @property
     def n_features(self) -> int:
@@ -953,12 +1014,7 @@ class FixedBudgetInteractionLearner:
             raise TypeError("state must be an InteractionFeatureState")
         if feature_dim < 1:
             raise ValueError("feature_dim must be positive")
-        key = jnp.asarray(state.key)
-        if key.shape != () or not jnp.issubdtype(
-            key.dtype,
-            jax.dtypes.prng_key,
-        ):
-            raise TypeError("interaction-feature key must be a scalar PRNG key")
+        _require_typed_threefry_key("interaction-feature key", state.key)
 
         float_contracts = (
             ("output_weights", state.output_weights, (self._n_tasks, self._n_features)),
@@ -1263,8 +1319,8 @@ class FixedBudgetInteractionLearner:
         }
 
     def to_config(self) -> dict[str, Any]:
-        """Serialize learner configuration."""
-        return {
+        """Serialize learner configuration, omitting dormant residual feedback."""
+        config = {
             "type": "FixedBudgetInteractionLearner",
             "state_schema": INTERACTION_FEATURE_STATE_SCHEMA,
             "n_features": self._n_features,
@@ -1313,6 +1369,9 @@ class FixedBudgetInteractionLearner:
             "scale_normalizer_decay": self._scale_normalizer_decay,
             "scale_normalizer_epsilon": self._scale_normalizer_epsilon,
         }
+        if self._candidate_residual_feedback:
+            config["candidate_residual_feedback"] = True
+        return config
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "FixedBudgetInteractionLearner":
@@ -1343,6 +1402,7 @@ class FixedBudgetInteractionLearner:
             payload["relevance_probe_mode"] = RELEVANCE_PROBE_MODE_CONDITIONAL_V1
         payload.setdefault("task_utility_weights", None)
         payload.setdefault("stale_retirement_interval", None)
+        payload.setdefault("candidate_residual_feedback", False)
         expected = set(inspect.signature(cls).parameters)
         if set(payload) != expected:
             raise ValueError("interaction-feature config fields do not match its schema")
@@ -1374,6 +1434,7 @@ class FixedBudgetInteractionLearner:
     def init(self, feature_dim: int, key: Array) -> InteractionFeatureState:
         """Initialize active and candidate pair banks."""
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        key = _require_typed_threefry_key("key", key)
         if feature_dim < 2 and not self._include_squares:
             raise ValueError("feature_dim must be at least 2 when squares are disabled")
         if self._candidate_strategy == "all_pairs" and self._candidate_count > 0:
@@ -1502,8 +1563,6 @@ class FixedBudgetInteractionLearner:
         return self._canonicalize(left, right)
 
     def _canonicalize(self, left: Array, right: Array) -> tuple[Array, Array]:
-        if self._include_squares:
-            return left, right
         return jnp.minimum(left, right), jnp.maximum(left, right)
 
     def _live_descriptor_mask(
@@ -2159,7 +2218,7 @@ class FixedBudgetInteractionLearner:
         feature_dim = observation.shape[0]
         key_kind, key_random, key_parent, key_mutate = jr.split(key, 4)
         mix = jnp.array(self._generator_mix, dtype=jnp.float32)
-        generator = jr.categorical(key_kind, jnp.log(mix + 1e-8))
+        generator = jr.categorical(key_kind, jnp.log(mix))
         live_parent = self._live_descriptor_mask(
             active_left,
             active_right,
@@ -2526,16 +2585,30 @@ class FixedBudgetInteractionLearner:
                         - (state.candidate_output_weights * candidate_features[None, :]),
                         0.0,
                     )
+                    # The non-robust path keeps no causal second moments, so
+                    # use a unit floor: plain LMS diverges once
+                    # ``step_size * phi**2 > 2`` and phi is a product of two
+                    # observation channels. Unit moments keep the delta
+                    # identical to the plain LMS step for a unit-bounded bank
+                    # and scale-free above that, mirroring the robust path.
+                    candidate_output_delta = self._normalized_candidate_delta(
+                        candidate_errors,
+                        candidate_features,
+                        jnp.ones_like(candidate_features),
+                        active_count,
+                    )
+                else:
+                    candidate_errors = errors[:, None]
+                    if self._candidate_residual_feedback:
+                        candidate_errors = jnp.where(
+                            active_mask[:, None],
+                            candidate_errors
+                            - (state.candidate_output_weights * candidate_features[None, :]),
+                            0.0,
+                        )
                     candidate_output_delta = (
                         self._step_size_output
                         * candidate_errors
-                        * candidate_features[None, :]
-                        / active_count
-                    )
-                else:
-                    candidate_output_delta = (
-                        self._step_size_output
-                        * errors[:, None]
                         * candidate_features[None, :]
                         / active_count
                     )
@@ -2548,7 +2621,7 @@ class FixedBudgetInteractionLearner:
             total_step = jnp.sum(jnp.abs(output_delta)) + jnp.sum(jnp.abs(output_bias_delta))
             if not self._independent_relevance_probe:
                 total_step = total_step + jnp.sum(jnp.abs(candidate_output_delta))
-            err_norm = jnp.linalg.norm(errors)
+            err_norm = _representable_l2_norm(errors)
             bound_magnitude = self._obgd_kappa * jnp.maximum(err_norm, 1.0) * total_step
             bounding_scale = 1.0 / jnp.maximum(bound_magnitude, 1.0)
             output_delta = bounding_scale * output_delta
@@ -3522,7 +3595,14 @@ class FixedBudgetInteractionLearner:
             uptime_s=state.uptime_s,
         )
 
-        loss = jnp.sum(errors**2) / active_count
+        squared_errors = errors**2
+        loss = jnp.sum(squared_errors) / active_count
+        reduction_only_overflow = jnp.isinf(loss) & jnp.all(jnp.isfinite(squared_errors))
+        loss = jnp.where(
+            reduction_only_overflow,
+            jnp.sum(squared_errors / active_count),
+            loss,
+        )
         mean_abs_error = jnp.sum(jnp.abs(errors)) / active_count
         max_candidate_utility = (
             jnp.max(new_candidate_utilities)
@@ -3887,7 +3967,10 @@ def load_interaction_feature_checkpoint(
         feature_dim = _require_int32("feature_dim", metadata.get("feature_dim"), minimum=1)
     except ValueError as error:
         raise ValueError("interaction-feature checkpoint feature_dim is invalid") from error
-    template = learner.init(feature_dim=feature_dim, key=jr.key(0))
+    template = learner.init(
+        feature_dim=feature_dim,
+        key=jr.key(0, impl="threefry2x32"),
+    )
     restored, restored_metadata = load_checkpoint(template, path)
     if restored_metadata != metadata:
         raise ValueError("interaction-feature checkpoint metadata changed between reads")

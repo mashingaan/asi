@@ -62,6 +62,7 @@ import jax.random as jr
 from jax import Array
 from jaxtyping import Float, Int, PRNGKeyArray
 
+from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.checkpoints import (
     load_checkpoint,
     load_checkpoint_metadata,
@@ -78,6 +79,17 @@ _GAUNTLET_LOOP_MAX_STEPS = NUM_SEGMENTS * 3000
 
 _INT32_MAX = 2**31 - 1
 _UINT32_MAX = 2**32 - 1
+_LIFETIME_GAUNTLET_PRNG_IMPLEMENTATION = "threefry2x32"
+# JAX's currently supported scalar typed keys use either two uint32 words
+# (Threefry) or four (RBG/unsafe RBG). Config validation cannot know which key
+# a caller will pass to ``init``, so reserve the largest supported payload.
+_MAX_PRNG_KEY_NBYTES = 4 * 4
+
+
+def _skip_zero_scale(scale: Array | float, value: Array) -> Array:
+    """Skip ``0 * inf`` so a closed context gate does not poison features."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
 
 LIFETIME_GAUNTLET_CONFIG_SCHEMA = "alberta.lifetime-gauntlet-config.v2"
 LIFETIME_GAUNTLET_STATE_SCHEMA = "alberta.lifetime-gauntlet-state.v2"
@@ -106,6 +118,24 @@ _GAUNTLET_CONFIG_FIELDS = frozenset(
         "context_noise_std",
     }
 )
+
+
+def _configured_gauntlet_state_nbytes(relevant_dim: int, irrelevant_dim: int) -> int:
+    """Return the largest persistent byte count accepted by ``GauntletStream.init``."""
+    input_dim = relevant_dim + irrelevant_dim
+    weight_nbytes = 4 * 4 * input_dim
+    nonlinear_coefficient_nbytes = 4 * (relevant_dim // 2)
+    return _MAX_PRNG_KEY_NBYTES + 4 + weight_nbytes + nonlinear_coefficient_nbytes
+
+
+def _configured_lifetime_gauntlet_state_nbytes(
+    config: GauntletConfig,
+    *,
+    key_nbytes: int,
+) -> int:
+    """Return exact lifetime-state bytes without constructing its large arrays."""
+    weight_nbytes = 3 * 4 * config.input_dim
+    return key_nbytes + LIFETIME_GAUNTLET_CLOCK_NBYTES + weight_nbytes
 
 
 def _require_int(
@@ -145,6 +175,25 @@ def _require_array(
     if array.dtype != dtype:
         raise TypeError(f"{name} must have dtype {dtype}, got {array.dtype}")
     return array
+
+
+def _require_lifetime_gauntlet_key(value: Array) -> Array:
+    """Require the two-word Threefry key encoded by the persisted state."""
+
+    try:
+        key_data = jr.key_data(value)
+        implementation = str(jr.key_impl(value))
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            "lifetime gauntlet key must be a threefry2x32 JAX PRNG key"
+        ) from error
+    if (
+        implementation != _LIFETIME_GAUNTLET_PRNG_IMPLEMENTATION
+        or key_data.shape != (2,)
+        or key_data.dtype != jnp.dtype(jnp.uint32)
+    ):
+        raise TypeError("lifetime gauntlet key must be a threefry2x32 JAX PRNG key")
+    return value
 
 
 def _checked_lifetime_words_increment(words: Array) -> tuple[Array, Array]:
@@ -282,6 +331,12 @@ class GauntletConfig:
             or self.segment_length < 1
         ):
             raise ValueError("segment_length must be positive")
+        state_nbytes = _configured_gauntlet_state_nbytes(
+            self.relevant_dim,
+            self.irrelevant_dim,
+        )
+        if state_nbytes > _INT32_MAX:
+            raise ValueError("gauntlet persistent state byte count must fit signed int32")
         for name in (
             "noise_std",
             "feature_std",
@@ -296,6 +351,12 @@ class GauntletConfig:
                 raise ValueError(f"{name} must be a finite real number")
             if not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite")
+            validated_float32_scalar(
+                name,
+                value,
+                positive=name in ("feature_std", "scale_factor"),
+                lower=None if name in ("feature_std", "scale_factor") else 0.0,
+            )
         if self.noise_std < 0.0 or self.feature_std <= 0.0:
             raise ValueError("noise_std must be >= 0 and feature_std > 0")
         if self.scale_factor <= 0.0 or self.drift_rate < 0.0:
@@ -530,7 +591,14 @@ class ContextGatedFeatures:
         x = timestep.observation[:d]
         ctx = timestep.observation[d:]
         base_gate = 1.0 - ctx[0] - ctx[1] if self._exclusive else 1.0
-        gated = jnp.concatenate([base_gate * x, ctx, ctx[0] * x, ctx[1] * x])
+        gated = jnp.concatenate(
+            [
+                _skip_zero_scale(base_gate, x),
+                ctx,
+                _skip_zero_scale(ctx[0], x),
+                _skip_zero_scale(ctx[1], x),
+            ]
+        )
         return TimeStep(observation=gated, target=timestep.target), new_state
 
 
@@ -688,11 +756,11 @@ class LifetimeGauntletStream:
                 0 of every N-th cycle (0 disables it).
         """
         self._config = config or GauntletConfig()
-        if (
-            isinstance(scale_cycle_period, bool)
-            or not isinstance(scale_cycle_period, int)
-            or scale_cycle_period < 0
-        ):
+        # An exact-type gate keeps a hostile ``int`` subclass from dispatching
+        # its overridden comparison as the range check is built.
+        if type(scale_cycle_period) is bool or type(scale_cycle_period) is not int:
+            raise ValueError("scale_cycle_period must be an exact integer")
+        if scale_cycle_period < 0:
             raise ValueError("scale_cycle_period must be non-negative")
         cycle_length = self.SUB_SEGMENTS * self._config.segment_length
         if cycle_length > _INT32_MAX:
@@ -727,7 +795,9 @@ class LifetimeGauntletStream:
     def resource_budget(self) -> LifetimeGauntletResourceBudget:
         """Return exact persistent-state and clock accounting."""
         return LifetimeGauntletResourceBudget(
-            state_nbytes=measure_lifetime_gauntlet_state_nbytes(self.init(jr.key(0))),
+            state_nbytes=_configured_lifetime_gauntlet_state_nbytes(
+                self._config, key_nbytes=8
+            ),
             exact_clock_nbytes=LIFETIME_GAUNTLET_CLOCK_NBYTES,
             exact_clock_delta_nbytes=LIFETIME_GAUNTLET_CLOCK_DELTA_NBYTES,
         )
@@ -798,9 +868,7 @@ class LifetimeGauntletStream:
             shape=(2,),
             dtype=jnp.dtype(jnp.uint32),
         )
-        key_data = jr.key_data(state.key)
-        if key_data.shape != (2,) or key_data.dtype != jnp.dtype(jnp.uint32):
-            raise TypeError("lifetime gauntlet key must be a scalar JAX PRNG key")
+        _require_lifetime_gauntlet_key(state.key)
 
     def state_is_valid(self, state: LifetimeState) -> Array:
         """Authenticate exact time and finite persistent task weights."""
@@ -831,6 +899,7 @@ class LifetimeGauntletStream:
 
     def init(self, key: Array) -> LifetimeState:
         """Initialize the persistent tasks and the first fresh task."""
+        key = _require_lifetime_gauntlet_key(key)
         key, k_c, k_d, k_f = jr.split(key, 4)
         return LifetimeState(
             key=key,
@@ -1050,7 +1119,10 @@ def load_lifetime_gauntlet_checkpoint(
     if not isinstance(raw_config, Mapping):
         raise ValueError("lifetime-gauntlet checkpoint stream_config is invalid")
     stream = LifetimeGauntletStream.from_config(raw_config)
-    restored, restored_metadata = load_checkpoint(stream.init(jr.key(0)), path)
+    restored, restored_metadata = load_checkpoint(
+        stream.init(jr.key(0, impl=_LIFETIME_GAUNTLET_PRNG_IMPLEMENTATION)),
+        path,
+    )
     if restored_metadata != metadata:
         raise ValueError("lifetime-gauntlet checkpoint metadata changed between reads")
     state = cast(LifetimeState, restored)
@@ -1102,13 +1174,21 @@ def lifetime_scorecard(
     fresh_early = jnp.mean(per_cycle[..., :, 0, :window], axis=-1)
     recur_c_early = jnp.mean(per_cycle[..., :, 1, :window], axis=-1)
     recur_d_early = jnp.mean(per_cycle[..., :, 3, :window], axis=-1)
-    eps = 1e-8
+    floor = jnp.asarray(1e-8, dtype=jnp.promote_types(sq_errors.dtype, jnp.float32))
+    both_at_floor_c = (recur_c_early[..., :1] <= floor) & (recur_c_early[..., 1:] <= floor)
+    raw_savings_c = recur_c_early[..., :1] / jnp.maximum(recur_c_early[..., 1:], floor)
+    savings_c = jnp.where(both_at_floor_c, jnp.ones_like(raw_savings_c), raw_savings_c)
+
+    both_at_floor_d = (recur_d_early[..., :1] <= floor) & (recur_d_early[..., 1:] <= floor)
+    raw_savings_d = recur_d_early[..., :1] / jnp.maximum(recur_d_early[..., 1:], floor)
+    savings_d = jnp.where(both_at_floor_d, jnp.ones_like(raw_savings_d), raw_savings_d)
+
     return {
         "fresh_early": fresh_early,
         "recur_c_early": recur_c_early,
         "recur_d_early": recur_d_early,
-        "savings_c": recur_c_early[..., :1] / jnp.maximum(recur_c_early[..., 1:], eps),
-        "savings_d": recur_d_early[..., :1] / jnp.maximum(recur_d_early[..., 1:], eps),
+        "savings_c": savings_c,
+        "savings_d": savings_d,
         "nan_steps": jnp.sum(~jnp.isfinite(sq_errors), axis=-1),
     }
 
@@ -1311,13 +1391,22 @@ def savings_ratio(
     Values > 1 mean the learner re-entered the recurring task closer to its
     old solution than it started at first exposure — the savings measure of
     memory.  A memoryless learner scores ~1; a learner whose representation
-    isolates tasks scores >> 1.  (Early-window MSE is used rather than
-    steps-to-criterion because it stays informative for learners whose
-    asymptotic error sits near the criterion threshold.)
+    isolates tasks scores >> 1.  Identical entry windows at or below the
+    ``1e-8`` numerical floor score ``1`` (same identity as
+    :func:`savings_ratio_steps`), not ``0``.  (Early-window MSE is used
+    rather than steps-to-criterion because it stays informative for learners
+    whose asymptotic error sits near the criterion threshold.)
     """
     first = early_window_mse(sq_errors, first_segment, segment_length, window)
     revisit = early_window_mse(sq_errors, revisit_segment, segment_length, window)
-    return first / jnp.maximum(revisit, 1e-8)
+    # The 1e-8 floor only prevents a zero-denominator blow-up. When both
+    # entry windows sit at or below that floor they are indistinguishable
+    # (oracle / noiseless / underflow), so the ratio is 1 — the same
+    # identity savings_ratio_steps already uses via max(steps, 1).
+    floor = jnp.asarray(1e-8, dtype=jnp.promote_types(first.dtype, jnp.float32))
+    both_at_floor = (first <= floor) & (revisit <= floor)
+    ratio = first / jnp.maximum(revisit, floor)
+    return jnp.where(both_at_floor, jnp.ones_like(ratio), ratio)
 
 
 def savings_ratio_steps(
@@ -1335,13 +1424,19 @@ def savings_ratio_steps(
     return jnp.maximum(first, 1) / jnp.maximum(revisit, 1)
 
 
-def gauntlet_scorecard(sq_errors: Array, config: GauntletConfig) -> dict[str, Array]:
+def gauntlet_scorecard(
+    sq_errors: Array, config: GauntletConfig, window: int | None = None
+) -> dict[str, Array]:
     """Compute the per-property scorecard from batched squared errors.
 
     Args:
         sq_errors: Shape ``(n_seeds, num_steps)`` from
             :func:`run_gauntlet_batched` over the full nine-segment program.
         config: The gauntlet configuration used to generate the run.
+        window: Entry-window width for the savings and early-MSE measures.
+            ``None`` selects the documented 200-step window, shortened to
+            the segment when ``config.segment_length`` is below 200 so that
+            every configuration the stream accepts can be scored.
 
     Returns:
         Dict of per-seed arrays (aggregate with median/mean as appropriate):
@@ -1358,16 +1453,20 @@ def gauntlet_scorecard(sq_errors: Array, config: GauntletConfig) -> dict[str, Ar
         - ``nan_steps``: number of non-finite squared errors (P6, must be 0).
     """
     length = config.segment_length
+    if window is None:
+        window = min(200, length)
+    if type(window) is not int or window < 1 or window > length:
+        raise ValueError(f"window must be an integer in [1, {length}], got {window!r}")
     threshold = 2.0 * config.noise_floor
     return {
         "tracking_mse": segment_mse(sq_errors, 1, length),
         "recovery_steps_c": steps_to_criterion(segment_slice(sq_errors, 2, length), threshold),
         "recovery_steps_d": steps_to_criterion(segment_slice(sq_errors, 3, length), threshold),
-        "savings_c": savings_ratio(sq_errors, 2, 4, length),
-        "savings_d": savings_ratio(sq_errors, 3, 5, length),
-        "savings_c_final": savings_ratio(sq_errors, 2, 8, length),
-        "early_mse_c_first": early_window_mse(sq_errors, 2, length),
-        "early_mse_c_recur": early_window_mse(sq_errors, 4, length),
+        "savings_c": savings_ratio(sq_errors, 2, 4, length, window),
+        "savings_d": savings_ratio(sq_errors, 3, 5, length, window),
+        "savings_c_final": savings_ratio(sq_errors, 2, 8, length, window),
+        "early_mse_c_first": early_window_mse(sq_errors, 2, length, window),
+        "early_mse_c_recur": early_window_mse(sq_errors, 4, length, window),
         "scaled_mse": segment_mse(sq_errors, 6, length),
         "nonlinear_mse": segment_mse(sq_errors, 7, length),
         "nan_steps": jnp.sum(~jnp.isfinite(sq_errors), axis=-1),
@@ -1407,7 +1506,15 @@ def best_fixed_alpha_errors(
         # over the finite steps, so a divergent-late candidate cannot "win"
         # with an undefined mean.
         n_bad = float(jnp.sum(~finite))
-        finite_mean = float(jnp.sum(jnp.where(finite, sq, 0.0)) / jnp.maximum(jnp.sum(finite), 1))
+        finite_values = jnp.where(finite, sq, 0.0)
+        finite_count = jnp.maximum(jnp.sum(finite), 1)
+        direct_mean = jnp.sum(finite_values) / finite_count
+        # Fall back to exact power-of-two scaling only when the ordinary sum
+        # overflows; large reciprocals can flush to zero on XLA:CPU.
+        _, exponent = jnp.frexp(jnp.max(finite_values, initial=0.0))
+        scaled_values = jnp.ldexp(finite_values, -exponent)
+        scaled_mean = jnp.ldexp(jnp.sum(scaled_values) / finite_count, exponent)
+        finite_mean = float(jnp.where(jnp.isfinite(direct_mean), direct_mean, scaled_mean))
         score = (n_bad, finite_mean)
         if best_sq is None or score < best_score:
             best_score = score

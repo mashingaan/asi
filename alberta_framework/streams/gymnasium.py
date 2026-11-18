@@ -34,7 +34,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
-from alberta_framework._seed_validation import JAX_KEY_SEED_MAX, require_jax_seed
+from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core._float32_scalars import validated_float32_scalar
 from alberta_framework.core.learners import LinearLearner
 from alberta_framework.core.types import LearnerState, TimeStep
@@ -44,21 +44,11 @@ if TYPE_CHECKING:
 
 _INT32_MAX = 2**31 - 1
 _INT32_MIN = -(2**31)
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
+# Distinct from the epsilon-coin splits of this same root. Not ``seed + 1``:
+# that root is the next experiment seed, so paired runs shared one stream,
+# and the uint32 maximum used a different derivation from every smaller seed.
+_EPSILON_GREEDY_RANDOM_STREAM = 0x45504752
 
 
 def _require_positive_int32(name: str, value: object) -> int:
@@ -111,6 +101,12 @@ def _discounted_bootstrap(gamma: float, next_value: float) -> float:
     if float(gamma) == 0.0:
         return 0.0
     return float(gamma) * float(next_value)
+
+
+def _float32_scalar_target(value: object) -> Array:
+    """Build one scalar target only when its float32 value remains finite."""
+    target = validated_float32_scalar("target", value)
+    return jnp.atleast_1d(jnp.asarray(target, dtype=jnp.float32))
 
 
 def _flatten_space(space: gymnasium.spaces.Space[Any]) -> int:
@@ -171,6 +167,7 @@ def _flatten_observation(obs: Any, space: gymnasium.spaces.Space[Any]) -> Array:
     expected = _flatten_space(space)
     if flattened.shape != (expected,) or not bool(jnp.all(jnp.isfinite(flattened))):
         raise ValueError("observation must match its declared flattened shape and be finite")
+    _require_space_member("observation", obs, space)
     return flattened
 
 
@@ -204,7 +201,87 @@ def _flatten_action(action: Any, space: gymnasium.spaces.Space[Any]) -> Array:
     expected = _flatten_space(space)
     if flattened.shape != (expected,) or not bool(jnp.all(jnp.isfinite(flattened))):
         raise ValueError("action must match its declared flattened shape and be finite")
+    _require_space_member("action", action, space)
     return flattened
+
+
+def _same_step_autoreset(env: gymnasium.Env[Any, Any]) -> bool:
+    """Recognize the legacy scalar contract, not an incidental info key.
+
+    Only unchanged official same-step step implementations own the reset.
+    Outer wrappers may delegate unchanged, or transform actions/rewards only.
+    Other outer step implementations could introduce a boundary themselves or
+    change observation coordinates, so their reset contract is unsupported.
+    Gymnasium >=1.0's next-step Autoreset uses the ordinary explicit reset path.
+    """
+    import gymnasium
+
+    legacy_type = getattr(gymnasium.wrappers, "AutoResetWrapper", None)
+    if legacy_type is None:
+        return False
+    delegates = (gymnasium.Wrapper.step, gymnasium.ActionWrapper.step, gymnasium.RewardWrapper.step)
+    unchanged_outer_step = True
+    current = env
+    while isinstance(current, gymnasium.Wrapper):
+        step = current.step
+        implementation = (
+            getattr(step, "__func__", None) if getattr(step, "__self__", None) is current else None
+        )
+        if isinstance(current, legacy_type):
+            if not unchanged_outer_step or implementation is not legacy_type.step:
+                raise ValueError(
+                    "same-step AutoResetWrapper requires its unchanged step and "
+                    "outer wrappers that only delegate or transform actions/rewards"
+                )
+            return True
+        unchanged_outer_step = unchanged_outer_step and implementation in delegates
+        current = current.env
+    return False
+
+
+def _transition_observations(
+    raw_next_obs: Any, info: dict[str, Any], space: gymnasium.spaces.Space[Any], *, done: bool,
+    same_step_autoreset: bool,
+) -> tuple[Array, Array | None]:
+    """Separate a transition's next observation from an already-reset episode.
+
+    Only the recognized same-step contract reinterprets the returned observation
+    as a reset observation and its final_observation as the learning observation.
+    Ordinary scalar steps return their actual next observation and must reset
+    explicitly at a boundary, regardless of incidental info keys.
+    VectorEnv's final_obs/mask protocol is outside this scalar Env interface.
+    """
+    returned_obs = _flatten_observation(raw_next_obs, space)
+    if done and same_step_autoreset:
+        if "final_observation" not in info:
+            raise ValueError("same-step autoreset must provide final_observation")
+        final_obs = _flatten_observation(info["final_observation"], space)
+        return final_obs, returned_obs
+    return returned_obs, None
+
+
+def _require_space_member(
+    name: str,
+    value: object,
+    space: gymnasium.spaces.Space[Any],
+) -> None:
+    """Reject a finite, correctly shaped value outside its declared space."""
+    import gymnasium
+
+    candidate = np.asarray(value) if isinstance(value, jax.Array) else value
+    try:
+        if isinstance(space, gymnasium.spaces.Box):
+            contained = gymnasium.spaces.Box.contains(space, candidate)
+        elif isinstance(space, gymnasium.spaces.Discrete):
+            contained = gymnasium.spaces.Discrete.contains(space, candidate)
+        elif isinstance(space, gymnasium.spaces.MultiDiscrete):
+            contained = gymnasium.spaces.MultiDiscrete.contains(space, candidate)
+        else:
+            raise ValueError("unsupported space")
+    except Exception as error:
+        raise ValueError(f"{name} could not be checked against its declared space") from error
+    if not bool(contained):
+        raise ValueError(f"{name} must belong to its declared space")
 
 
 def _require_runtime_shape(name: str, value: object, expected: tuple[int, ...]) -> None:
@@ -257,18 +334,40 @@ def _make_random_policy(
             raise ValueError("Discrete action bounds must fit JAX signed int32")
     elif isinstance(action_space, gymnasium.spaces.Box):
         _require_float32_allocation("random Box bounds and action", 3 * action_dim)
-        low_array = np.asarray(action_space.low, dtype=np.float32)
-        high_array = np.asarray(action_space.high, dtype=np.float32)
-        if not bool(
-            np.all(
-                np.isfinite(low_array)
-                & np.isfinite(high_array)
-                & (low_array <= high_array)
+        action_dtype = np.dtype(action_space.dtype)
+        integer_box = action_dtype.kind in "biu"
+        if integer_box:
+            _require_allocation(
+                "random integer Box action", action_dim, itemsize=action_dtype.itemsize
             )
-        ):
-            raise ValueError("Box random actions require finite ordered float32 bounds")
-        low = jnp.asarray(low_array)
-        high = jnp.asarray(high_array)
+            integer_lows = []
+            integer_highs = []
+            for raw_low, raw_high in zip(action_space.low.flat, action_space.high.flat):
+                lower, upper = int(raw_low), int(raw_high)
+                # Box bounds are inclusive. Check before narrowing or adding one
+                # in int32, using the same bounded randint domain as Discrete.
+                if not (
+                    _INT32_MIN <= lower <= upper < _INT32_MAX
+                    and 1 <= upper - lower + 1 <= _INT32_MAX
+                ):
+                    raise ValueError("integer Box random action bounds must fit JAX signed int32")
+                integer_lows.append(lower)
+                integer_highs.append(upper + 1)
+            low = jnp.asarray(integer_lows, dtype=jnp.int32).reshape(action_space.shape)
+            high = jnp.asarray(integer_highs, dtype=jnp.int32).reshape(action_space.shape)
+        else:
+            low_array = np.asarray(action_space.low, dtype=np.float32)
+            high_array = np.asarray(action_space.high, dtype=np.float32)
+            if not bool(
+                np.all(
+                    np.isfinite(low_array)
+                    & np.isfinite(high_array)
+                    & (low_array <= high_array)
+                )
+            ):
+                raise ValueError("Box random actions require finite ordered float32 bounds")
+            low = jnp.asarray(low_array)
+            high = jnp.asarray(high_array)
     elif isinstance(action_space, gymnasium.spaces.MultiDiscrete):
         starts = np.asarray(action_space.start).reshape((-1,))
         counts = np.asarray(action_space.nvec).reshape((-1,))
@@ -296,6 +395,11 @@ def _make_random_policy(
         if isinstance(action_space, gymnasium.spaces.Discrete):
             return int(jr.randint(key, (), discrete_low, discrete_high))
         if isinstance(action_space, gymnasium.spaces.Box):
+            if integer_box:
+                return np.asarray(
+                    jr.randint(key, action_space.shape, low, high, dtype=jnp.int32),
+                    dtype=action_dtype,
+                )
             return _sample_finite_box(key, low, high)
         if isinstance(action_space, gymnasium.spaces.MultiDiscrete):
             samples = np.fromiter(
@@ -322,6 +426,10 @@ def _make_random_policy(
 def make_random_policy(env: gymnasium.Env[Any, Any], seed: int = 0) -> Callable[[Array], Any]:
     """Create a random action policy for an environment.
 
+    Integer Box actions preserve the space's dtype and inclusive bounds. Their
+    bounds, exclusive upper bound, and per-coordinate range must fit signed
+    int32, matching the JAX randint domain used for discrete exploration.
+
     Args:
         env: Gymnasium environment
         seed: Random seed
@@ -341,6 +449,13 @@ def make_epsilon_greedy_policy(
 ) -> Callable[[Array], Any]:
     """Wrap a policy with epsilon-greedy exploration.
 
+    The coin flip and the random action share one ``threefry2x32`` root named
+    by ``seed``. Random actions are a fold of that root, not ``jr.key(seed + 1)``.
+    The next integer is another experiment's seed, so the old derivation made
+    seed ``S`` replay the random policy recorded as seed ``S + 1``. The uint32
+    maximum used ``fold_in`` instead, so the last seed was not the same
+    function of its id. A process-wide PRNG default does not retarget the root.
+
     Args:
         base_policy: The greedy policy to wrap
         env: Gymnasium environment (for random action sampling)
@@ -354,8 +469,8 @@ def make_epsilon_greedy_policy(
         raise ValueError("base_policy must be callable")
     epsilon = validated_float32_scalar("epsilon", epsilon, lower=0.0, upper=1.0)
     seed = require_jax_seed(seed)
-    rng = jr.key(seed)
-    random_rng = jr.key(seed + 1) if seed < JAX_KEY_SEED_MAX else jr.fold_in(rng, 1)
+    rng = jr.key(seed, impl="threefry2x32")
+    random_rng = jr.fold_in(rng, _EPSILON_GREEDY_RANDOM_STREAM)
     random_policy = _make_random_policy(env, random_rng)
 
     def policy(obs: Array) -> Any:
@@ -438,8 +553,11 @@ def collect_trajectory(
         action = policy(current_obs)
         flat_action = _flatten_action(action, env.action_space)
 
-        raw_next_obs, reward, terminated, truncated, _ = env.step(action)
-        next_obs = _flatten_observation(raw_next_obs, env.observation_space)
+        raw_next_obs, reward, terminated, truncated, info = env.step(action)
+        next_obs, reset_obs = _transition_observations(
+            raw_next_obs, info, env.observation_space, done=terminated or truncated,
+            same_step_autoreset=_same_step_autoreset(env) if terminated or truncated else False,
+        )
 
         # Construct features
         if include_action_in_features:
@@ -449,7 +567,7 @@ def collect_trajectory(
 
         # Construct target based on mode
         if mode == PredictionMode.REWARD:
-            target = jnp.atleast_1d(jnp.array(reward, dtype=jnp.float32))
+            target = _float32_scalar_target(reward)
         elif mode == PredictionMode.NEXT_STATE:
             target = next_obs
         else:  # VALUE mode
@@ -460,17 +578,18 @@ def collect_trajectory(
                 bootstrap = _discounted_bootstrap(gamma, float(value_estimator(next_obs)))
             else:
                 bootstrap = 0.0
-            target = jnp.atleast_1d(
-                jnp.array(float(reward) + bootstrap, dtype=jnp.float32)
-            )
+            target = _float32_scalar_target(float(reward) + bootstrap)
 
         observations.append(features)
         targets.append(target)
 
         if terminated or truncated:
-            raw_obs, _ = env.reset(seed=seed + reset_count)
-            reset_count += 1
-            current_obs = _flatten_observation(raw_obs, env.observation_space)
+            if reset_obs is not None:
+                current_obs = reset_obs
+            else:
+                raw_obs, _ = env.reset(seed=seed + reset_count)
+                reset_count += 1
+                current_obs = _flatten_observation(raw_obs, env.observation_space)
         else:
             current_obs = next_obs
 
@@ -554,6 +673,13 @@ def learn_from_trajectory(
                 f"learner_state.weights shape {learner_state.weights.shape} does not match "
                 f"feature_dim={feature_dim}"
             )
+        if learner_state.bias.ndim != 0:
+            raise ValueError("learner_state.bias must be a scalar")
+        # A learner skips non-finite updates, so a poisoned start would otherwise
+        # report zero error for the whole trajectory without learning anything.
+        for field, value in (("weights", learner_state.weights), ("bias", learner_state.bias)):
+            if not isinstance(value, jax.core.Tracer) and not bool(jnp.all(jnp.isfinite(value))):
+                raise ValueError(f"learner_state.{field} must be finite")
     else:
         learner_state = learner.init(feature_dim)
 
@@ -564,6 +690,7 @@ def learn_from_trajectory(
 
     t0 = time.time()
     final_state, metrics = jax.lax.scan(step_fn, learner_state, (observations, targets))
+    jax.block_until_ready((final_state, metrics))  # type: ignore[no-untyped-call]
     elapsed = time.time() - t0
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
 
@@ -721,14 +848,14 @@ class GymnasiumStream:
     ) -> Array:
         """Construct target based on prediction mode."""
         if self._mode == PredictionMode.REWARD:
-            return jnp.atleast_1d(jnp.array(reward, dtype=jnp.float32))
+            return _float32_scalar_target(reward)
 
         elif self._mode == PredictionMode.NEXT_STATE:
             return next_obs
 
         elif self._mode == PredictionMode.VALUE:
             if terminated:
-                return jnp.atleast_1d(jnp.array(reward, dtype=jnp.float32))
+                return _float32_scalar_target(reward)
 
             if self._value_estimator is not None:
                 next_value = self._value_estimator(next_obs)
@@ -736,7 +863,7 @@ class GymnasiumStream:
                 next_value = 0.0
 
             target = reward + _discounted_bootstrap(self._gamma, next_value)
-            return jnp.atleast_1d(jnp.array(target, dtype=jnp.float32))
+            return _float32_scalar_target(target)
 
         else:
             raise ValueError(f"Unknown mode: {self._mode}")
@@ -754,8 +881,13 @@ class GymnasiumStream:
         action = self._policy(self._current_obs)
         flat_action = _flatten_action(action, self._env.action_space)
 
-        raw_next_obs, reward, terminated, truncated, _ = self._env.step(action)
-        next_obs = _flatten_observation(raw_next_obs, self._env.observation_space)
+        raw_next_obs, reward, terminated, truncated, info = self._env.step(action)
+        next_obs, reset_obs = _transition_observations(
+            raw_next_obs, info, self._env.observation_space, done=terminated or truncated,
+            same_step_autoreset=(
+                _same_step_autoreset(self._env) if terminated or truncated else False
+            ),
+        )
 
         features = self._construct_features(self._current_obs, flat_action)
         target = self._construct_target(float(reward), next_obs, terminated)
@@ -764,7 +896,7 @@ class GymnasiumStream:
 
         if terminated or truncated:
             self._episode_count += 1
-            self._current_obs = None
+            self._current_obs = reset_obs
         else:
             self._current_obs = next_obs
 
@@ -880,6 +1012,7 @@ class TDStream:
         if self._current_obs is None:
             raw_obs, _ = self._env.reset(seed=self._get_reset_seed())
             self._current_obs = _flatten_observation(raw_obs, self._env.observation_space)
+        if self._current_action is None:
             self._current_action = self._policy(self._current_obs)
 
         action = self._current_action
@@ -887,26 +1020,31 @@ class TDStream:
             raise RuntimeError("TDStream has an observation without an owned action")
         flat_action = _flatten_action(action, self._env.action_space)
 
-        raw_next_obs, reward, terminated, truncated, _ = self._env.step(action)
-        next_obs = _flatten_observation(raw_next_obs, self._env.observation_space)
+        raw_next_obs, reward, terminated, truncated, info = self._env.step(action)
+        next_obs, reset_obs = _transition_observations(
+            raw_next_obs, info, self._env.observation_space, done=terminated or truncated,
+            same_step_autoreset=(
+                _same_step_autoreset(self._env) if terminated or truncated else False
+            ),
+        )
 
         features = self._construct_features(self._current_obs, flat_action)
 
         if terminated:
-            target = jnp.atleast_1d(jnp.array(reward, dtype=jnp.float32))
+            target = _float32_scalar_target(reward)
         else:
             next_action = self._policy(next_obs)
             next_flat_action = _flatten_action(next_action, self._env.action_space)
             next_features = self._construct_features(next_obs, next_flat_action)
             bootstrap = self._value_fn(next_features)
             target_val = float(reward) + _discounted_bootstrap(self._gamma, float(bootstrap))
-            target = jnp.atleast_1d(jnp.array(target_val, dtype=jnp.float32))
+            target = _float32_scalar_target(target_val)
 
         self._step_count += 1
 
         if terminated or truncated:
             self._episode_count += 1
-            self._current_obs = None
+            self._current_obs = reset_obs
             self._current_action = None
         else:
             self._current_obs = next_obs

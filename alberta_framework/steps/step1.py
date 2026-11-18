@@ -67,19 +67,7 @@ _VALID_NORMALIZERS: frozenset[str] = frozenset({"none", "ema", "welford", "strea
 _VALID_STREAMS: frozenset[str] = frozenset({"alberta", "xdist_shift"})
 _INT32_MAX: int = 2**31 - 1
 _MAX_RESOURCE_BYTES: int = 256 * 1024 * 1024
-_ACTUAL_INT_TYPES = (
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-)
+_ACTUAL_INT_TYPES = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 _ACTUAL_FLOAT_TYPES = (
         float,
         Fraction,
@@ -424,7 +412,10 @@ def make_step1_optimizer(config: Step1KernelConfig) -> Any:
             meta_step_size=config.meta_step_size,
         )
     if name == "adagain":
-        return AdaGain(initial_step_size=config.step_size)
+        return AdaGain(
+            initial_step_size=config.step_size,
+            meta_step_size=config.meta_step_size,
+        )
     if name == "adam":
         return Adam(step_size=config.step_size)
     if name == "rmsprop":
@@ -521,13 +512,15 @@ def run_step1_smoke(
             learner,
             cast(Any, stream),
             num_steps=steps,
-            key=jr.key(seed),
+            key=jr.key(seed, impl="threefry2x32"),
         ),
     )
     metrics = loop_result[1]
     metrics.block_until_ready()
     window = metrics[-final_window:, 0]
     final_window_mse = float(jnp.mean(window))
+    if not math.isfinite(final_window_mse) and bool(jnp.all(jnp.isfinite(window))):
+        final_window_mse = float(np.asarray(window, dtype=np.float64).mean())
     return Step1SmokeResult(
         config=cfg,
         steps=steps,

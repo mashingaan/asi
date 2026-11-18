@@ -552,6 +552,69 @@ class TestFixedBudgetFeatureLearner:
             state.generator_utility_ema[1:],
         )
 
+    @pytest.mark.parametrize(
+        ("age_corrected", "ranking_kwargs"),
+        [
+            (False, {}),
+            (True, {"future_utility_mix": 1.0, "future_utility_normalization": "age"}),
+        ],
+    )
+    def test_plasticity_pressure_compares_post_promotion_eligible_bank(
+        self,
+        age_corrected: bool,
+        ranking_kwargs: dict[str, Any],
+    ) -> None:
+        """Pressure must not rank the slot a promotion just refilled as worst active."""
+        learner = FixedBudgetFeatureLearner(
+            n_features=2,
+            n_tasks=1,
+            step_size_output=0.0,
+            step_size_feature=0.0,
+            utility_decay=0.5,
+            replacement_interval=1,
+            min_feature_age=5,
+            candidate_count=2,
+            candidate_min_age=5,
+            use_obgd=False,
+            learn_feature_resources=True,
+            resource_discount=0.5,
+            resource_exploration=0.0,
+            **ranking_kwargs,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(43)).replace(
+            utilities=jnp.array([0.2, 0.8], dtype=jnp.float32),
+            ages=jnp.array([10, 10], dtype=jnp.int32),
+            candidate_utilities=jnp.array([1.0, 0.6], dtype=jnp.float32),
+            candidate_ages=jnp.array([10, 10], dtype=jnp.int32),
+        )
+
+        # Zero output weights and a zero target make every utility signal zero,
+        # so each EMA halves: active (0.1, 0.4) and candidates (0.5, 0.3).
+        result = learner.update(
+            state,
+            jnp.array([0.3, -0.4], dtype=jnp.float32),
+            jnp.zeros((1,), dtype=jnp.float32),
+        )
+
+        assert int(result.promoted_candidate) == 0
+        assert int(result.replaced_slot) == 0
+        np.testing.assert_array_equal(np.asarray(result.state.ages), np.array([0, 11]))
+        np.testing.assert_array_equal(np.asarray(result.state.candidate_ages), np.array([0, 11]))
+        # After the promotion, slot 0 holds an age-0 feature that cannot be
+        # discarded, so the worst eligible active feature is slot 1 (0.4) and
+        # the best eligible candidate is candidate 1 (0.3).
+        correction = 1.0 / (1.0 - 0.5**11) if age_corrected else 1.0
+        worst_active = 0.4 * correction
+        best_candidate = 0.3 * correction
+        margin = 1.05 * (1.25 + 1.0 + 0.8) / 3.0
+        pressure = np.tanh((best_candidate - margin * worst_active) / (worst_active + 1e-6))
+        np.testing.assert_allclose(
+            np.asarray(result.state.plasticity_signal_ema),
+            0.5 * np.array([-pressure, 0.0, pressure]),
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
     def test_constructed_and_augmented_feature_shapes(self) -> None:
         learner = FixedBudgetFeatureLearner(n_features=6, n_tasks=2)
         state = learner.init(feature_dim=4, key=jr.key(14))
@@ -589,6 +652,38 @@ class TestFixedBudgetFeatureLearner:
             GENERATOR_MUTATE_PARENT,
             GENERATOR_IMPRINT,
         }
+
+    def test_imprint_replacement_normalizes_large_finite_observation(self) -> None:
+        learner = FixedBudgetFeatureLearner(
+            n_features=1,
+            n_tasks=1,
+            step_size_output=0.0,
+            step_size_feature=0.0,
+            replacement_interval=1,
+            min_feature_age=0,
+            candidate_count=0,
+            generator_mix=(0.0, 0.0, 1.0),
+            mutation_scale=0.0,
+            use_obgd=False,
+        )
+        state = learner.init(feature_dim=8, key=jr.key(123))
+        observation = jnp.full((8,), 7e18, dtype=jnp.float32)
+
+        result = learner.update(
+            state,
+            observation,
+            jnp.zeros((1,), dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        assert int(result.replaced_slot) == 0
+        assert int(result.state.feature_generator[0]) == GENERATOR_IMPRINT
+        chex.assert_trees_all_close(
+            jnp.linalg.norm(result.state.feature_weights[0]),
+            jnp.array(1.0, dtype=jnp.float32),
+            rtol=1e-6,
+        )
+        assert float(learner.constructed_features(result.state, observation)[0]) == 1.0
 
     def test_age_corrected_promotion_restarts_raw_utility_ema(self) -> None:
         learner = FixedBudgetFeatureLearner(
@@ -665,6 +760,40 @@ class TestFixedBudgetFeatureLearner:
         result = run_feature_discovery_arrays(learner, state, observations, targets)
 
         chex.assert_shape(result.metrics, (10, 7))
+        chex.assert_tree_all_finite(result.metrics)
+
+    @pytest.mark.parametrize("runner_kind", ("arrays", "loop"))
+    def test_runners_preserve_initialized_host_clocks(self, runner_kind: str) -> None:
+        stream = NonlinearFeatureDiscoveryStream(
+            feature_dim=4,
+            n_tasks=2,
+            n_latents=8,
+        )
+        learner = FixedBudgetFeatureLearner(
+            n_features=8,
+            n_tasks=2,
+            replacement_interval=0,
+        )
+        birth = 1700000000.125
+        uptime = 2**24 + 0.25
+        state = learner.init(feature_dim=4, key=jr.key(7)).replace(
+            birth_timestamp=birth,
+            uptime_s=uptime,
+        )
+        if runner_kind == "arrays":
+            observations, targets = collect_feature_discovery_stream(
+                stream, num_steps=2, key=jr.key(6)
+            )
+            result = run_feature_discovery_arrays(learner, state, observations, targets)
+        else:
+            result = run_feature_discovery_loop(
+                learner, stream, num_steps=2, key=jr.key(6), learner_state=state
+            )
+        clocks = result.state
+        assert type(clocks.birth_timestamp) is float
+        assert clocks.birth_timestamp == birth
+        assert type(clocks.uptime_s) is float
+        assert clocks.uptime_s > uptime
         chex.assert_tree_all_finite(result.metrics)
 
 
@@ -1446,6 +1575,61 @@ class TestFixedBudgetInteractionLearner:
         chex.assert_shape(result.errors, (2,))
         chex.assert_shape(result.metrics, (7,))
         chex.assert_tree_all_finite(result.metrics)
+        assert int(result.state.step_count) == 1
+
+    @pytest.mark.parametrize("use_obgd", [False, True])
+    def test_update_preserves_finite_wide_mean_squared_error(
+        self,
+        use_obgd: bool,
+    ) -> None:
+        learner = FixedBudgetInteractionLearner(
+            n_features=1,
+            n_tasks=8,
+            candidate_count=0,
+            step_size_output=1.0e-20,
+            replacement_interval=0,
+            use_obgd=use_obgd,
+            obgd_kappa=1.0e-20,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(0))
+        observation = jnp.ones((2,), dtype=jnp.float32)
+        targets = jnp.full((8,), -7.0e18, dtype=jnp.float32)
+
+        errors = learner.predict(state, observation) - targets
+        squared_errors = errors**2
+        expected_mse = float(np.float64(np.float32(7.0e18)) ** 2)
+        assert bool(jnp.all(jnp.isfinite(squared_errors)))
+        assert not bool(jnp.isfinite(jnp.sum(squared_errors)))
+        assert np.isfinite(expected_mse)
+
+        result = learner.update(state, observation, targets)
+
+        assert not bool(result.update_rejected)
+        assert int(result.state.step_count) == 1
+        assert bool(jnp.any(result.state.output_biases != state.output_biases))
+        chex.assert_tree_all_finite(result.metrics)
+        assert float(result.metrics[0]) == pytest.approx(expected_mse, rel=1.0e-6)
+        assert float(result.metrics[6]) == 1.0
+
+    def test_square_enabled_init_produces_live_pairs_and_accepts_updates(self) -> None:
+        learner = FixedBudgetInteractionLearner(
+            n_features=8,
+            n_tasks=2,
+            candidate_count=3,
+            replacement_interval=10,
+            include_squares=True,
+        )
+        state = learner.init(feature_dim=4, key=jr.key(10))
+
+        result = learner.update(
+            state,
+            jnp.array([0.1, -0.2, 0.3, 0.4], dtype=jnp.float32),
+            jnp.array([1.0, -1.0], dtype=jnp.float32),
+        )
+
+        assert not bool(result.update_rejected)
+        assert bool(jnp.all(state.feature_left <= state.feature_right))
+        assert bool(jnp.all(state.candidate_left <= state.candidate_right))
         assert int(result.state.step_count) == 1
 
     def test_max_utility_aggregation_does_not_dilute_rare_task_head(self) -> None:
@@ -3064,6 +3248,107 @@ class TestFixedBudgetInteractionLearner:
         chex.assert_shape(result.metrics, (10, 7))
         chex.assert_tree_all_finite(result.metrics)
 
+    def test_candidate_residual_feedback_learns_the_candidate_contribution(self) -> None:
+        """Residual feedback lets an unnormalized candidate converge.
+
+        The candidate is not part of the deployed prediction, so its LMS
+        error must be the deployed residual minus its own contribution,
+        exactly as the scale-robust and independent-probe paths already do.
+        Without the self-term the update has no fixed point: the weight
+        grows linearly at ``alpha * E[e * phi]`` forever and its utility
+        inflates until promotion copies the runaway weight verbatim.
+        """
+        learner = FixedBudgetInteractionLearner(
+            n_features=1,
+            n_tasks=1,
+            candidate_count=3,
+            candidate_strategy="all_pairs",
+            include_squares=True,
+            replacement_interval=100000,
+            candidate_residual_feedback=True,
+        )
+        config = learner.to_config()
+        assert config["candidate_residual_feedback"] is True
+        learner = FixedBudgetInteractionLearner.from_config(config)
+        state = learner.init(feature_dim=2, key=jr.key(0)).replace(
+            feature_left=jnp.array([0], dtype=jnp.int32),
+            feature_right=jnp.array([1], dtype=jnp.int32),
+        )
+        # The (1, 1) candidate is index 2 of the all-pairs bank.
+        assert int(state.candidate_left[2]) == 1
+        assert int(state.candidate_right[2]) == 1
+        for step in range(200):
+            if step % 2 == 0:
+                observation = jnp.array([0.0, 1.0], dtype=jnp.float32)
+                target = jnp.array([1.0], dtype=jnp.float32)
+            else:
+                observation = jnp.array([0.0, 0.0], dtype=jnp.float32)
+                target = jnp.array([0.0], dtype=jnp.float32)
+            result = learner.update(
+                state,
+                observation,
+                target,
+                jnp.ones((1,), dtype=jnp.bool_),
+            )
+            state = result.state
+        # The deployed feature (0, 1) is always zero here, so the bias
+        # converges to ~0.5 and the correct promoted candidate weight is
+        # ~0.5 as well (the scale-robust control converges to 0.5076).
+        assert float(state.candidate_output_weights[0, 2]) == pytest.approx(
+            0.5, abs=0.1
+        )
+        assert float(state.candidate_utilities[2]) < 0.2
+
+    def test_probe_candidate_head_stays_bounded_on_large_inputs(self) -> None:
+        """A probe candidate head must not diverge on large feature values.
+
+        The independent-probe candidate delta is the only candidate update
+        in the file with neither the scale-robust normalization nor the
+        ObGD bound, so plain LMS ``w += alpha * (e - w*phi) * phi`` is
+        unstable once ``alpha * phi**2 > 2``. With ``phi = 100 * 100`` the
+        weight alternates sign and grows ~3000x per step until it overflows
+        to ``inf``; the fail-closed transaction then refuses every later
+        update and the learner is stuck forever. Routing the delta through
+        the normalized candidate update keeps the step scale-free.
+        """
+        learner = FixedBudgetInteractionLearner(
+            n_features=1,
+            n_tasks=1,
+            step_size_output=0.03,
+            candidate_count=3,
+            candidate_strategy="all_pairs",
+            include_squares=True,
+            replacement_interval=100000,
+            independent_relevance_probe=True,
+            evidence_gated_active_output_memory=True,
+            utility_retention_grace_steps=8,
+            utility_evidence_threshold=0.1,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(0)).replace(
+            feature_left=jnp.array([0], dtype=jnp.int32),
+            feature_right=jnp.array([1], dtype=jnp.int32),
+        )
+        # The (1, 1) candidate is index 2 of the all-pairs bank.
+        assert int(state.candidate_left[2]) == 1
+        assert int(state.candidate_right[2]) == 1
+        observation = jnp.array([0.0, 100.0], dtype=jnp.float32)
+        target = jnp.array([1.0], dtype=jnp.float32)
+        for _ in range(8):
+            result = learner.update(
+                state,
+                observation,
+                target,
+                jnp.ones((1,), dtype=jnp.bool_),
+            )
+            state = result.state
+        # Every update must be accepted: on the buggy path the 7th update
+        # already overflows to inf and is refused, freezing step_count at 6.
+        assert int(state.step_count) == 8
+        assert bool(jnp.all(jnp.isfinite(state.candidate_output_weights)))
+        # The correct weight is ~1e-4 (1.0 / 10000); anything near that
+        # order is converged, while the buggy path is at ~-7e34 by step 6.
+        assert abs(float(state.candidate_output_weights[0, 2])) < 1.0
+
 
 class TestReplaceFractionRemoval:
     """The vestigial replace_fraction knob is gone but legacy configs load."""
@@ -3418,3 +3703,22 @@ def test_fixed_budget_outer_jit_shapes_and_saturating_counters() -> None:
             jnp.ones((3,), dtype=jnp.float32),
             jnp.ones((1, 1), dtype=jnp.float32),
         )
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+@pytest.mark.parametrize("magnitude", [1.5e19, -1.5e19, 1e20, float("inf")])
+def test_update_preserves_finite_mean_squared_error_metric(
+    disable_jit: bool, magnitude: float
+) -> None:
+    learner = FixedBudgetFeatureLearner(n_features=2, n_tasks=2)
+    with jax.disable_jit(disable_jit):
+        state = learner.init(feature_dim=2, key=jr.key(0))
+        observation = jnp.zeros(2, dtype=jnp.float32)
+        result = learner.update(state, observation, jnp.full(2, magnitude, dtype=jnp.float32))
+    if abs(magnitude) == 1.5e19:
+        errors = np.asarray(result.errors, dtype=np.float64)
+        assert bool(result.update_applied)
+        assert float(result.metrics[0]) == pytest.approx(float(np.mean(errors**2)), rel=2e-6)
+    else:
+        assert not bool(result.update_applied)
+        assert int(result.state.step_count) == 0

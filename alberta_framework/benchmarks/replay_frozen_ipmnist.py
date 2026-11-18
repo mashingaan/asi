@@ -49,6 +49,14 @@ _DOMAIN_PROL: Final = 0x50524F4C
 _INT32_MAX: Final = (1 << 31) - 1
 
 
+def _skip_zero_scale(scale: float, value: Array) -> Array:
+    """Keep finite multiplication exact while repairing zero-scaled poison."""
+    product = jnp.asarray(scale, dtype=value.dtype) * value
+    if scale != 0.0:
+        return product
+    return jnp.where(jnp.isfinite(value), product, jnp.zeros_like(value))
+
+
 @chex.dataclass(frozen=True, mappable_dataclass=False)
 class ReplayContextState:
     optimizer_state: dict[str, Any]
@@ -73,7 +81,12 @@ class FrozenFeatureState:
 
 def _key_from_params(params: dict[str, Array], domain: int) -> Array:
     bits = jax.lax.bitcast_convert_type(params["w1"].reshape(-1), jnp.uint32)
-    key = jr.fold_in(jr.key(jnp.uint32(domain)), bits[0])
+    # The frozen extractors are identity-bearing: the domain root is pinned to
+    # explicit threefry2x32 so the recorded (arm, seed, source) identity pins
+    # the feature map regardless of the ambient jax_default_prng_impl.
+    key = jr.fold_in(
+        jr.key(jnp.uint32(domain), impl="threefry2x32"), bits[0]
+    )
     return jr.fold_in(key, bits[-1])
 
 
@@ -180,7 +193,8 @@ def make_replay_context_learner(
 
         replay_gradient = jax.grad(replay_loss)(params)
         combined = {
-            name: task_gradient[name] + hp["replay_weight"] * replay_gradient[name]
+            name: task_gradient[name]
+            + _skip_zero_scale(hp["replay_weight"], replay_gradient[name])
             for name in _PARAM_KEYS
         }
         update = adam_step(params, state.optimizer_state, combined, jr.key(0))
@@ -307,9 +321,34 @@ def make_frozen_feature_learner(hp: Mapping[str, float]) -> tuple[Any, Any]:
         error = target - jax.nn.softmax(logits)
         if method == 1:
             pp = state.inverse_covariance @ phi
-            gain = pp / (1.0 + phi @ pp)
+            direct_denom = 1.0 + phi @ pp
+            direct_gain = pp / direct_denom
+            # A finite ``phi`` and ``pp`` can overflow ``1.0 + phi @ pp`` to
+            # ``+inf`` and collapse ``direct_gain`` to zero even when the
+            # Sherman-Morrison gain and covariance step are representable.
+            peak = jnp.maximum(jnp.max(jnp.abs(phi)), jnp.max(jnp.abs(pp)))
+            _, exp = jnp.frexp(peak)
+            safe_exp = jnp.where(peak > 0.0, exp, 0)
+            scaled_phi = jnp.ldexp(phi, -safe_exp)
+            scaled_pp = jnp.ldexp(pp, -safe_exp)
+            scaled_denom = jnp.ldexp(jnp.float32(1.0), -2 * safe_exp) + (
+                scaled_phi @ scaled_pp
+            )
+            scaled_gain = scaled_pp / scaled_denom
+            safe_gain = jnp.ldexp(scaled_gain, -safe_exp)
+            use_direct = (
+                jnp.isfinite(direct_denom)
+                | ~jnp.all(jnp.isfinite(safe_gain))
+                | ~jnp.all(jnp.isfinite(scaled_gain))
+            )
+            gain = jnp.where(use_direct, direct_gain, safe_gain)
+            outer_step = jnp.where(
+                use_direct,
+                jnp.outer(direct_gain, pp),
+                jnp.outer(scaled_gain, scaled_pp),
+            )
             readout = state.readout + jnp.outer(gain, target - logits)
-            inverse = state.inverse_covariance - jnp.outer(gain, pp)
+            inverse = state.inverse_covariance - outer_step
             prompt, scale, shift = state.prompt, state.scale, state.shift
         else:
             loss = -jax.nn.log_softmax(logits)[y]
@@ -322,16 +361,18 @@ def make_frozen_feature_learner(hp: Mapping[str, float]) -> tuple[Any, Any]:
             inverse = state.inverse_covariance
             if method == 2:
                 feature_gradient = state.readout @ (-error)
-                prompt = (
-                    state.prompt
-                    - mechanism * hp["head_step_size"] * update_scale * feature_gradient
+                # mechanism=0 is the declared mechanism-off reduction; skip
+                # before ``0 * inf`` poisons prompt/scale/shift.
+                feature_step = _skip_zero_scale(
+                    mechanism * hp["head_step_size"],
+                    update_scale * feature_gradient,
                 )
-                scale = state.scale - mechanism * hp[
-                    "head_step_size"
-                ] * update_scale * feature_gradient * (phi - state.shift)
-                shift = (
-                    state.shift - mechanism * hp["head_step_size"] * update_scale * feature_gradient
+                # Pull the feature-space loss gradient through the affine map.
+                prompt = state.prompt - feature_step * state.scale
+                scale = state.scale - feature_step * (
+                    jax.nn.relu(state.projection @ x) + mechanism * state.prompt
                 )
+                shift = state.shift - feature_step
             else:
                 prompt, scale, shift = state.prompt, state.scale, state.shift
         candidate = FrozenFeatureState(  # type: ignore[call-arg]

@@ -210,19 +210,7 @@ _STEP10_CONFIG_FIELDS = frozenset(
     {"type", "subtask_specs", *Step10STOMPConfig.__dataclass_fields__}
 )
 _SUBTASK_SPEC_FIELDS = frozenset(SubtaskSpec.__dataclass_fields__)
-_ACTUAL_INT_TYPES = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_ACTUAL_INT_TYPES = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 _ACTUAL_REAL_TYPES = _ACTUAL_INT_TYPES + (
     float,
     Fraction,
@@ -739,7 +727,7 @@ def run_step10_smoke(
     agent = make_step10_stomp_agent(cfg)
     obs_dim = cfg.observation_dim
 
-    data_key, state_key = jr.split(jr.key(seed))
+    data_key, state_key = jr.split(jr.key(seed, impl="threefry2x32"))
     observations = jr.normal(data_key, (steps + 1, obs_dim), dtype=jnp.float32)
     rewards = jnp.tanh(observations[1:, 0])
 

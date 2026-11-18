@@ -71,27 +71,32 @@ SCIENTIFIC_PROMOTION_ALLOWED = False
 RECURRENT_LATENT_WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA = (
     "alberta.recurrent_latent_world_model_ensemble.v1"
 )
+_PRNG_IMPLEMENTATION = "threefry2x32"
 
 _MAX_STATE_NBYTES = 256 * 1024 * 1024
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
 _LOG_TWO_PI = float(math.log(2.0 * math.pi))
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
+
+
+def _require_typed_threefry_key(name: str, value: object) -> Array:
+    """Require the exact persisted two-word Threefry key contract."""
+    try:
+        key = jnp.asarray(value)
+        implementation = str(jr.key_impl(value))  # type: ignore[arg-type]
+        words = jr.key_data(value)  # type: ignore[arg-type]
+    except Exception as error:
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key") from error
+    if (
+        key.shape != ()
+        or implementation != _PRNG_IMPLEMENTATION
+        or words.shape != (2,)
+        or words.dtype != jnp.uint32
+    ):
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key")
+    return key
 
 
 def _positive_int(value: object, *, name: str, maximum: int = _INT32_MAX) -> int:
@@ -215,11 +220,64 @@ def _tree_equal(left: Any, right: Any) -> Array:
 
 
 def _tree_l2_norm(tree: Any) -> Array:
-    squared = [
-        jnp.sum(jnp.square(jnp.asarray(leaf, dtype=jnp.float32)))
-        for leaf in jax.tree_util.tree_leaves(tree)
+    """Compute a joint float32 norm without squaring at the input scale."""
+    leaves = [
+        jnp.asarray(leaf, dtype=jnp.float32) for leaf in jax.tree_util.tree_leaves(tree)
     ]
-    return jnp.sqrt(jnp.sum(jnp.stack(squared)))
+    scale = jnp.asarray(0.0, dtype=jnp.float32)
+    for leaf in leaves:
+        scale = jnp.maximum(scale, jnp.max(jnp.abs(leaf), initial=0.0))
+    finite_nonzero_scale = jnp.isfinite(scale) & (scale > 0.0)
+    safe_scale = jnp.where(finite_nonzero_scale, scale, 1.0)
+    squared_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    for leaf in leaves:
+        normalized = leaf / safe_scale
+        squared_sum = squared_sum + jnp.sum(jnp.square(normalized))
+    stable_norm = safe_scale * jnp.sqrt(squared_sum)
+    return jnp.where(scale == 0.0, 0.0, jnp.where(jnp.isfinite(scale), stable_norm, scale))
+
+
+def _scale_safe_ratio(numerator: Array, denominator: float) -> Array:
+    """Divide by one positive float32 scalar without a subnormal reciprocal."""
+    scale = jnp.asarray(denominator, dtype=numerator.dtype)
+    mantissa, exponent = jnp.frexp(scale)
+    return jnp.ldexp(numerator, -exponent) / mantissa
+
+
+def _scale_safe_mean(values: Array, *, axis: int) -> Array:
+    """Reduce finite float32 values without overflowing their intermediate sum."""
+    peak = jnp.max(jnp.abs(values), axis=axis, keepdims=True)
+    _, exponent = jnp.frexp(peak)
+    exponent = jnp.where(peak > 0.0, exponent, 0)
+    scaled = jnp.ldexp(values, -exponent)
+    scaled_mean = jnp.mean(scaled, axis=axis)
+    mean = jnp.ldexp(scaled_mean, jnp.squeeze(exponent, axis=axis))
+    # Roundoff near float32's limit must not leave the inputs' convex hull.
+    return jnp.clip(mean, jnp.min(values, axis=axis), jnp.max(values, axis=axis))
+
+
+def _scale_safe_mean_and_variance(values: Array, *, axis: int) -> tuple[Array, Array]:
+    """Return a population mean and variance in a power-of-two scaled domain."""
+    peak = jnp.max(jnp.abs(values), axis=axis, keepdims=True)
+    _, exponent = jnp.frexp(peak)
+    exponent = jnp.where(peak > 0.0, exponent, 0)
+    scaled = jnp.ldexp(values, -exponent)
+    scaled_mean = jnp.mean(scaled, axis=axis)
+    # Shift by one member before reducing so identical values have exactly
+    # zero deviations. Compute the center from these offsets to retain
+    # disagreements smaller than one ulp of the rounded ensemble mean.
+    # Center again before squaring to avoid cancellation between moments.
+    reference = jnp.take(scaled, 0, axis=axis)
+    shifted = scaled - jnp.expand_dims(reference, axis=axis)
+    mean_offset = jnp.mean(shifted, axis=axis)
+    centered = shifted - jnp.expand_dims(mean_offset, axis=axis)
+    scaled_variance = jnp.mean(jnp.square(centered), axis=axis)
+    reduced_exponent = jnp.squeeze(exponent, axis=axis)
+    mean = jnp.ldexp(scaled_mean, reduced_exponent)
+    return (
+        jnp.clip(mean, jnp.min(values, axis=axis), jnp.max(values, axis=axis)),
+        jnp.ldexp(scaled_variance, 2 * reduced_exponent),
+    )
 
 
 def _saturating_increment(value: Array, maximum: int) -> Array:
@@ -274,6 +332,13 @@ class RecurrentLatentWorldModelEnsembleConfig:
     still bounds the representation gradient (a returned diagnostic signal,
     never itself clipped) and constrains ``gradient_clip_norm`` at
     construction.
+
+    Head logits are likewise validated for finiteness only.  They are not
+    predictions: ``tanh`` squashes the observation and reward means into
+    ``max_prediction_magnitude``, a sigmoid squashes the variances into
+    ``[variance_floor, max_variance]``, and the prediction gates check those
+    outputs.  A member that learns a low-noise stream drives its variance
+    logit past any fixed ceiling, so a logit ceiling is the same deadlock.
     """
 
     observation_dim: int
@@ -840,7 +905,7 @@ class RecurrentLatentWorldModelEnsemble:
 
     def __init__(self, config: RecurrentLatentWorldModelEnsembleConfig):
         self._config = config
-        template = self._initial_state(jr.key(0))
+        template = self._initial_state(jr.key(0, impl=_PRNG_IMPLEMENTATION))
         self._member_signature = _static_signature(template.member_parameters[0])
         self._state_signature = _static_signature(template)
         self._start_signature = _static_signature(self._zero_start_cache())
@@ -926,9 +991,7 @@ class RecurrentLatentWorldModelEnsemble:
         return state
 
     def _initial_state(self, key: Array) -> RecurrentLatentWorldModelEnsembleState:
-        key_data = jr.key_data(key)
-        if key_data.shape != (2,) or key_data.dtype != jnp.uint32:
-            raise ValueError("key must be one JAX PRNG key")
+        key = _require_typed_threefry_key("key", key)
         keys = jr.split(key, self._config.ensemble_size + 1)
         return RecurrentLatentWorldModelEnsembleState(
             member_parameters=tuple(
@@ -1062,7 +1125,9 @@ class RecurrentLatentWorldModelEnsemble:
             # irrelevant since valid=False gates every consumer, but the
             # pytree shape/dtype must match a real member_parameters tuple
             # for jax.lax.cond's branch-structure requirement.
-            owner_parameters=self._initial_state(jr.key(0)).member_parameters,
+            owner_parameters=self._initial_state(
+                jr.key(0, impl=_PRNG_IMPLEMENTATION)
+            ).member_parameters,
             observation=jnp.zeros((self._config.observation_dim,), dtype=jnp.float32),
             action=jnp.asarray(0, dtype=jnp.int32),
             prediction=self._zero_prediction(),
@@ -1125,8 +1190,11 @@ class RecurrentLatentWorldModelEnsemble:
 
         mean_logits = parameters.mean_kernel @ next_hidden + parameters.mean_bias
         variance_logits = parameters.variance_kernel @ next_hidden + parameters.variance_bias
-        grounded = self._config.max_prediction_magnitude * jnp.tanh(
-            mean_logits[:-1] / self._config.max_prediction_magnitude
+        prediction_scale = jnp.asarray(
+            self._config.max_prediction_magnitude, dtype=jnp.float32
+        )
+        grounded = prediction_scale * jnp.tanh(
+            _scale_safe_ratio(mean_logits[:-1], self._config.max_prediction_magnitude)
         )
         continuation = jax.nn.sigmoid(mean_logits[-1])
         means = jnp.concatenate((grounded, continuation[None]), axis=0)
@@ -1155,14 +1223,27 @@ class RecurrentLatentWorldModelEnsemble:
         raw = jnp.stack([item[1] for item in member_outputs], axis=0)
         means = jnp.stack([item[2] for item in member_outputs], axis=0)
         variances = jnp.stack([item[3] for item in member_outputs], axis=0)
-        epistemic = jnp.var(means, axis=0)
-        mean_variance = jnp.mean(variances, axis=0)
+        mean_prediction, epistemic = _scale_safe_mean_and_variance(means, axis=0)
+        mean_variance = _scale_safe_mean(variances, axis=0)
+        mean_raw = jnp.mean(raw, axis=0)
+        # Recover finite member means when only their reduction overflows.
+        scaled_mean_raw = jnp.sum(raw / self._config.ensemble_size, axis=0)
+        recover_raw = jnp.all(jnp.isfinite(raw), axis=0) & ~jnp.isfinite(mean_raw)
+        mean_raw = jnp.where(recover_raw, scaled_mean_raw, mean_raw)
+        aleatoric_uncertainty = _scale_safe_mean(mean_variance, axis=0)
+        # Retain the direct reduction's exact cached value in ordinary cases;
+        # use the scaled reduction only when the direct mean overflows.
+        direct_epistemic_disagreement = jnp.mean(epistemic)
+        epistemic_disagreement = jnp.where(
+            jnp.isfinite(direct_epistemic_disagreement),
+            direct_epistemic_disagreement,
+            _scale_safe_mean(epistemic, axis=0),
+        )
         warmup = state.event_count >= self._config.uncertainty_warmup_steps
         finite = (
             jnp.all(jnp.isfinite(next_hidden))
             & jnp.all(jnp.abs(next_hidden) <= 1.0 + 1.0e-6)
             & jnp.all(jnp.isfinite(raw))
-            & jnp.all(jnp.abs(raw) <= self._config.max_prediction_magnitude)
             & jnp.all(jnp.isfinite(means))
             & jnp.all(jnp.abs(means) <= self._config.max_prediction_magnitude)
             & jnp.all(jnp.isfinite(variances))
@@ -1170,24 +1251,27 @@ class RecurrentLatentWorldModelEnsemble:
             & jnp.all(variances <= self._config.max_variance)
             & jnp.all(jnp.isfinite(epistemic))
             & jnp.all(jnp.isfinite(mean_variance))
+            & jnp.all(jnp.isfinite(mean_prediction))
+            & jnp.isfinite(aleatoric_uncertainty)
+            & jnp.isfinite(epistemic_disagreement)
         )
         uncertainty_available = finite & warmup
         return RecurrentLatentWorldModelPrediction(
             member_raw_outputs=raw,
-            mean_raw_output=jnp.mean(raw, axis=0),
+            mean_raw_output=mean_raw,
             member_mean_predictions=means,
-            mean_prediction=jnp.mean(means, axis=0),
+            mean_prediction=mean_prediction,
             member_next_observations=means[:, : self._config.observation_dim],
-            mean_next_observation=jnp.mean(means[:, : self._config.observation_dim], axis=0),
+            mean_next_observation=mean_prediction[: self._config.observation_dim],
             member_rewards=means[:, -2],
-            mean_reward=jnp.mean(means[:, -2]),
+            mean_reward=mean_prediction[-2],
             member_continuations=means[:, -1],
-            mean_continuation=jnp.mean(means[:, -1]),
+            mean_continuation=mean_prediction[-1],
             member_aleatoric_variances=variances,
             mean_aleatoric_variance=mean_variance,
-            aleatoric_uncertainty=jnp.mean(mean_variance),
+            aleatoric_uncertainty=aleatoric_uncertainty,
             per_head_epistemic_variance=epistemic,
-            epistemic_disagreement=jnp.mean(epistemic),
+            epistemic_disagreement=epistemic_disagreement,
             member_next_hidden_states=next_hidden,
             warmup_ready=warmup,
             availability=RecurrentLatentPredictionAvailability(
@@ -1698,7 +1782,11 @@ class RecurrentLatentWorldModelEnsemble:
         state: RecurrentLatentWorldModelEnsembleState | None = None,
     ) -> RecurrentLatentWorldModelResourceBudget:
         """Measure exact logical persistent/cache/result PyTree resources."""
-        measured = self.init(jr.key(0)) if state is None else state
+        measured = (
+            self.init(jr.key(0, impl=_PRNG_IMPLEMENTATION))
+            if state is None
+            else state
+        )
         self._validate_state_static(measured)
         if not bool(jax.device_get(self._state_valid(measured))):
             raise ValueError("cannot account an invalid state")
@@ -1820,7 +1908,11 @@ def load_recurrent_latent_world_model_ensemble_checkpoint(
         raise ValueError("checkpoint evidence level is not L0")
     if metadata.get("scientific_promotion_allowed") is not False:
         raise ValueError("checkpoint cannot claim scientific promotion")
-    key = jr.key(0) if template_key is None else template_key
+    key = (
+        jr.key(0, impl=_PRNG_IMPLEMENTATION)
+        if template_key is None
+        else template_key
+    )
     # The template supplies only the checkpoint's static PyTree contract.  It
     # must not make restoration depend on whether this unrelated random draw
     # happens to fit the configured parameter bound; the persisted state is

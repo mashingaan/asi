@@ -25,6 +25,8 @@ from alberta_framework.core.recurrent_latent_world_model_ensemble import (
     RecurrentLatentWorldModelEnsemble,
     RecurrentLatentWorldModelEnsembleConfig,
     RecurrentLatentWorldModelEnsembleState,
+    _scale_safe_mean,
+    _scale_safe_mean_and_variance,
     _tree_l2_norm,
     load_recurrent_latent_world_model_ensemble_checkpoint,
     save_recurrent_latent_world_model_ensemble_checkpoint,
@@ -157,6 +159,19 @@ def test_initialization_is_distinct_fixed_width_and_exactly_accounted() -> None:
     assert budget.max_member_parameter_updates_per_event == model.config.ensemble_size
     assert budget.recurrent_advances_per_accepted_event == 1
     assert budget.replay_capacity == 0
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        jr.key(0, impl="rbg"),
+        jr.PRNGKey(0),
+    ],
+)
+def test_init_rejects_keys_outside_the_typed_threefry_contract(key: jax.Array) -> None:
+    model = RecurrentLatentWorldModelEnsemble(_config())
+    with pytest.raises(ValueError, match="typed scalar threefry2x32"):
+        model.init(key)
 
 
 _REAL_SCALAR_FIELDS = (
@@ -309,6 +324,159 @@ def test_start_and_decide_are_read_only_predict_before_update_caches() -> None:
     assert float(prediction.aleatoric_uncertainty) > 0.0
 
 
+def test_decide_preserves_legal_large_member_predictions_and_ensemble_means() -> None:
+    """Finite heads must not collapse or overflow at a legal float32 bound."""
+    model = RecurrentLatentWorldModelEnsemble(
+        _config(
+            max_parameter_magnitude=3.0e38,
+            max_prediction_magnitude=3.0e38,
+            max_loss_magnitude=3.0e38,
+            uncertainty_warmup_steps=0,
+        )
+    )
+    state = model.init(jr.key(23))
+    mean_bias = jnp.asarray((2.0e38, 2.0e38, 2.0e38, 0.0), dtype=jnp.float32)
+    members = tuple(
+        member.replace(  # type: ignore[attr-defined]
+            mean_kernel=jnp.zeros_like(member.mean_kernel),
+            mean_bias=mean_bias,
+        )
+        for member in state.member_parameters
+    )
+    state = state.replace(member_parameters=members)  # type: ignore[attr-defined]
+
+    decision = _decision(model, state, jnp.zeros((2,), dtype=jnp.float32))
+    prediction = decision.prediction
+    bound = model.config.max_prediction_magnitude
+    expected = np.float32(bound * np.tanh(float(mean_bias[0]) / bound))
+
+    assert bool(model.state_valid(state))
+    assert bool(decision.valid)
+    assert bool(prediction.valid)
+    np.testing.assert_array_equal(
+        prediction.member_raw_outputs[:, :3],
+        np.full((3, 3), np.float32(2.0e38), dtype=np.float32),
+    )
+    np.testing.assert_allclose(
+        prediction.member_mean_predictions[:, :3], expected, rtol=2.0e-7
+    )
+    np.testing.assert_allclose(prediction.mean_prediction[:3], expected, rtol=2.0e-7)
+    np.testing.assert_array_equal(
+        prediction.per_head_epistemic_variance[:3], np.zeros((3,), dtype=np.float32)
+    )
+
+
+@pytest.mark.parametrize("magnitude", [1.0e30, 1.0e38])
+def test_scale_safe_mean_and_variance_is_zero_for_identical_large_values(
+    magnitude: float,
+) -> None:
+    """Identical finite members have zero variance at any float32 scale."""
+    values = jnp.full((3,), magnitude, dtype=jnp.float32)
+    mean, variance = _scale_safe_mean_and_variance(values, axis=0)
+    np.testing.assert_allclose(float(mean), magnitude, rtol=2.0e-7)
+    assert float(variance) == 0.0
+
+
+@pytest.mark.parametrize("members", [7, 9])
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("with_variance", [False, True])
+def test_scale_safe_means_keep_identical_float32_limits(
+    members: int, axis: int, with_variance: bool,
+) -> None:
+    maximum = np.float32(np.finfo(np.float32).max)
+    values = np.tile(np.asarray([maximum, -maximum], dtype=np.float32), (members, 1))
+    if axis == 1:
+        values = values.T
+    expected = np.mean(values.astype(np.float64), axis=axis)
+    if with_variance:
+        mean, variance = jax.jit(
+            lambda array: _scale_safe_mean_and_variance(array, axis=axis)
+        )(jnp.asarray(values))
+        np.testing.assert_array_equal(variance, np.zeros_like(expected))
+    else:
+        mean = jax.jit(lambda array: _scale_safe_mean(array, axis=axis))(jnp.asarray(values))
+    np.testing.assert_array_equal(mean, expected)
+
+
+@pytest.mark.parametrize("magnitude", [1.0e10, 1.0e18, 1.0e25])
+@pytest.mark.parametrize("axis", [0, 1])
+def test_scale_safe_variance_preserves_adjacent_float32_disagreement(
+    magnitude: float, axis: int,
+) -> None:
+    base = np.float32(magnitude)
+    neighbor = np.nextafter(base, np.float32(np.inf))
+    members = np.asarray([base, base, neighbor], dtype=np.float32)
+    values = np.stack([members, members[::-1]])
+    if axis == 0:
+        values = values.T
+    _, variance = jax.jit(
+        lambda array: _scale_safe_mean_and_variance(array, axis=axis)
+    )(jnp.asarray(values))
+    expected = np.var(values.astype(np.float64), axis=axis)
+    np.testing.assert_allclose(variance, expected, rtol=2.0e-6)
+
+
+def test_scale_safe_variance_preserves_large_heterogeneous_disagreement() -> None:
+    values = np.asarray([-1e18, 1e18, 0.0], dtype=np.float32)
+    mean, variance = jax.jit(
+        lambda array: _scale_safe_mean_and_variance(array, axis=0)
+    )(jnp.asarray(values))
+    assert float(mean) == 0.0
+    np.testing.assert_allclose(float(variance), np.var(values.astype(np.float64)), rtol=2.0e-6)
+
+
+@pytest.mark.parametrize("magnitude", [1.0e30, 1.0e38])
+def test_scale_safe_variance_keeps_unrepresentable_disagreement_nonfinite(
+    magnitude: float,
+) -> None:
+    values = jnp.asarray([-magnitude, magnitude, 0.0], dtype=jnp.float32)
+    _, variance = jax.jit(
+        lambda array: _scale_safe_mean_and_variance(array, axis=0)
+    )(values)
+    assert np.isposinf(float(variance))
+
+
+def test_decide_preserves_identical_large_member_predictions_at_1e30() -> None:
+    """Identical large heads must stay a valid zero-disagreement prediction."""
+    model = RecurrentLatentWorldModelEnsemble(
+        _config(
+            max_parameter_magnitude=1.0e35,
+            max_prediction_magnitude=1.0e30,
+            max_loss_magnitude=1.0e35,
+            uncertainty_warmup_steps=0,
+        )
+    )
+    state = model.init(jr.key(23))
+    # atanh(0.5) * 1e30 saturates the heads to exactly 5e29, a magnitude
+    # whose rounded scaled mean sits one ulp away from the inputs, while the
+    # raw logits stay within max_prediction_magnitude.
+    mean_bias = jnp.asarray(
+        (5.493061443340549e29, 5.493061443340549e29, 5.493061443340549e29, 0.0),
+        dtype=jnp.float32,
+    )
+    members = tuple(
+        member.replace(  # type: ignore[attr-defined]
+            mean_kernel=jnp.zeros_like(member.mean_kernel),
+            mean_bias=mean_bias,
+        )
+        for member in state.member_parameters
+    )
+    state = state.replace(member_parameters=members)  # type: ignore[attr-defined]
+
+    decision = _decision(model, state, jnp.zeros((2,), dtype=jnp.float32))
+    prediction = decision.prediction
+
+    assert bool(model.state_valid(state))
+    assert bool(decision.valid)
+    assert bool(prediction.valid)
+    np.testing.assert_allclose(
+        prediction.member_mean_predictions[:, :3], 5.0e29, rtol=2.0e-7
+    )
+    np.testing.assert_array_equal(
+        prediction.per_head_epistemic_variance[:3], np.zeros((3,), dtype=np.float32)
+    )
+
+
 def test_nonboundary_update_commits_one_recurrent_advance_and_masked_nll_updates() -> None:
     model = RecurrentLatentWorldModelEnsemble(_config())
     state = model.init(jr.key(0))
@@ -459,6 +627,100 @@ def test_member_gradient_validity_is_finiteness_only_not_a_raw_norm_ceiling() ->
     )
     assert bool(result.diagnostics.applied)
     assert bool(jnp.all(result.diagnostics.member_gradients_valid))
+    assert bool(result.diagnostics.candidate_state_valid)
+
+
+def test_head_logits_are_not_gated_by_max_prediction_magnitude() -> None:
+    """Head logits are not predictions, so the prediction bound must not veto them.
+
+    The mean head reaches its target through ``M * tanh(logit / M)`` and the
+    variance head through a sigmoid into ``[variance_floor, max_variance]``,
+    so a logit beyond ``M`` is still an in-bounds prediction.  A member that
+    learns a low-noise stream drives its variance logit below ``-M``, and
+    because a rejection leaves state unchanged, gating the logits deadlocks
+    the model (the failure mode of issue #366).
+    """
+    # The initial variance logit (-5.76) already exceeds a bound of 5.
+    model = RecurrentLatentWorldModelEnsemble(_config(max_prediction_magnitude=5.0))
+    assert abs(model.config.initial_variance_logit) > model.config.max_prediction_magnitude
+    state = model.init(jr.key(0))
+    decision = _decision(model, state)
+    assert bool(decision.valid)
+    assert bool(model.update(state, decision, _transition()).diagnostics.applied)
+
+    # A low-noise member: variance near the floor, a mean at 0.83 * M.
+    model = RecurrentLatentWorldModelEnsemble(_config(max_prediction_magnitude=10.0))
+    state = model.init(jr.key(0))
+    first_member = state.member_parameters[0]
+    low_noise_member = cast(Any, first_member).replace(
+        mean_bias=first_member.mean_bias.at[0].set(12.0),
+        variance_bias=jnp.full_like(first_member.variance_bias, -10.5),
+    )
+    state = cast(Any, state).replace(
+        member_parameters=(low_noise_member, *state.member_parameters[1:])
+    )
+    assert bool(model.state_valid(state))
+    decision = _decision(model, state)
+    prediction = decision.prediction
+    assert float(jnp.max(jnp.abs(prediction.member_raw_outputs))) > 10.0
+    assert float(jnp.max(jnp.abs(prediction.member_mean_predictions))) < 10.0
+    assert float(jnp.min(prediction.member_aleatoric_variances)) > model.config.variance_floor
+    assert bool(decision.valid)
+    assert bool(model.update(state, decision, _transition()).diagnostics.applied)
+
+
+def test_finite_low_variance_gradients_are_clipped_instead_of_rejected() -> None:
+    """A representable tree norm must survive overflow in the square reduction."""
+    model = RecurrentLatentWorldModelEnsemble(
+        _config(
+            variance_floor=1.0e-25,
+            max_variance=1.0,
+            gradient_clip_norm=1.0,
+            max_raw_gradient_norm=3.0e38,
+            max_loss_magnitude=3.0e38,
+        )
+    )
+    state = model.init(jr.key(24))
+    state = state.replace(  # type: ignore[attr-defined]
+        member_parameters=tuple(
+            parameters.replace(  # type: ignore[attr-defined]
+                variance_bias=jnp.full_like(parameters.variance_bias, -35.0)
+            )
+            for parameters in state.member_parameters
+        )
+    )
+    decision = _decision(model, state)
+    far_bootstrap = jnp.asarray((900.0, -900.0), dtype=jnp.float32)
+    stopped_targets = jnp.concatenate(
+        (far_bootstrap, jnp.asarray((0.5, 0.9), dtype=jnp.float32))
+    )
+    _, gradient = jax.value_and_grad(model._member_nll)(  # noqa: SLF001
+        state.member_parameters[0],
+        state.member_hidden_states[0],
+        OBSERVATION,
+        ACTION,
+        stopped_targets,
+    )
+
+    gradient_leaves = jax.tree_util.tree_leaves(gradient)
+    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in gradient_leaves)
+    direct_norm = jnp.sqrt(
+        jnp.sum(jnp.stack([jnp.sum(jnp.square(leaf)) for leaf in gradient_leaves]))
+    )
+    assert bool(jnp.isinf(direct_norm))
+    assert bool(jnp.isfinite(_tree_l2_norm(gradient)))
+
+    result = model.update(
+        state,
+        decision,
+        _transition(
+            bootstrap_observation=far_bootstrap,
+            next_decision_observation=far_bootstrap,
+        ),
+    )
+    assert bool(result.diagnostics.applied)
+    assert bool(jnp.all(result.diagnostics.member_gradients_valid))
+    assert bool(result.diagnostics.representation_gradient_valid)
     assert bool(result.diagnostics.candidate_state_valid)
 
 
@@ -869,6 +1131,23 @@ def test_digest_bound_checkpoint_roundtrip_preserves_exact_future_stream(tmp_pat
     _assert_tree_equal(original_next, restored_next)
 
 
+def test_internal_templates_ignore_the_ambient_prng_default(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "ambient-rbg.ckpt"
+    with jax.default_prng_impl("rbg"):
+        model = RecurrentLatentWorldModelEnsemble(_config())
+        state = model.init(jr.key(9, impl="threefry2x32"))
+        budget = model.resource_budget()
+        save_recurrent_latent_world_model_ensemble_checkpoint(model, state, checkpoint)
+        restored_model, restored_state = (
+            load_recurrent_latent_world_model_ensemble_checkpoint(checkpoint)
+        )
+
+    assert budget.bootstrap_prng_uint32_scalars == 2
+    assert str(jr.key_impl(restored_state.bootstrap_key)) == "threefry2x32"
+    assert bool(restored_model.state_valid(restored_state))
+    _assert_tree_equal(restored_state, state)
+
+
 def test_checkpoint_restore_does_not_depend_on_an_unrelated_template_draw(
     tmp_path: Path,
 ) -> None:
@@ -1077,3 +1356,28 @@ def test_recurrent_ensemble_config_rejects_non_dict_schema_containers() -> None:
 def test_recurrent_ensemble_config_rejects_derived_resource_overflow() -> None:
     with pytest.raises(ValueError, match="persistent state"):
         _config(observation_dim=3_000_000)
+
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+@pytest.mark.parametrize("magnitude", [2.0e38, -2.0e38, 1.0, 1.1754943508222875e-38])
+def test_public_decision_retains_finite_raw_member_mean(
+    disable_jit: bool, magnitude: float
+) -> None:
+    model = RecurrentLatentWorldModelEnsemble(_config(
+        ensemble_size=2, max_prediction_magnitude=2.5e38,
+        max_parameter_magnitude=2.5e38,
+    ))
+    state = model.init(jr.key(0))
+    members = tuple(dataclasses.replace(
+        member, mean_kernel=jnp.zeros_like(member.mean_kernel),
+        mean_bias=jnp.zeros_like(member.mean_bias).at[-1].set(magnitude),
+    ) for member in state.member_parameters)
+    state = dataclasses.replace(state, member_parameters=members)
+    with jax.disable_jit(disable_jit):
+        decision = _decision(model, state)
+        assert bool(decision.valid)
+        raw = np.asarray(decision.prediction.member_raw_outputs)
+        np.testing.assert_array_equal(raw[:, 3], np.full(2, magnitude, dtype=np.float32))
+        assert float(decision.prediction.mean_raw_output[3]) == float(np.float32(magnitude))
+        assert np.all(np.isfinite(np.asarray(decision.prediction.mean_raw_output)))

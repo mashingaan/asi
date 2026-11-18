@@ -142,7 +142,8 @@ class HordeUpdateResult:
         predictions: Predictions from all demons, shape ``(n_demons,)``
         td_errors: TD errors (target - prediction), shape ``(n_demons,)``.
             NaN for inactive demons.
-        td_targets: Computed TD targets ``r + gamma * V(s')``,
+        td_targets: Computed TD targets
+            ``r + gamma * V(s') + (1 - gamma) * z``,
             shape ``(n_demons,)``. NaN for inactive demons.
         per_demon_metrics: Per-demon metrics, shape ``(n_demons, 3)``.
             Columns: ``[squared_error, raw_error, mean_step_size]``.
@@ -306,6 +307,9 @@ class HordeLearner:
             step_size, sparsity, leaky_relu_slope, use_layer_norm
         )
         self._horde_spec = horde_spec
+        self._terminal_rewards = jnp.array(
+            [demon.terminal_reward for demon in horde_spec.demons], dtype=jnp.float32
+        )
         self._hidden_sizes = hidden_sizes
         self._step_size = step_size
         self._sparsity = sparsity
@@ -323,6 +327,7 @@ class HordeLearner:
             float(np.float32(d.gamma) * np.float32(d.lamda))
             for d in horde_spec.demons
         )
+        self._per_head_trace_decay = per_head_gl
 
         self._learner = MultiHeadMLPLearner(
             n_heads=len(horde_spec.demons),
@@ -467,9 +472,10 @@ class HordeLearner:
     ) -> HordeUpdateResult:
         """Update Horde given observation, cumulants, and next observation.
 
-        Computes TD targets ``r + gamma * V(s')`` for each demon, then
-        delegates to ``MultiHeadMLPLearner.update()``. For gamma=0 demons,
-        the target equals the cumulant.
+        Computes TD targets ``r + gamma * V(s') + (1 - gamma) * z`` for each
+        demon, where ``z`` is the demon's ``terminal_reward``, then delegates
+        to ``MultiHeadMLPLearner.update()``. For gamma=0 demons, the target
+        equals the cumulant plus ``z``.
 
         Args:
             state: Current state
@@ -494,12 +500,13 @@ class HordeLearner:
         # 1. Compute V(s') for bootstrapping
         next_preds = self._learner.predict(state, next_observation)
 
-        # 2. TD targets: r + gamma * V(s')
-        # For gamma=0 demons: target = cumulant (single-step prediction)
+        # 2. TD targets: r + gamma * V(s') + (1 - gamma) * z, where z is the
+        # demon's terminal pseudo-reward (Sutton et al. 2011).
+        # For gamma=0 demons: target = cumulant + z (single-step prediction)
         # NaN cumulants stay NaN (inactive demons)
         gammas = self._horde_spec.gammas
         bootstrap = jnp.where(gammas == 0.0, 0.0, gammas * next_preds)
-        targets = cumulants + bootstrap
+        targets = cumulants + bootstrap + (1.0 - gammas) * self._terminal_rewards
         requested = ~jnp.isnan(cumulants)
         head_inputs_valid = requested & jnp.isfinite(cumulants) & jnp.isfinite(targets)
         safe_targets = jnp.where(head_inputs_valid, targets, jnp.nan)
@@ -582,7 +589,7 @@ class HordeLearner:
 
         next_preds = self._learner.predict(state, next_observation)
         bootstrap = jnp.where(discounts == 0.0, 0.0, discounts * next_preds)
-        targets = cumulants + bootstrap
+        targets = cumulants + bootstrap + (1.0 - discounts) * self._terminal_rewards
         requested = ~jnp.isnan(cumulants)
         head_inputs_valid = (
             requested
@@ -629,6 +636,45 @@ class HordeLearner:
             ),
             head_updates_applied=head_updates_applied,
             update_applied=update_applied,
+        )
+
+    def drop_eligibility_after_zero_discount(
+        self,
+        state: MultiHeadMLPState,
+        discounts: Array,
+        update_applied: Array,
+    ) -> MultiHeadMLPState:
+        """Clear stored head traces after a genuine zero continuation.
+
+        ``update_with_discounts`` keeps each demon's configured
+        ``gamma * lambda``. Control adapters rely on that: they zero the
+        bootstrap discount because the target already contains it, and the
+        trace must still decay by the demon's own horizon. A transition
+        discount of zero is different. The terminating step has already
+        applied the trace it carried in. The next state's trace is
+        ``e = (gamma * lambda) * e_prev + grad``, so leaving the terminal
+        trace in place credits the following episode with the previous one.
+        Demons whose configured trace decay is zero replace their trace on
+        every step and are left unchanged.
+        """
+
+        applied = jnp.asarray(update_applied, dtype=jnp.bool_)
+        discount_vector = jnp.asarray(discounts, dtype=jnp.float32)
+        new_traces = []
+        for index, (weight_trace, bias_trace) in enumerate(state.head_traces):
+            if self._per_head_trace_decay[index] == 0.0:
+                new_traces.append((weight_trace, bias_trace))
+                continue
+            clear = applied & (discount_vector[index] == 0.0)
+            new_traces.append(
+                (
+                    jnp.where(clear, jnp.zeros_like(weight_trace), weight_trace),
+                    jnp.where(clear, jnp.zeros_like(bias_trace), bias_trace),
+                )
+            )
+        return cast(
+            MultiHeadMLPState,
+            state.replace(head_traces=tuple(new_traces)),  # type: ignore[attr-defined]
         )
 
 
@@ -871,6 +917,13 @@ class MixedHorde:
         next_observation: Array,
     ) -> HordeUpdateResult:
         """Update routed demons and return outputs in original demon order."""
+        cumulants = jnp.asarray(cumulants)
+        expected_shape = (self.n_demons,)
+        if cumulants.shape != expected_shape:
+            raise ValueError(
+                f"cumulants must have shape {expected_shape}, got {cumulants.shape}"
+            )
+
         predictions = jnp.full((self.n_demons,), jnp.nan, dtype=jnp.float32)
         td_errors = jnp.full((self.n_demons,), jnp.nan, dtype=jnp.float32)
         td_targets = jnp.full((self.n_demons,), jnp.nan, dtype=jnp.float32)
@@ -1010,8 +1063,15 @@ def run_horde_learning_loop(
         head_updates_applied,
         updates_applied,
     ) = jax.lax.scan(step_fn, state, (observations, cumulants, next_observations))
+    # Traced calls defer execution; concrete results must finish before timing.
+    if not isinstance(per_demon_metrics, jax.core.Tracer):
+        per_demon_metrics.block_until_ready()
     elapsed = time.time() - t0
-    final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
+    # Host-only clocks are narrowed while carried through the traced scan.
+    final_state = final_state.replace(  # type: ignore[attr-defined]
+        birth_timestamp=state.birth_timestamp,
+        uptime_s=state.uptime_s + elapsed,
+    )
 
     return HordeLearningResult(  # type: ignore[call-arg]
         state=final_state,
@@ -1064,8 +1124,39 @@ def run_mixed_horde_learning_loop(
         updates_applied,
     ) = jax.lax.scan(step_fn, state, (observations, cumulants, next_observations))
     elapsed = time.time() - t0
+    # The scan traces nested learner clocks and narrows them to float32.
+    # Restore the incoming Python values. Add this scan's time to the mixed
+    # state's host uptime, not to a narrowed device value.
+    shared_state = final_state.shared_state
+    original_shared = state.shared_state
+    if original_shared is not None and shared_state is not None:
+        shared_state = shared_state.replace(  # type: ignore[attr-defined]
+            birth_timestamp=original_shared.birth_timestamp,
+            uptime_s=original_shared.uptime_s,
+        )
+    independent_state = final_state.independent_state
+    original_independent = state.independent_state
+    if original_independent is not None and independent_state is not None:
+        demon_states = tuple(
+            demon.replace(  # type: ignore[attr-defined]
+                birth_timestamp=original.birth_timestamp,
+                uptime_s=original.uptime_s,
+            )
+            for demon, original in zip(
+                independent_state.demon_states,
+                original_independent.demon_states,
+            )
+        )
+        independent_state = independent_state.replace(  # type: ignore[attr-defined]
+            birth_timestamp=original_independent.birth_timestamp,
+            uptime_s=original_independent.uptime_s,
+            demon_states=demon_states,
+        )
     final_state = final_state.replace(  # type: ignore[attr-defined]
-        uptime_s=final_state.uptime_s + elapsed
+        birth_timestamp=state.birth_timestamp,
+        uptime_s=state.uptime_s + elapsed,
+        shared_state=shared_state,
+        independent_state=independent_state,
     )
     return MixedHordeLearningResult(  # type: ignore[call-arg]
         state=final_state,
@@ -1115,9 +1206,15 @@ def run_horde_learning_loop_final_state(
         (observations, cumulants, next_observations),
     )
     elapsed = time.time() - t0
+    # The scan carries host clocks through the traced update and narrows them
+    # to float32. Restore the incoming Python values and add this scan's time
+    # to the host uptime base.
     return cast(
         MultiHeadMLPState,
-        final_state.replace(uptime_s=final_state.uptime_s + elapsed),  # type: ignore[attr-defined]
+        final_state.replace(  # type: ignore[attr-defined]
+            birth_timestamp=state.birth_timestamp,
+            uptime_s=state.uptime_s + elapsed,
+        ),
     )
 
 

@@ -10,6 +10,7 @@ import jax.random as jr
 import numpy as np
 import pytest
 
+from alberta_framework.core.baseline_optimizers import Adam
 from alberta_framework.core.continual_backprop import (
     CBPLearningResult,
     CBPMLPLearner,
@@ -27,10 +28,13 @@ from alberta_framework.core.continual_backprop import (
     update_utility,
 )
 from alberta_framework.core.multi_head_learner import MultiHeadMLPLearner
+from alberta_framework.core.optimizers import Autostep
 
-# =============================================================================
+# ======================================================================
+
 # init_cbp_state shape / value tests
-# =============================================================================
+# ======================================================================
+
 
 
 class TestInitCbpStateShapes:
@@ -149,9 +153,56 @@ class TestInitCbpStateShapes:
             CBPMultiHeadMLPLearner.from_config(unknown)
 
 
-# =============================================================================
+# ======================================================================
+
 # Utility update behaviour
-# =============================================================================
+# ======================================================================
+
+
+
+class TestReplacedUnitAdamStepCount:
+    """A replaced unit restarts Adam's bias correction with its moments."""
+
+    STEP_SIZE = 1e-3
+
+    def test_first_step_after_replacement_is_adams_nominal_step(self) -> None:
+        learner = CBPMultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(8,),
+            optimizer=Adam(self.STEP_SIZE, 0.9, 0.999, 1e-8),
+            cbp_config=ContinualBackpropConfig(replacement_rate=1 / 8, maturity_threshold=50),
+            use_layer_norm=False,
+        )
+        state = learner.init(feature_dim=4, key=jr.key(0))
+        rng = np.random.default_rng(0)
+
+        def sample() -> tuple[jax.Array, jax.Array]:
+            x = jnp.asarray(rng.normal(size=4), dtype=jnp.float32)
+            return x, jnp.asarray([float(np.sin(x[0]))], dtype=jnp.float32)
+
+        for _ in range(200):
+            result = learner.update(state, *sample())
+            state = result.state
+            if bool(result.replacements_made[0]):
+                break
+        assert bool(result.replacements_made[0])
+        unit = int(jnp.argmin(state.cbp_state.ages[0]))
+        assert int(state.cbp_state.ages[0][unit]) == 0
+        head_opt = state.mlp_state.head_optimizer_states[0][0]
+        assert float(head_opt.m[0, unit]) == 0.0
+        assert float(head_opt.t[0, unit]) == 0.0
+        assert float(jnp.max(head_opt.t)) == 50.0
+
+        before = float(state.mlp_state.head_params.weights[0][0, unit])
+        for _ in range(20):
+            result = learner.update(state, *sample())
+            after = float(result.state.mlp_state.head_params.weights[0][0, unit])
+            if after != before:
+                break
+            state = result.state
+        assert after != before
+        # Fresh zero moments with a reset count give Adam's nominal first step.
+        assert abs(after - before) == pytest.approx(self.STEP_SIZE, rel=1e-3)
 
 
 class TestUtilityUpdate:
@@ -205,6 +256,27 @@ class TestUtilityUpdate:
         assert int(state.ages[0][1]) == 10
         assert int(state.ages[0][2]) == 10
 
+    def test_age_saturates_at_int32_max_without_losing_maturity(self) -> None:
+        """int32 ages must not wrap; wraparound makes mature units ineligible."""
+        int32_max = np.iinfo(np.int32).max
+        wrapped = jnp.array(int32_max, dtype=jnp.int32) + jnp.array(1, dtype=jnp.int32)
+        assert int(wrapped) == -int32_max - 1
+
+        cbp_state = ContinualBackpropState(  # type: ignore[call-arg]
+            utilities=(jnp.array([0.9, 0.1], dtype=jnp.float32),),
+            ages=(jnp.array([int32_max, int32_max], dtype=jnp.int32),),
+            replacement_accumulators=jnp.zeros(1, dtype=jnp.float32),
+            rng_key=jr.key(0),
+        )
+        acts = (jnp.array([1.0, 1.0], dtype=jnp.float32),)
+        grads = (jnp.array([0.1, 0.1], dtype=jnp.float32),)
+        new = update_utility(cbp_state, acts, grads, 0.9)
+        assert int(new.ages[0][0]) == int32_max
+        assert int(new.ages[0][1]) == int32_max
+        idx, has = _select_replacement_index(new.utilities[0], new.ages[0], 10, 0.9)
+        assert bool(has)
+        assert int(idx) == 1
+
     def test_inf_activation_silent_grad_holds_finite_utility(self) -> None:
         """Inf activation * a silent gradient is 0*inf = NaN utility.
 
@@ -222,7 +294,7 @@ class TestUtilityUpdate:
         new = update_utility(cbp_state, activations, grads, 0.9)
         assert bool(jnp.all(jnp.isfinite(new.utilities[0])))
         chex.assert_trees_all_close(new.utilities[0][0], cbp_state.utilities[0][0])
-        idx, has = _select_replacement_index(new.utilities[0], new.ages[0], 10)
+        idx, has = _select_replacement_index(new.utilities[0], new.ages[0], 10, 0.9)
         assert bool(has)
         assert int(idx) == 1
 
@@ -274,9 +346,11 @@ class TestWrapperUtilityGradients:
         assert second_layer_utility > 1e-8
 
 
-# =============================================================================
+# ======================================================================
+
 # Replacement re-initializes low-utility units
-# =============================================================================
+# ======================================================================
+
 
 
 class TestReplacement:
@@ -480,9 +554,11 @@ class TestReplacement:
         assert int(jnp.sum(changed_rows)) >= 1
 
 
-# =============================================================================
+# ======================================================================
+
 # enabled=False returns unchanged state
-# =============================================================================
+# ======================================================================
+
 
 
 class TestDisabledReturnsUnchanged:
@@ -545,9 +621,11 @@ class TestDisabledReturnsUnchanged:
             plain_running = plain_result.state
 
 
-# =============================================================================
+# ======================================================================
+
 # JIT compatibility
-# =============================================================================
+# ======================================================================
+
 
 
 class TestJitCompatibility:
@@ -604,9 +682,11 @@ class TestJitCompatibility:
             state = result.state
 
 
-# =============================================================================
+# ======================================================================
+
 # Wrapper plumbing: shapes, init split, predict path
-# =============================================================================
+# ======================================================================
+
 
 
 class TestWrapperPlumbing:
@@ -639,6 +719,81 @@ class TestWrapperPlumbing:
         preds = learner.predict(state, jnp.array([0.1, -0.2, 0.5]))
         chex.assert_shape(preds, (4,))
         chex.assert_tree_all_finite(preds)
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+@pytest.mark.parametrize("rejection", ["overflow", "nonfinite_target", "exhausted_counter"])
+@pytest.mark.parametrize("interface", ["multi", "single", "scan"])
+def test_cbp_rejected_update_preserves_learned_state(
+    disable_jit: bool, rejection: str, interface: str
+) -> None:
+    learner = CBPMultiHeadMLPLearner(
+        n_heads=1,
+        hidden_sizes=(2,),
+        optimizer=Adam(step_size=0.01),
+        sparsity=0.0,
+        use_layer_norm=False,
+        cbp_config=ContinualBackpropConfig(
+            replacement_rate=1.0, maturity_threshold=3
+        ),
+    )
+    observation = jnp.array([0.1, 0.2], dtype=jnp.float32)
+    targets = jnp.array([1.0], dtype=jnp.float32)
+    with jax.disable_jit(disable_jit):
+        state = learner.init(2, jr.key(0, impl="threefry2x32"))
+        state = state.replace(
+            mlp_state=state.mlp_state.replace(birth_timestamp=0.0, uptime_s=0.0)
+        )
+        for _ in range(2):
+            state = learner.update(state, observation, targets).state
+        np.testing.assert_array_equal(state.cbp_state.ages[0], [2, 2])
+        accepted = learner.update(state, observation, targets)
+        assert bool(jnp.any(accepted.replacements_made))
+
+        if rejection == "overflow":
+            targets = jnp.array([1e30], dtype=jnp.float32)
+        elif rejection == "nonfinite_target":
+            targets = jnp.array([jnp.inf], dtype=jnp.float32)
+        else:
+            state = state.replace(
+                mlp_state=state.mlp_state.replace(
+                    step_count=jnp.asarray(2**31 - 1, dtype=jnp.int32),
+                    step_words=jnp.full((2,), 2**32 - 1, dtype=jnp.uint32),
+                )
+            )
+        base = learner.learner.update(state.mlp_state, observation, targets)
+        assert not bool(base.update_applied)
+        chex.assert_trees_all_equal(base.state, state.mlp_state)
+
+        if interface == "scan":
+            result = run_cbp_learning_loop(
+                learner, state, observation[None, :], targets[None, :]
+            )
+            actual = result.state
+        elif interface == "single":
+            adapter = CBPMLPLearner.from_config(
+                {
+                    key: value
+                    for key, value in learner.to_config().items()
+                    if key not in {"n_heads", "per_head_gamma_lamda"}
+                }
+                | {"type": "CBPMLPLearner"}
+            )
+            result = adapter.update(CBPMLPState(multi_state=state), observation, targets[0])
+            actual = result.state.multi_state
+        else:
+            result = learner.update(state, observation, targets)
+            actual = result.state
+
+        assert not bool(jnp.any(result.replacements_made))
+        chex.assert_trees_all_equal(
+            actual.mlp_state.replace(uptime_s=state.mlp_state.uptime_s),
+            state.mlp_state,
+        )
+        chex.assert_trees_all_equal(
+            actual.cbp_state.replace(rng_key=jr.key_data(actual.cbp_state.rng_key)),
+            state.cbp_state.replace(rng_key=jr.key_data(state.cbp_state.rng_key)),
+        )
 
 
 class TestSingleOutputCBPMLP:
@@ -688,9 +843,11 @@ class TestSingleOutputCBPMLP:
         assert rebuilt.to_config() == learner.to_config()
 
 
-# =============================================================================
+# ======================================================================
+
 # Full loop smoke test
-# =============================================================================
+# ======================================================================
+
 
 
 class TestLoop:
@@ -718,10 +875,94 @@ class TestLoop:
         chex.assert_shape(result.per_head_metrics, (50, 1, 3))
         chex.assert_shape(result.replacements_made, (50, 1))
 
+    def test_learning_loop_preserves_initialized_host_clocks(self):
+        learner = CBPMultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(4,),
+            cbp_config=ContinualBackpropConfig(enabled=False),
+            step_size=0.05,
+            sparsity=0.0,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(0))
+        birth = 1700000000.125
+        uptime = 2**24 + 0.25
+        state = state.replace(
+            mlp_state=state.mlp_state.replace(
+                birth_timestamp=birth,
+                uptime_s=uptime,
+            )
+        )
+        observations = jnp.zeros((2, 2), dtype=jnp.float32)
+        targets = jnp.zeros((2, 1), dtype=jnp.float32)
 
-# =============================================================================
+        result = run_cbp_learning_loop(learner, state, observations, targets)
+        clocks = result.state.mlp_state
+
+        assert type(clocks.birth_timestamp) is float
+        assert clocks.birth_timestamp == birth
+        assert type(clocks.uptime_s) is float
+        assert clocks.uptime_s > uptime
+        chex.assert_tree_all_finite(result.per_head_metrics)
+
+    def test_learning_loop_finishes_device_work_before_stopping_uptime_clock(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reported uptime must cover scan completion, not only dispatch."""
+        from types import SimpleNamespace
+
+        import alberta_framework.core.continual_backprop as module
+
+        learner = CBPMultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(4,),
+            cbp_config=ContinualBackpropConfig(enabled=False),
+            step_size=0.05,
+            sparsity=0.0,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(0))
+        observations = jnp.zeros((2, 2), dtype=jnp.float32)
+        targets = jnp.zeros((2, 1), dtype=jnp.float32)
+        real_scan = jax.lax.scan
+        scan_returned = False
+        blocked: list[object] = []
+
+        def recording_scan(*args: object, **kwargs: object) -> object:
+            nonlocal scan_returned
+            result = real_scan(*args, **kwargs)
+            scan_returned = True
+            return result
+
+        def recording_block(value: object) -> object:
+            assert scan_returned
+            blocked.append(value)
+            return value
+
+        clock_samples = iter((100.0, 101.0))
+
+        def clock() -> float:
+            if scan_returned:
+                assert blocked
+            return next(clock_samples)
+
+        monkeypatch.setattr(jax.lax, "scan", recording_scan)
+        monkeypatch.setattr(jax, "block_until_ready", recording_block)
+        monkeypatch.setattr(module, "time", SimpleNamespace(time=clock))
+
+        result = run_cbp_learning_loop(learner, state, observations, targets)
+
+        assert len(blocked) == 1
+        blocked_state, blocked_metrics, blocked_replacements = blocked[0]
+        assert blocked_state is not None
+        assert blocked_metrics is result.per_head_metrics
+        assert blocked_replacements is result.replacements_made
+        assert result.state.mlp_state.uptime_s == state.mlp_state.uptime_s + 1.0
+
+
+# ======================================================================
+
 # Tracker dataclass
-# =============================================================================
+# ======================================================================
+
 
 
 class TestTrackerDataclass:
@@ -741,9 +982,11 @@ class TestTrackerDataclass:
         assert tracker.sparsity == 0.5
 
 
-# =============================================================================
+# ======================================================================
+
 # Config validation and roundtrip
-# =============================================================================
+# ======================================================================
+
 
 
 class TestContinualBackpropConfigValidation:
@@ -988,3 +1231,275 @@ class TestCBPWrapperConstructorIdentities:
         payload[field] = value
         with pytest.raises(ValueError, match="serialized"):
             CBPMultiHeadMLPLearner.from_config(payload)
+
+
+def test_replacement_resets_optimizer_state_and_traces() -> None:
+    """A fresh unit must not inherit the dead unit's adaptation history.
+
+    The reference GnT implementation resets the optimizer slots of a
+    replaced feature along with its weights, and MLPLearner.
+    reset_dormant_neurons re-initializes optimizer-state slices from
+    init_for_shape for the same reason: a step-size-adapting optimizer
+    whose per-weight state survives the replacement hands the newborn
+    unit the collapsed step-sizes of the unit it replaced.
+    """
+    hidden = (6,)
+    optimizer = Autostep(initial_step_size=0.01)
+    learner = MultiHeadMLPLearner(n_heads=1, hidden_sizes=hidden, optimizer=optimizer)
+    mlp_state = learner.init(32, jr.key(0))
+
+    key = jr.key(3)
+    for i in range(60):
+        obs = jr.normal(jr.fold_in(key, i), (32,), jnp.float32)
+        target = jnp.array([float(jnp.sum(obs))], jnp.float32)
+        mlp_state = learner.update(mlp_state, obs, target).state
+
+    cbp_state = init_cbp_state(mlp_state, hidden, jr.key(7))
+    cbp_state = cbp_state.replace(
+        utilities=(jnp.array([0.0, 1.0, 1.0, 1.0, 1.0, 1.0], jnp.float32),),
+        ages=(jnp.full((6,), 500, jnp.int32),),
+        replacement_accumulators=jnp.array([1.0], jnp.float32),
+    )
+    config = ContinualBackpropConfig(
+        decay_rate=0.99, replacement_rate=1.0, maturity_threshold=100
+    )
+
+    new_mlp, _new_cbp, replaced = replace_units_with_flags(
+        mlp_state,
+        cbp_state,
+        config,
+        0.9,
+        learner.optimizer,
+        learner.head_optimizer,
+    )
+    assert bool(replaced[0])
+
+    fresh = optimizer.init_for_shape((6, 32))
+    chex.assert_trees_all_close(
+        new_mlp.trunk_optimizer_states[0].step_sizes[0],
+        fresh.step_sizes[0],
+    )
+    chex.assert_trees_all_close(
+        new_mlp.trunk_traces[0][0], jnp.zeros(32, dtype=jnp.float32)
+    )
+    chex.assert_trees_all_close(
+        new_mlp.head_traces[0][0][:, 0], jnp.zeros(1, dtype=jnp.float32)
+    )
+    fresh_head = optimizer.init_for_shape(new_mlp.head_params.weights[0].shape)
+    chex.assert_trees_all_close(
+        new_mlp.head_optimizer_states[0][0].step_sizes[:, 0],
+        fresh_head.step_sizes[:, 0],
+    )
+
+    surviving = np.asarray(mlp_state.trunk_optimizer_states[0].step_sizes[1])
+    chex.assert_trees_all_close(
+        new_mlp.trunk_optimizer_states[0].step_sizes[1], jnp.asarray(surviving)
+    )
+
+
+def test_wrapper_replacement_resets_learned_adaptation_history() -> None:
+    optimizer = Autostep(initial_step_size=0.01)
+    wrapper = CBPMultiHeadMLPLearner(
+        n_heads=1, hidden_sizes=(4, 3), optimizer=optimizer,
+        gamma=0.0, lamda=0.0, sparsity=0.0,
+        cbp_config=ContinualBackpropConfig(replacement_rate=1.0, maturity_threshold=20),
+    )
+    state = wrapper.init(3, jr.key(801))
+    for step in range(10):
+        obs = jr.normal(jr.fold_in(jr.key(802), step), (3,))
+        state = wrapper.update(state, obs, jnp.array([2.0])).state
+    state = state.replace(cbp_state=state.cbp_state.replace(
+        ages=tuple(jnp.full_like(age, 100) for age in state.cbp_state.ages),
+    ))
+    result = wrapper.update(state, jnp.array([0.3, 0.5, -0.2]), jnp.array([1.0]))
+    for layer, age in enumerate(result.state.cbp_state.ages):
+        replaced = np.flatnonzero(np.asarray(age) == 0)
+        assert len(replaced) == 1
+        unit = int(replaced[0])
+        opt = result.state.mlp_state.trunk_optimizer_states[2 * layer]
+        fresh = optimizer.init_for_shape(opt.step_sizes.shape)
+        chex.assert_trees_all_equal(opt.step_sizes[unit], fresh.step_sizes[unit])
+        chex.assert_trees_all_equal(opt.traces[unit], fresh.traces[unit])
+        np.testing.assert_array_equal(result.state.mlp_state.trunk_traces[2 * layer][unit], 0.0)
+
+
+# ======================================================================
+
+# Published bias-corrected utility (Dohare et al. 2024, Eq. 8)
+# ======================================================================
+
+
+
+def _warm_utility_ema(steps: int, contribution: float, decay: float) -> tuple[float, int]:
+    """Drive ``update_utility`` for ``steps`` steps on one unit.
+
+    Returns the resulting ``(utility, age)`` for a unit that saw the same
+    ``|activation * gradient|`` product on every step.
+    """
+    state = ContinualBackpropState(  # type: ignore[call-arg]
+        utilities=(jnp.zeros(1, dtype=jnp.float32),),
+        ages=(jnp.zeros(1, dtype=jnp.int32),),
+        replacement_accumulators=jnp.zeros(1, dtype=jnp.float32),
+        rng_key=jr.key(0),
+    )
+    activations = (jnp.array([contribution], dtype=jnp.float32),)
+    grads = (jnp.ones(1, dtype=jnp.float32),)
+    for _ in range(steps):
+        state = update_utility(state, activations, grads, decay)
+    return float(state.utilities[0][0]), int(state.ages[0][0])
+
+
+class TestPublishedBiasCorrectedUtility:
+    """Replacement must rank units by the *bias-corrected* utility.
+
+    Dohare, Hernandez-Garcia, Lan, Rahman, Mahmood & Sutton (2024), "Loss of
+    plasticity in deep continual learning", *Nature* 632, pp. 768-774,
+    Eq. 8::
+
+        u_hat[l, i, t] = u[l, i, t] / (1 - eta ** a[l, i, t])
+
+    where ``a`` is the *per-unit* age.  The authors' released implementation
+    (https://github.com/shibhansh/loss-of-plasticity,
+    ``lop/algos/gnt.py::GnT.update_utility`` /
+    ``GnT.test_features``) computes
+
+        bias_correction = 1 - self.decay_rate ** self.ages[layer_idx]
+        self.bias_corrected_util[layer_idx] = self.util[layer_idx] / bias_correction
+
+    and then selects with
+    ``torch.topk(-self.bias_corrected_util[i][eligible_feature_indices], ...)``.
+    ``lop/algos/cbp_linear.py`` and ``lop/algos/cbp_conv.py`` use the same
+    per-unit-age correction.
+
+    The correction does not cancel across units: every replaced unit has its
+    age reset to 0, so eligible units genuinely differ in age and therefore in
+    warm-up bias.  Ranking on the raw EMA systematically understates the
+    utility of the youngest eligible units -- exactly the units the maturity
+    threshold exists to protect (paper, Section "Continual backpropagation":
+    "initializing the outgoing weight to zero makes the new unit vulnerable to
+    immediate reinitialized as it has zero utility").
+    """
+
+    DECAY = 0.99
+    MATURITY = 100
+    # Steps chosen so the two units are genuinely distinguishable: the young
+    # unit is at exactly the maturity threshold (warm-up factor 1 - 0.99**100
+    # = 0.6340), the old unit is effectively fully warm (1 - 0.99**700
+    # = 0.99909).
+    YOUNG_STEPS = 100
+    OLD_STEPS = 700
+    YOUNG_CONTRIBUTION = 1.0
+    OLD_CONTRIBUTION = 0.9
+
+    def _crafted_layer(self) -> tuple[jnp.ndarray, jnp.ndarray, float, float]:
+        young_util, young_age = _warm_utility_ema(
+            self.YOUNG_STEPS, self.YOUNG_CONTRIBUTION, self.DECAY
+        )
+        old_util, old_age = _warm_utility_ema(
+            self.OLD_STEPS, self.OLD_CONTRIBUTION, self.DECAY
+        )
+        assert young_age == self.YOUNG_STEPS
+        assert old_age == self.OLD_STEPS
+        utility = jnp.array([young_util, old_util], dtype=jnp.float32)
+        age = jnp.array([young_age, old_age], dtype=jnp.int32)
+        return utility, age, young_util, old_util
+
+    def test_raw_and_published_rankings_actually_disagree(self) -> None:
+        """Pin that this fixture discriminates -- it cannot pass by coincidence."""
+        utility, age, young_util, old_util = self._crafted_layer()
+
+        # Raw EMAs: the young unit reads LOWER even though its steady-state
+        # contribution (1.0) is strictly larger than the old unit's (0.9).
+        assert young_util < old_util
+        assert int(jnp.argmin(utility)) == 0
+
+        # Bias-corrected utilities recover the true steady-state contributions
+        # and reverse the ranking.
+        corrected = utility / (1.0 - self.DECAY ** age.astype(jnp.float32))
+        assert float(corrected[0]) == pytest.approx(self.YOUNG_CONTRIBUTION, abs=2e-3)
+        assert float(corrected[1]) == pytest.approx(self.OLD_CONTRIBUTION, abs=2e-3)
+        assert float(corrected[0]) > float(corrected[1])
+        assert int(jnp.argmin(corrected)) == 1
+
+    def test_selector_uses_bias_corrected_utility(self) -> None:
+        utility, age, _, _ = self._crafted_layer()
+
+        idx, has_candidate = _select_replacement_index(
+            utility, age, self.MATURITY, self.DECAY
+        )
+        assert bool(has_candidate)
+        # Published rule replaces unit 1 (lowest bias-corrected utility, 0.9).
+        # The raw-EMA rule would have replaced unit 0 (see the test above).
+        assert int(idx) == 1
+
+    def test_replacement_path_reinitializes_the_published_unit(self) -> None:
+        utility, age, _, _ = self._crafted_layer()
+
+        learner = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(2,), sparsity=0.0)
+        mlp_state = learner.init(feature_dim=3, key=jr.key(0))
+        cbp_state = ContinualBackpropState(  # type: ignore[call-arg]
+            utilities=(utility,),
+            ages=(age,),
+            # Full budget so the single allowed replacement fires this step.
+            replacement_accumulators=jnp.ones(1, dtype=jnp.float32),
+            rng_key=jr.key(1),
+        )
+        config = ContinualBackpropConfig(
+            decay_rate=self.DECAY,
+            replacement_rate=0.0,
+            maturity_threshold=self.MATURITY,
+            enabled=True,
+        )
+
+        _new_mlp, new_cbp, replaced = replace_units_with_flags(
+            mlp_state, cbp_state, config, sparsity=0.0
+        )
+        assert bool(replaced[0])
+        # A replaced unit has its age and utility reset to 0.
+        assert int(new_cbp.ages[0][1]) == 0
+        assert float(new_cbp.utilities[0][1]) == 0.0
+        # The younger, higher-true-utility unit is untouched.
+        assert int(new_cbp.ages[0][0]) == self.YOUNG_STEPS
+
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+def test_cbp_replaces_lowest_finite_utility_when_debiasing_overflows(disable_jit):
+    learner = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(3,), sparsity=0.0)
+    mlp = learner.init(feature_dim=1, key=jr.key(42))
+    cbp = init_cbp_state(mlp, (3,), key=jr.key(7)).replace(
+        utilities=(jnp.array([0.0, 2e38, 1e38], dtype=jnp.float32),),
+        ages=(jnp.array([0, 1, 1], dtype=jnp.int32),),
+        replacement_accumulators=jnp.array([1.0], dtype=jnp.float32),
+    )
+    config = ContinualBackpropConfig(
+        decay_rate=0.99, replacement_rate=1.0, maturity_threshold=1
+    )
+    with jax.disable_jit(disable_jit):
+        _, updated, flags = jax.jit(
+            lambda m, c: replace_units_with_flags(m, c, config, 0.0)
+        )(mlp, cbp)
+    assert bool(flags[0])
+    np.testing.assert_array_equal(np.asarray(updated.ages[0]), [0, 1, 0])
+    np.testing.assert_array_equal(
+        np.asarray(updated.utilities[0][:2]), np.asarray(cbp.utilities[0][:2])
+    )
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+def test_cbp_ranking_fallback_preserves_finite_scores_and_rejects_poison(disable_jit):
+    select = jax.jit(lambda u, a: _select_replacement_index(u, a, 1, 0.99))
+    with jax.disable_jit(disable_jit):
+        for utilities, ages, expected, available in (
+            ([jnp.nan, jnp.inf, 1e38], [1, 1, 1], 2, True),
+            ([0.0, 2e38, 1e38], [0, 1, 2], 2, True),
+            ([0.0, 2e38, 1e-30], [0, 1, 1], 2, True),
+            ([0.0, 2.0, 1.0], [0, 1, 1], 2, True),
+            ([0.0, 2e38, 1e38], [0, 0, 0], -1, False),
+            ([jnp.nan, jnp.inf, -jnp.inf], [1, 1, 1], -1, False),
+        ):
+            index, found = select(
+                jnp.array(utilities, dtype=jnp.float32), jnp.array(ages, dtype=jnp.int32)
+            )
+            assert int(index) == expected
+            assert bool(found) == available

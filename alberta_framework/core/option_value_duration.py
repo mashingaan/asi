@@ -423,7 +423,13 @@ class OptionValueDurationLearner:
             dtype=jnp.float32,
         )
         heads = jnp.einsum("ohf,f->oh", state.weights, observation)
-        return jnp.where(self._state_values_valid(state), heads, jnp.zeros_like(heads))
+        # Finite weights and observations can still overflow the dot product.
+        heads_valid = (
+            self._state_values_valid(state)
+            & jnp.all(jnp.isfinite(observation))
+            & jnp.all(jnp.isfinite(heads))
+        )
+        return jnp.where(heads_valid, heads, jnp.zeros_like(heads))
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(
@@ -439,10 +445,13 @@ class OptionValueDurationLearner:
             durations,
             jnp.asarray(self._config.duration_floor, dtype=jnp.float32),
         )
+        reward_rates = reward_values / safe_durations
+        # Finite heads can still overflow the division by the duration floor.
+        rates_valid = jnp.all(jnp.isfinite(reward_rates))
         return OptionValueDurationPrediction(
-            reward_values=reward_values,
-            durations=durations,
-            reward_rates=reward_values / safe_durations,
+            reward_values=jnp.where(rates_valid, reward_values, jnp.zeros_like(reward_values)),
+            durations=jnp.where(rates_valid, durations, jnp.zeros_like(durations)),
+            reward_rates=jnp.where(rates_valid, reward_rates, jnp.zeros_like(reward_rates)),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -498,8 +507,18 @@ class OptionValueDurationLearner:
             jnp.zeros_like(next_predictions),
             continuation_discount * next_predictions,
         )
-        td_targets = cumulants + bootstrap
-        td_errors = td_targets - predictions
+        # Keep ordinary rounding. Recover only an overflowing partial sum
+        # whose cancellation against the current prediction is a finite TD error:
+        # reward + V(s') can be outside float32 while reward + (V(s') - V(s)) is not.
+        direct_targets = cumulants + bootstrap
+        direct_td_errors = direct_targets - predictions
+        recovered_td_errors = cumulants + (bootstrap - predictions)
+        td_targets = direct_targets
+        td_errors = jnp.where(
+            jnp.isfinite(direct_targets),
+            direct_td_errors,
+            recovered_td_errors,
+        )
         step_sizes = jnp.array(
             [
                 self._config.reward_step_size,
@@ -558,7 +577,9 @@ class OptionValueDurationLearner:
                 jnp.zeros_like(next_predictions),
             ),
             td_targets=jnp.where(
-                head_updates_applied, td_targets, jnp.zeros_like(td_targets)
+                head_updates_applied & jnp.isfinite(td_targets),
+                td_targets,
+                jnp.zeros_like(td_targets),
             ),
             td_errors=jnp.where(
                 head_updates_applied, td_errors, jnp.zeros_like(td_errors)
@@ -668,7 +689,17 @@ def run_option_value_duration_from_arrays(
             continuation_discounts,
         ),
     )
-    final_state = final_state.replace(uptime_s=final_state.uptime_s + (time.time() - start))
+    # Concrete calls must finish device work before recording active uptime.
+    # Traced calls defer execution to their caller.
+    if not isinstance(td_errors, jax.core.Tracer):
+        td_errors.block_until_ready()
+    elapsed = time.time() - start
+    # Keep host-only clocks out of the device scan's scalar narrowing: restore
+    # the incoming values, advancing uptime from the true host base.
+    final_state = final_state.replace(
+        birth_timestamp=state.birth_timestamp,
+        uptime_s=state.uptime_s + elapsed,
+    )
     return OptionValueDurationArrayResult(
         state=final_state,
         predictions=predictions,

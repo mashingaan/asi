@@ -73,6 +73,20 @@ def _trusted_float_array(value: object, *, name: str) -> Array:
     return array
 
 
+def _three_factor_product(first: Array, second: Array, third: Array) -> Array:
+    # Left-associated multiplication overflows before a small third factor
+    # can bring the rounded product back into the float32 range.
+    direct = first * second * third
+    first_mantissa, first_exponent = jnp.frexp(first)
+    second_mantissa, second_exponent = jnp.frexp(second)
+    third_mantissa, third_exponent = jnp.frexp(third)
+    mantissa = first_mantissa * second_mantissa * third_mantissa
+    exponent = first_exponent + second_exponent + third_exponent
+    stable = jnp.ldexp(mantissa, exponent)
+    use_stable = jnp.isfinite(stable) & ~jnp.isfinite(direct)
+    return jnp.where(use_stable, stable, direct)
+
+
 def _adalin_transaction(
     x: Array, alpha: Array, *, activation: Array, derivative: Array
 ) -> tuple[Array, Array]:
@@ -83,7 +97,7 @@ def _adalin_transaction(
     if math.prod(output_shape) > _MAX_ARRAY_ELEMENTS:
         raise ValueError("broadcast output exceeds the 1000000-element limit")
     gate = jax.lax.stop_gradient(jnp.cos(0.5 * jnp.pi * jnp.abs(derivative)))
-    candidate = activation + alpha * x * gate
+    candidate = activation + _three_factor_product(alpha, x, gate)
     valid = (
         jnp.all(jnp.isfinite(x)) & jnp.all(jnp.isfinite(alpha)) & jnp.all(jnp.isfinite(candidate))
     )
@@ -569,15 +583,24 @@ def run_adalin_development(
                 mechanism_enabled=mechanism_enabled,
             )
         task_online.append(task_correct / config.examples_per_task)
-        test_correct, test_total = _accuracy(
-            adalin_logits(
-                state.parameters,
-                jnp.asarray(test_x[:, pixels]),
-                mechanism_enabled=mechanism_enabled,
-            ),
-            jnp.asarray(test_y),
+        test_correct = 0
+        test_total = 0
+        evaluation_batch_size = _evaluation_batch_size(
+            test_x.shape[1], config.hidden_widths
         )
-        model_forward_calls += 1
+        for start in range(0, test_x.shape[0], evaluation_batch_size):
+            stop = start + evaluation_batch_size
+            correct, total = _accuracy(
+                adalin_logits(
+                    state.parameters,
+                    jnp.asarray(test_x[start:stop][:, pixels]),
+                    mechanism_enabled=mechanism_enabled,
+                ),
+                jnp.asarray(test_y[start:stop]),
+            )
+            test_correct += correct
+            test_total += total
+            model_forward_calls += 1
         task_test.append(test_correct / test_total)
     wall_clock = time.perf_counter() - started
     observations = config.tasks * config.examples_per_task
@@ -668,6 +691,13 @@ def run_adalin_development(
     }
     validate_adalin_result(result)
     return result
+
+
+def _evaluation_batch_size(width: int, hidden_widths: tuple[int, int]) -> int:
+    divisor = max(width, *hidden_widths)
+    if divisor > _MAX_ARRAY_ELEMENTS:
+        raise ValueError("evaluation width and hidden widths must fit the array-element budget")
+    return _MAX_ARRAY_ELEMENTS // divisor
 
 
 _RESULT_KEYS = {
@@ -771,9 +801,19 @@ def validate_adalin_result(value: object) -> None:
     _require_keys(
         dataset, {"sha256", "train_examples", "test_examples", "input_dim", "classes"}, "dataset"
     )
+    dataset_digest = dataset["sha256"]
+    if (
+        type(dataset_digest) is not str
+        or len(dataset_digest) != 64
+        or any(char not in "0123456789abcdef" for char in dataset_digest)
+    ):
+        raise ValueError("dataset.sha256 must be a lowercase SHA-256 digest")
     for field in ("train_examples", "test_examples", "input_dim", "classes"):
         if type(dataset[field]) is not int or cast(int, dataset[field]) < 1:
             raise ValueError(f"dataset.{field} must be a positive exact integer")
+    evaluation_batch_size = _evaluation_batch_size(
+        cast(int, dataset["input_dim"]), config.hidden_widths
+    )
     if (
         dataset["train_examples"] != config.examples_per_task
         or dataset["classes"] != config.classes
@@ -840,7 +880,9 @@ def validate_adalin_result(value: object) -> None:
         "label_queries": observations,
         "optimizer_updates": updates,
         "model_queries": observations + config.tasks * cast(int, dataset["test_examples"]),
-        "model_forward_calls": updates + config.tasks,
+        "model_forward_calls": updates
+        + config.tasks
+        * math.ceil(cast(int, dataset["test_examples"]) / evaluation_batch_size),
         "timing_qualified": False,
     }
     for resource_field, resource_expected in expected_resources.items():

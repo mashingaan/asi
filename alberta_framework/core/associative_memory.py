@@ -36,19 +36,7 @@ from alberta_framework.core.update_safety import (
 
 _INT32_MAX: int = 2**31 - 1
 _UINT32_MAX: int = 4294967295
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_ACTUAL_INT_TYPES: tuple[type, ...] = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 
 
 def _require_float32_resource(
@@ -551,8 +539,9 @@ def _masked_softmax(logits: Array, mask: Array) -> Array:
 def _cross_entropy_from_logits(logits: Array, label: Array) -> Array:
     safe_label = jnp.clip(label.astype(jnp.int32), 0, logits.shape[0] - 1)
     shifted = logits - jnp.max(logits)
-    log_z = jnp.log(jnp.sum(jnp.exp(shifted))) + jnp.max(logits)
-    return log_z - logits[safe_label]
+    # Keep the common offset cancelled before the final subtraction.
+    # Adding it back first can round away a nonzero log-partition.
+    return jnp.log(jnp.sum(jnp.exp(shifted))) - shifted[safe_label]
 
 
 class AssociativeMemoryLearner:
@@ -822,12 +811,57 @@ class AssociativeMemoryLearner:
             fraction * budget_span
         )
 
-    def _weighted_feature_loss(self, row_values: Array, weights: Array, label: Array) -> Array:
-        evidence = jnp.sum(weights[:, None] * row_values, axis=0)
-        logits = self._config.logit_scale * evidence
+    def _weighted_evidence(self, row_values: Array, weights: Array) -> tuple[Array, Array]:
+        """Reduce active row evidence without overflowing a representable mean."""
         total_weight = jnp.sum(weights)
-        if self._config.normalize_by_weight:
-            logits = jnp.where(total_weight > 0.0, logits / total_weight, logits)
+        weight_col = weights[:, None]
+        active_values = jnp.where(
+            weight_col == 0.0,
+            jnp.zeros_like(row_values),
+            row_values,
+        )
+        if not self._config.normalize_by_weight:
+            return jnp.sum(weight_col * active_values, axis=0), total_weight
+
+        evidence_weights = jnp.where(total_weight > 0.0, weights / total_weight, weights)
+        value_scale = jnp.max(jnp.abs(active_values), axis=0)
+        _, value_exponent = jnp.frexp(value_scale)
+        scale_exponent = jnp.maximum(value_exponent - 1, 0)
+        scaled_values = jnp.ldexp(active_values, -scale_exponent)
+        scaled_bound = jnp.max(jnp.abs(scaled_values), axis=0)
+        unit_evidence = jnp.sum(
+            evidence_weights[:, None] * scaled_values,
+            axis=0,
+        )
+        # A normalized, non-negative weight vector forms a convex combination.
+        # Bound only roundoff outside that exact range before restoring scale.
+        unit_evidence = jnp.clip(unit_evidence, -scaled_bound, scaled_bound)
+        return jnp.ldexp(unit_evidence, scale_exponent), total_weight
+
+    def _combined_logits(self, prior: Array, evidence: Array) -> Array:
+        """Combine finite score sources in a softmax-equivalent finite frame."""
+        prior_logits = jnp.asarray(0.05, dtype=jnp.float32) * prior
+        evidence_logits = self._config.logit_scale * evidence
+        centered_prior = prior_logits - jax.lax.stop_gradient(jnp.max(prior_logits))
+        centered_evidence = evidence_logits - jax.lax.stop_gradient(
+            jnp.max(evidence_logits)
+        )
+        prior_gap = -centered_prior
+        evidence_gap = -centered_evidence
+        larger_gap = jnp.maximum(prior_gap, evidence_gap)
+        smaller_gap = jnp.minimum(prior_gap, evidence_gap)
+        ceiling = jnp.asarray(np.finfo(np.float32).max, dtype=jnp.float32)
+        combined_gap = larger_gap + jnp.minimum(smaller_gap, ceiling - larger_gap)
+        combined_gap = combined_gap - jax.lax.stop_gradient(jnp.min(combined_gap))
+        return -combined_gap
+
+    def _weighted_feature_loss(self, row_values: Array, weights: Array, label: Array) -> Array:
+        evidence, total_weight = self._weighted_evidence(row_values, weights)
+        # Center on both sides of the scale, as in the per-row loss below;
+        # this value feeds cross entropy only, which is shift invariant.
+        centered = evidence - jax.lax.stop_gradient(jnp.max(evidence))
+        logits = self._config.logit_scale * centered
+        logits = logits - jax.lax.stop_gradient(jnp.max(logits))
         loss = _cross_entropy_from_logits(logits, label)
         uniform_loss = jnp.log(jnp.asarray(self._config.vocab_size, dtype=jnp.float32))
         return jnp.where(total_weight > 0.0, loss, uniform_loss)
@@ -857,21 +891,15 @@ class AssociativeMemoryLearner:
         window_scope, window_probs = self._window_scope_weights(state)
         scope_weights = family_scope * window_scope * mask.astype(jnp.float32)
         weights = base_weights * scope_weights
-        weight_col = weights[:, None]
-        # Silent features have weight 0. An inf stored value times that
-        # weight is 0*inf = NaN. Skip the product on exact zeros.
-        evidence = jnp.sum(
-            jnp.where(weight_col == 0.0, jnp.zeros_like(row_values), weight_col * row_values),
-            axis=0,
-        )
+        evidence, total_weight = self._weighted_evidence(row_values, weights)
         # The decayed label-frequency prior enters with a small fixed weight:
         # it dominates only when no feature rows match (evidence is zero, so
         # the prediction falls back to base rates) and is otherwise a weak
-        # tiebreak against feature evidence scaled by ``logit_scale``.
-        logits = 0.05 * state.prior + self._config.logit_scale * evidence
-        total_weight = jnp.sum(weights)
-        if self._config.normalize_by_weight:
-            logits = jnp.where(total_weight > 0.0, logits / total_weight, logits)
+        # tiebreak against feature evidence scaled by ``logit_scale``. The
+        # weight normalization applies to the evidence sum alone, so the
+        # prior's coefficient stays fixed instead of scaling with
+        # ``1 / total_weight``.
+        logits = self._combined_logits(state.prior, evidence)
         probabilities = _softmax(logits)
         return AssociativeMemoryPrediction(
             logits=logits,
@@ -889,7 +917,9 @@ class AssociativeMemoryLearner:
             effective_budget=self._effective_budget(state),
         )
 
-    def _replacement_slot(self, state: AssociativeMemoryState) -> tuple[Array, Array]:
+    def _replacement_slot(
+        self, state: AssociativeMemoryState, matched: Array
+    ) -> tuple[Array, Array, Array]:
         eligible = (
             jnp.arange(self._config.max_features, dtype=jnp.float32)
             < self._effective_budget(state)
@@ -897,9 +927,23 @@ class AssociativeMemoryLearner:
         empty = (state.counts <= 0.0) & eligible
         has_empty = jnp.any(empty)
         empty_slot = jnp.argmax(empty.astype(jnp.int32))
-        utility_score = jnp.where(eligible & (~empty), state.utility, jnp.inf)
-        low_utility_slot = jnp.argmin(utility_score)
-        return jnp.where(has_empty, empty_slot, low_utility_slot), has_empty
+        occupied = eligible & (~empty)
+        # Rows this update already wrote, or matched and will write later in
+        # the same scan, are not victims: evicting a matched row resets its
+        # learned values and makes its key evict a second row when reached.
+        protected = occupied & ((state.last_update == state.step_count) | matched)
+        candidate = occupied & (~protected)
+        candidate_score = jnp.where(candidate, state.utility, jnp.inf)
+        low_utility_slot = jnp.argmin(candidate_score)
+        # When every eligible row is protected there is no victim: the new
+        # key must be skipped this step, not fall back to evicting a
+        # protected row (which would discard a write this update just made).
+        has_victim = has_empty | jnp.any(candidate)
+        return (
+            jnp.where(has_empty, empty_slot, low_utility_slot),
+            has_empty,
+            has_victim,
+        )
 
     def _update_family_scope(
         self,
@@ -1076,6 +1120,12 @@ class AssociativeMemoryLearner:
             prior=next_state.prior.at[label].add(self._config.write_lr)
         )
 
+        matched = (
+            jnp.zeros((self._config.max_features,), dtype=jnp.bool_)
+            .at[prediction.indices]
+            .max(prediction.found > 0)
+        )
+
         def row_step(
             carry: AssociativeMemoryState,
             inputs: tuple[Array, Array],
@@ -1084,22 +1134,57 @@ class AssociativeMemoryLearner:
             found, indices = self._lookup(carry, key[None, :], active[None])
             found_scalar = found[0]
             existing_slot = indices[0]
-            replacement_slot, used_empty = self._replacement_slot(carry)
+            replacement_slot, used_empty, has_victim = self._replacement_slot(
+                carry, matched
+            )
             slot = jnp.where(found_scalar, existing_slot, replacement_slot)
+            # A new key with no empty slot and no unprotected victim is
+            # skipped: writing it would evict a row this update just wrote
+            # (or matched and will write later), discarding that write.
+            write_active = (active > 0) & (found_scalar | has_victim)
             # A slot allocated or reused for a new key starts empty: the values,
             # utility, and count of an evicted occupant must not be inherited.
             slot_values = carry.values[slot]
             old_row = jnp.where(found_scalar, slot_values, jnp.zeros_like(slot_values))
             old_utility = jnp.where(found_scalar, carry.utility[slot], 0.0)
-            row_logits = self._config.logit_scale * old_row
+            # Center the scaled array itself. Cross entropy is shift
+            # invariant, but the compiled product ``logit_scale * old_row`` is
+            # recomputed inside the max-subtraction fusion and contracted into
+            # an FMA, so the difference at the maximum is the rounding error of
+            # that product instead of exactly zero. Subtracting the maximum of
+            # the product, rather than of its operand, makes that entry an
+            # exact zero whatever the compiler recomputes.
+            # Center on both sides of the scale. Cross entropy is shift
+            # invariant, so both subtractions are exact, and each blocks a
+            # different recomputation: XLA re-forms the product inside the
+            # max-subtraction fusion and contracts it into an FMA, so the
+            # difference at the maximum becomes the rounding error of the
+            # product instead of exactly zero. Centering the operand makes the
+            # maximum entry an exact zero before the multiply; centering the
+            # product covers the case where the subtraction itself is the part
+            # that gets re-formed. Either one alone was measured insufficient
+            # on some shape.
+            centered_row = old_row - jax.lax.stop_gradient(jnp.max(old_row))
+            scaled_row = self._config.logit_scale * centered_row
+            row_logits = scaled_row - jax.lax.stop_gradient(jnp.max(scaled_row))
             feature_loss = jnp.where(
                 found_scalar,
                 _cross_entropy_from_logits(row_logits, label),
                 jnp.log(jnp.asarray(self._config.vocab_size, dtype=jnp.float32)),
             )
-            new_utility = (
+            # A row allocated on this step still holds zeros, so ``feature_loss``
+            # above is the uniform placeholder rather than a measurement of the
+            # row. Charging that difference against it would make every newborn
+            # negative whenever the model already beats uniform, ranking it below
+            # every proven row and electing it as the next eviction victim before
+            # it has ever been written. An unproven row starts neutral instead and
+            # earns utility from its next observation, when feature_loss reflects
+            # what the row actually stores.
+            new_utility = jnp.where(
+                found_scalar,
                 self._config.utility_decay * old_utility
-                + self._config.utility_lr * (loss - feature_loss)
+                + self._config.utility_lr * (loss - feature_loss),
+                0.0,
             )
             # Clip the stored trace, not just the derived weight: ±8 is far
             # outside the range that moves the clamped weight (ln of the
@@ -1109,7 +1194,7 @@ class AssociativeMemoryLearner:
             new_utility = jnp.clip(new_utility, -8.0, 8.0)
             new_row = old_row * self._config.retention
             new_row = new_row.at[label].add(self._config.write_lr)
-            active_bool = active > 0
+            active_bool = write_active
             allocations = _saturating_add_bool(
                 carry.allocations,
                 active_bool & (~found_scalar) & used_empty,
@@ -1185,8 +1270,10 @@ class AssociativeMemoryLearner:
             ],
             dtype=jnp.float32,
         )
+        context_valid = jnp.all((context >= 0) & (context < self._config.vocab_size))
         update_applied = (
             label_valid
+            & context_valid
             & self._state_is_valid(state)
             & floating_tree_is_finite(prediction)
             & jnp.isfinite(loss)

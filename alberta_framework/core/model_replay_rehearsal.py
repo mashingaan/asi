@@ -78,19 +78,8 @@ MECHANISM_STATUS = "model-only-replay-mechanism-no-scientific-claim"
 _INT32_MAX = 2_147_483_647
 _UINT32_MAX = 4_294_967_295
 _COMPOSER_ACCOUNTING_BYTES = 7 * 4
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_MODEL_REPLAY_PRNG_IMPLEMENTATION = "threefry2x32"
+_ACTUAL_INT_TYPES: tuple[type, ...] = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 
 
 def _require_int(
@@ -579,6 +568,24 @@ def _config_digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _exact_json_equal(left: object, right: object) -> bool:
+    """Compare JSON trees without Python's bool/int or int/float aliases."""
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        right_dict = cast(dict[str, object], right)
+        return left.keys() == right_dict.keys() and all(
+            _exact_json_equal(value, right_dict[key]) for key, value in left.items()
+        )
+    if type(left) is list:
+        right_list = cast(list[object], right)
+        return len(left) == len(right_list) and all(
+            _exact_json_equal(item, other)
+            for item, other in zip(left, right_list, strict=True)
+        )
+    return left == right
+
+
 def _saturating_increment(value: Array) -> Array:
     return jnp.minimum(value, jnp.asarray(_INT32_MAX - 1, dtype=jnp.int32)) + jnp.asarray(
         1, dtype=jnp.int32
@@ -595,7 +602,10 @@ class ModelReplayRehearsal:
         self._config = config
         self._ensemble = WorldModelEnsemble(config.ensemble)
         self._replay = DualReplayMemory(config.replay)
-        template = self._make_initial_state(jr.key(0), persistent_bytes=0)
+        template = self._make_initial_state(
+            jr.key(0, impl=_MODEL_REPLAY_PRNG_IMPLEMENTATION),
+            persistent_bytes=0,
+        )
         persistent_scalars, persistent_bytes = _logical_tree_size(template)
         _require_float32_resource(
             "ModelReplayRehearsal state",
@@ -1178,7 +1188,11 @@ class ModelReplayRehearsal:
         state: ModelReplayRehearsalState | None = None,
     ) -> ModelReplayRehearsalResourceBudget:
         """Return exact persistent allocation and bounded update candidates."""
-        measured = self.init(jr.key(0)) if state is None else state
+        measured = (
+            self.init(jr.key(0, impl=_MODEL_REPLAY_PRNG_IMPLEMENTATION))
+            if state is None
+            else state
+        )
         self._validate_state_static_contract(measured)
         scalars, persistent_bytes = _logical_tree_size(measured)
         ensemble_bytes = self._ensemble.resource_budget(
@@ -1266,16 +1280,32 @@ def load_model_replay_rehearsal_checkpoint(
     if type(digest) is not str or digest != _config_digest(config):
         raise ValueError("model replay rehearsal config digest does not match")
     composer = ModelReplayRehearsal.from_config(config)
-    if composer.to_config() != config:
+    if not _exact_json_equal(composer.to_config(), config):
         raise ValueError("model replay rehearsal checkpoint config is not canonical")
-    key = jr.key(0) if template_key is None else template_key
+    key = (
+        jr.key(0, impl=_MODEL_REPLAY_PRNG_IMPLEMENTATION)
+        if template_key is None
+        else template_key
+    )
     template = composer.init(key)
     expected_budget = composer.resource_budget(template).to_config()
     resource_budget = metadata.get("resource_budget")
-    if type(resource_budget) is not dict or resource_budget != expected_budget:
+    if type(resource_budget) is not dict or not _exact_json_equal(
+        resource_budget, expected_budget
+    ):
         raise ValueError("model replay rehearsal resource budget does not match config")
+    expected_metadata_fields = {
+        "schema",
+        "mechanism_status",
+        "accepted_scientific_evidence",
+        "composer_config",
+        "config_sha256",
+        "resource_budget",
+    }
+    if set(metadata) != expected_metadata_fields:
+        raise ValueError("model replay rehearsal checkpoint metadata fields do not match v1")
     restored, restored_metadata = load_checkpoint(template, path)
-    if restored_metadata != metadata:
+    if not _exact_json_equal(restored_metadata, metadata):
         raise ValueError("model replay rehearsal checkpoint metadata changed between reads")
     state = cast(ModelReplayRehearsalState, restored)
     composer.validate_state(state)

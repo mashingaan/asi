@@ -238,3 +238,62 @@ def test_leftover_constructor_scalars_keep_legal_floats() -> None:
     assert payload["promotion_blend"] == 1.0
     assert type(payload["step_size_output"]) is float
     assert type(payload["obgd_kappa"]) is float
+
+
+@pytest.mark.parametrize(
+    "generator_mix",
+    [
+        (2.0, -1.0, 0.0),
+        (float("nan"), 1.0, 0.0),
+        (float("inf"), 1.0, 0.0),
+        (1.0, True, 0.0),
+        [1.0, 0.0, 0.0],
+        (1.0, 0.0),
+    ],
+)
+def test_generator_mix_rejects_negative_nonfinite_and_malformed_entries(
+    generator_mix: Any,
+) -> None:
+    """``generator_mix`` is a categorical over three generators.
+
+    A negative entry survives the positive-sum check, and ``log`` of it inside
+    the categorical draw is NaN, which collapses the draw onto one generator;
+    NaN or inf entries poison every stored probability. The sibling
+    ``FixedBudgetFeatureLearner`` already rejects all of these.
+    """
+    with pytest.raises(ValueError, match="generator_mix"):
+        _construct(generator_mix=generator_mix)
+
+
+def test_generator_mix_keeps_legal_mass_and_normalizes() -> None:
+    learner = _construct(generator_mix=(2.0, 1.0, 1.0))
+    assert learner.to_config()["generator_mix"] == [0.5, 0.25, 0.25]
+    learner = _construct(generator_mix=(0.0, 0.0, 3.0))
+    assert learner.to_config()["generator_mix"] == [0.0, 0.0, 1.0]
+
+
+def test_generator_mix_zero_mass_stays_impossible_during_sampling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded_logits: list[np.ndarray[Any, Any]] = []
+
+    def recording_categorical(
+        _key: jnp.ndarray,
+        logits: jnp.ndarray,
+        *_args: object,
+        **_kwargs: object,
+    ) -> jnp.ndarray:
+        recorded_logits.append(np.asarray(logits))
+        return jnp.asarray(0, dtype=jnp.int32)
+
+    monkeypatch.setattr(jr, "categorical", recording_categorical)
+    learner = _construct(generator_mix=(0.0, 0.0, 1.0))
+    learner._generate_one(
+        jr.key(0),
+        jnp.asarray([1.0, 2.0, 3.0], dtype=jnp.float32),
+        jnp.asarray([0, 0, 1, 1], dtype=jnp.int32),
+        jnp.asarray([1, 2, 2, 0], dtype=jnp.int32),
+        jnp.ones((4,), dtype=jnp.float32),
+    )
+
+    assert np.array_equal(recorded_logits[0], np.asarray([-np.inf, -np.inf, 0.0]))

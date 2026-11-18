@@ -44,6 +44,8 @@ _MAX_LIFECYCLE_ID_LENGTH = _MAX_ID_LENGTH - len(
 )
 _MAX_CONFIG_BYTES = 1 << 20
 _MAX_JSON_NESTING_DEPTH = 64
+# Frozen manifests are tiny. Cap nodes before walking toward the 1 MiB encoding cap.
+_MAX_JSON_VALUES = 1_000_000
 _MAX_ARRAY_RANK = 8
 _MAX_ARRAY_ELEMENTS = 1 << 20
 _SUPPORTED_DTYPES = frozenset(
@@ -119,32 +121,122 @@ def _load_manifest_config_json(raw: str) -> Any:
         raise ValueError("manifest config must be canonical JSON") from exc
 
 
-def _validate_json_value(value: Any, *, path: str, depth: int = 0) -> None:
+def _charge_json_bytes(encoded_bytes: list[int], amount: int) -> None:
+    if amount > _MAX_CONFIG_BYTES - encoded_bytes[0]:
+        raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+    encoded_bytes[0] += amount
+
+
+def _charge_json_string(encoded_bytes: list[int], text: str) -> None:
+    remaining = _MAX_CONFIG_BYTES - encoded_bytes[0]
+    if len(text) > remaining - 2:
+        raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+    size = 2
+    for character in text:
+        codepoint = ord(character)
+        if character in {'"', "\\"} or codepoint in {8, 9, 10, 12, 13}:
+            size += 2
+        elif codepoint < 32:
+            size += 6
+        elif codepoint <= 0x7E:
+            size += 1
+        elif codepoint <= 0xFFFF:
+            size += 6
+        else:
+            size += 12
+        if size > remaining:
+            raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+    _charge_json_bytes(encoded_bytes, size)
+
+
+def _validate_json_value(
+    value: Any,
+    *,
+    path: str,
+    depth: int = 0,
+    nodes: int = 0,
+    _encoded_bytes: list[int] | None = None,
+) -> int:
+    if _encoded_bytes is None:
+        _encoded_bytes = [0]
+
+    nodes += 1
+    if nodes > _MAX_JSON_VALUES:
+        raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
     if depth > _MAX_JSON_NESTING_DEPTH:
         raise ValueError(f"{path} exceeds the maximum canonical JSON nesting depth")
     value_type = type(value)
-    if value is None or value_type is str or value_type is bool or value_type is int:
-        return
+    if value is None:
+        _charge_json_bytes(_encoded_bytes, 4)
+        return nodes
+    if value_type is str:
+        _charge_json_string(_encoded_bytes, value)
+        return nodes
+    if value_type is bool:
+        _charge_json_bytes(_encoded_bytes, 4 if value else 5)
+        return nodes
+    if value_type is int:
+        integer = cast(int, value)
+        # Preserve the public canonical-JSON domain, including unsigned-64
+        # protocol values, while rejecting integers that cannot possibly fit
+        # the 1 MiB encoded-byte budget before decimal conversion.  Since
+        # 2**10 > 10**3, an integer beyond this bit bound necessarily needs
+        # more than _MAX_CONFIG_BYTES decimal digits.
+        if integer.bit_length() > (_MAX_CONFIG_BYTES * 10) // 3 + 1:
+            raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+        try:
+            _charge_json_bytes(_encoded_bytes, len(str(integer)))
+        except ValueError as exc:
+            raise ValueError(f"{path} must have a finite canonical JSON encoding") from exc
+        return nodes
     if value_type is float:
         if not math.isfinite(value):
             raise ValueError(f"{path} must contain only finite JSON numbers")
-        return
-    if isinstance(value, list):
+        _charge_json_bytes(_encoded_bytes, len(repr(value)))
+        return nodes
+    if value_type is list:
+        extra = len(value)
+        if nodes + extra > _MAX_JSON_VALUES:
+            raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
+        structural_bytes = 2 + max(0, extra - 1)
+        if structural_bytes + extra > _MAX_CONFIG_BYTES - _encoded_bytes[0]:
+            raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+        _charge_json_bytes(_encoded_bytes, structural_bytes)
         for index, item in enumerate(value):
-            _validate_json_value(item, path=f"{path}[{index}]", depth=depth + 1)
-        return
-    if isinstance(value, Mapping):
+            nodes = _validate_json_value(
+                item,
+                path=f"{path}[{index}]",
+                depth=depth + 1,
+                nodes=nodes,
+                _encoded_bytes=_encoded_bytes,
+            )
+        return nodes
+    if value_type is dict:
+        extra = len(value)
+        if nodes + extra > _MAX_JSON_VALUES:
+            raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
+        structural_bytes = 2 + max(0, extra - 1) + extra
+        if structural_bytes + extra > _MAX_CONFIG_BYTES - _encoded_bytes[0]:
+            raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+        _charge_json_bytes(_encoded_bytes, structural_bytes)
         for key, item in value.items():
             if type(key) is not str:
                 raise ValueError(f"{path} JSON object keys must be strings")
-            _validate_json_value(item, path=f"{path}.{key}", depth=depth + 1)
-        return
+            _charge_json_string(_encoded_bytes, key)
+            nodes = _validate_json_value(
+                item,
+                path=f"{path}.{key}",
+                depth=depth + 1,
+                nodes=nodes,
+                _encoded_bytes=_encoded_bytes,
+            )
+        return nodes
     raise ValueError(f"{path} is not a canonical JSON value")
 
 
 def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
-    if not isinstance(value, Mapping):
-        raise ValueError("config must be a JSON mapping")
+    if type(value) is not dict:
+        raise ValueError("config must be an exact JSON object")
     _validate_json_value(value, path="config")
     try:
         encoded = json.dumps(
@@ -200,10 +292,15 @@ def _require_builtin_value_shape(
         array = value
         if array.size > _MAX_ARRAY_ELEMENTS or array.shape != expected:
             raise ValueError(f"{name} shape must be {expected}, got {array.shape}")
+        if array.dtype.kind == "b":
+            raise ValueError(f"{name} must contain only real numeric values, not bool")
         return
     if not expected:
         if type(value) in (list, tuple, range):
             raise ValueError(f"{name} shape must be {expected}")
+        # NumPy would promote a boolean element beside a number without a trace.
+        if type(value) is bool or getattr(value, "dtype", None) == np.dtype(np.bool_):
+            raise ValueError(f"{name} must contain only real numeric values, not bool")
         return
     if type(value) is range:
         count = _require_bounded_sequence_length(
@@ -291,14 +388,14 @@ class ArrayValue:
             raise ValueError(f"unsupported dtype '{host_dtype}'") from exc
         if dtype.name not in _SUPPORTED_DTYPES or dtype.name != self.dtype:
             raise ValueError("ArrayValue dtype must be a portable canonical numeric dtype")
-        if type(self.shape) is not tuple or any(
-            type(dimension) is not int or dimension <= 0 for dimension in self.shape
-        ):
+        if type(self.shape) is not tuple:
+            raise ValueError("ArrayValue shape must be a tuple of positive dimensions or ()")
+        if len(self.shape) > _MAX_ARRAY_RANK:
+            raise ValueError(f"ArrayValue rank must be <= {_MAX_ARRAY_RANK}")
+        if any(type(dimension) is not int or dimension <= 0 for dimension in self.shape):
             raise ValueError("ArrayValue shape must be a tuple of positive dimensions or ()")
         if not isinstance(self.payload, bytes):
             raise ValueError("ArrayValue payload must be immutable bytes")
-        if len(self.shape) > _MAX_ARRAY_RANK:
-            raise ValueError(f"ArrayValue rank must be <= {_MAX_ARRAY_RANK}")
         elements = _shape_size(self.shape)
         if elements > _MAX_ARRAY_ELEMENTS:
             raise ValueError(f"ArrayValue must contain <= {_MAX_ARRAY_ELEMENTS} elements")
@@ -347,9 +444,11 @@ class SpaceSpec:
 
     def __post_init__(self) -> None:
         _require_safe_id(self.semantic_id, name="semantic_id")
-        if type(self.shape) is not tuple or any(
-            type(dimension) is not int or dimension <= 0 for dimension in self.shape
-        ):
+        if type(self.shape) is not tuple:
+            raise ValueError("shape must be a tuple of positive integer dimensions or ()")
+        if len(self.shape) > _MAX_ARRAY_RANK:
+            raise ValueError(f"space rank must be <= {_MAX_ARRAY_RANK}")
+        if any(type(dimension) is not int or dimension <= 0 for dimension in self.shape):
             raise ValueError("shape must be a tuple of positive integer dimensions or ()")
         host_dtype = _require_exact_str("dtype", self.dtype)
         try:
@@ -361,8 +460,6 @@ class SpaceSpec:
         if dtype.name != self.dtype:
             host_canonical = _require_exact_str("dtype.name", dtype.name)
             raise ValueError(f"dtype must use canonical spelling '{host_canonical}'")
-        if len(self.shape) > _MAX_ARRAY_RANK:
-            raise ValueError(f"space rank must be <= {_MAX_ARRAY_RANK}")
         if _shape_size(self.shape) > _MAX_ARRAY_ELEMENTS:
             raise ValueError(f"space must contain <= {_MAX_ARRAY_ELEMENTS} elements")
 
@@ -403,14 +500,35 @@ class SpaceSpec:
         )
         if low_count != size or high_count != size:
             raise ValueError("box bounds must contain one value per flattened shape entry")
-        lows = _numeric_array(self.low, name="box low bounds")
-        highs = _numeric_array(self.high, name="box high bounds")
-        if lows.shape != (size,) or highs.shape != (size,):
-            raise ValueError("box bounds must contain one value per flattened shape entry")
-        if np.any(lows > highs):
-            raise ValueError("every box low bound must be <= its high bound")
-        cast_lows = _cast_representable(lows, dtype=dtype, name="box low bounds")
-        cast_highs = _cast_representable(highs, dtype=dtype, name="box high bounds")
+        if dtype.kind in {"i", "u"}:
+            def cast_integer_bounds(
+                values: tuple[float | int, ...], *, name: str
+            ) -> np.ndarray[Any, Any]:
+                converted: list[int] = []
+                for raw in values:
+                    scalar = _numeric_array(raw, name=name)
+                    if scalar.shape != ():
+                        raise ValueError(
+                            "box bounds must contain one value per flattened shape entry"
+                        )
+                    converted.append(
+                        int(_cast_representable(scalar, dtype=dtype, name=name).item())
+                    )
+                return np.asarray(converted, dtype=dtype)
+
+            cast_lows = cast_integer_bounds(self.low, name="box low bounds")
+            cast_highs = cast_integer_bounds(self.high, name="box high bounds")
+        else:
+            _require_builtin_value_shape(self.low, expected=(size,), name="box low bounds")
+            _require_builtin_value_shape(self.high, expected=(size,), name="box high bounds")
+            lows = _numeric_array(self.low, name="box low bounds")
+            highs = _numeric_array(self.high, name="box high bounds")
+            if lows.shape != (size,) or highs.shape != (size,):
+                raise ValueError("box bounds must contain one value per flattened shape entry")
+            if np.any(lows > highs):
+                raise ValueError("every box low bound must be <= its high bound")
+            cast_lows = _cast_representable(lows, dtype=dtype, name="box low bounds")
+            cast_highs = _cast_representable(highs, dtype=dtype, name="box high bounds")
         if np.any(cast_lows > cast_highs):
             raise ValueError("box bounds reverse in the declared dtype")
         object.__setattr__(
@@ -984,7 +1102,8 @@ class DispatchReceipt:
                 executor_id=executor_id,
                 executor_epoch="legacy.preview1",
             )
-            applied_action = dispatch.effective_action
+            if applied_action is None:
+                applied_action = dispatch.effective_action
         elif dispatch is not None:
             if executor_id is not None:
                 raise ValueError("receipt constructors cannot mix executor_id with command")
@@ -1043,6 +1162,8 @@ def _finite_scalar(value: Any, *, name: str) -> float:
         raise ValueError(f"{name} must remain finite and representable as a protocol float")
     if original != 0 and converted == 0.0:
         raise ValueError(f"{name} must not underflow when represented as a protocol float")
+    if original != converted:
+        raise ValueError(f"{name} must not lose precision as a protocol float")
     return converted
 
 

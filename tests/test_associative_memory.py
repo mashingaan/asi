@@ -5,6 +5,7 @@ import math
 from fractions import Fraction
 
 import chex
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -202,6 +203,112 @@ def test_silent_feature_does_not_turn_inf_value_into_nan() -> None:
     chex.assert_trees_all_equal(result.predictions, jnp.zeros_like(result.predictions))
     chex.assert_trees_all_equal(result.logits, jnp.zeros_like(result.logits))
     chex.assert_trees_all_equal(result.metrics, jnp.zeros_like(result.metrics))
+
+
+def test_normalized_evidence_stays_finite_when_only_the_sum_overflows() -> None:
+    """Normalize row evidence without first forming an overflowing sum."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(
+            vocab_size=2,
+            block_size=4,
+            suffix_length=2,
+            feature_family="position_token",
+            max_features=4,
+            write_lr=2.0e38,
+            retention=0.5,
+            utility_lr=0.0,
+            logit_scale=1.0,
+        )
+    )
+    context = jnp.asarray([0, 1, 0, 1], dtype=jnp.int32)
+    label = jnp.asarray(0, dtype=jnp.int32)
+
+    first = learner.update(learner.init(), context, label)
+    prediction = learner.predict(first.state, context)
+    second = learner.update(first.state, context, label)
+
+    assert bool(first.update_applied)
+    assert bool(jnp.all(jnp.isfinite(first.state.values)))
+    assert not bool(jnp.isfinite(jnp.sum(first.state.values[:, 0])))
+    assert math.isfinite(float(np.asarray(first.state.values[:, 0], dtype=np.float64).mean()))
+    chex.assert_tree_all_finite(prediction)
+    chex.assert_trees_all_close(
+        prediction.probabilities,
+        jnp.asarray([1.0, 0.0], dtype=jnp.float32),
+    )
+    assert bool(second.update_applied)
+
+
+def test_normalized_evidence_stays_finite_at_float32_ceiling() -> None:
+    """Rounding normalized weight mass above one cannot overflow the mean."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(
+            vocab_size=2,
+            block_size=10,
+            suffix_length=2,
+            feature_family="position_token",
+            max_features=20,
+            write_lr=float(np.finfo(np.float32).max),
+            retention=0.0,
+            utility_lr=0.0,
+            logit_scale=1.0,
+        )
+    )
+    first_context = jnp.zeros((10,), dtype=jnp.int32)
+    second_context = jnp.ones((10,), dtype=jnp.int32)
+    label_zero = jnp.asarray(0, dtype=jnp.int32)
+
+    first = learner.update(learner.init(), first_context, label_zero)
+    second = learner.update(
+        first.state,
+        second_context,
+        jnp.asarray(1, dtype=jnp.int32),
+    )
+    prediction = learner.predict(second.state, first_context)
+    third = learner.update(second.state, first_context, label_zero)
+
+    assert bool(first.update_applied)
+    assert bool(second.update_applied)
+    assert bool(jnp.all(jnp.isfinite(second.state.values)))
+    chex.assert_tree_all_finite(prediction)
+    chex.assert_trees_all_close(
+        prediction.probabilities,
+        jnp.asarray([1.0, 0.0], dtype=jnp.float32),
+    )
+    assert bool(third.update_applied)
+
+
+def test_finite_prior_and_evidence_do_not_overflow_combined_logits() -> None:
+    """Softmax-equivalent prior/evidence combination stays representable."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(
+            vocab_size=2,
+            block_size=2,
+            suffix_length=2,
+            feature_family="position_token",
+            max_features=2,
+            write_lr=float(np.finfo(np.float32).max),
+            retention=0.0,
+            utility_lr=0.0,
+            logit_scale=1.0,
+        )
+    )
+    context = jnp.zeros((2,), dtype=jnp.int32)
+    label = jnp.asarray(0, dtype=jnp.int32)
+
+    first = learner.update(learner.init(), context, label)
+    prediction = learner.predict(first.state, context)
+    second = learner.update(first.state, context, label)
+
+    assert bool(first.update_applied)
+    assert bool(jnp.all(jnp.isfinite(first.state.values)))
+    assert bool(jnp.all(jnp.isfinite(first.state.prior)))
+    chex.assert_tree_all_finite(prediction)
+    chex.assert_trees_all_close(
+        prediction.probabilities,
+        jnp.asarray([1.0, 0.0], dtype=jnp.float32),
+    )
+    assert bool(second.update_applied)
 
 
 def test_corrupted_active_family_logits_remain_fail_visible() -> None:
@@ -429,6 +536,36 @@ def test_update_rejects_labels_outside_the_vocabulary_instead_of_clipping(
     assert not bool(result.update_applied)
     chex.assert_trees_all_equal(result.state, state)
     chex.assert_trees_all_equal(result.metrics, jnp.zeros_like(result.metrics))
+
+
+@pytest.mark.parametrize("token", [-1, 4, 9999])
+def test_update_rejects_contexts_outside_the_vocabulary(token: int) -> None:
+    """An out-of-vocabulary token must not allocate rows under an unreachable key."""
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
+    )
+    state = learner.init()
+    result = learner.update(
+        state,
+        jnp.asarray([1, 2, token], dtype=jnp.int32),
+        jnp.asarray(1, dtype=jnp.int32),
+    )
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_trees_all_equal(result.metrics, jnp.zeros_like(result.metrics))
+
+
+def test_scan_update_applies_only_the_valid_contexts_of_a_mixed_stream() -> None:
+    learner = AssociativeMemoryLearner(
+        AssociativeMemoryConfig(vocab_size=4, block_size=3, suffix_length=2, max_features=8)
+    )
+    contexts = jnp.asarray([[1, 2, 3], [1, 2, 4], [1, 2, 3]], dtype=jnp.int32)
+    labels = jnp.ones((3,), dtype=jnp.int32)
+
+    result = run_associative_memory_arrays(learner, learner.init(), contexts, labels)
+
+    assert result.updates_applied.tolist() == [True, False, True]
+    assert int(result.state.step_count) == 2
 
 
 @pytest.mark.parametrize("label", [-1, 4, 9999])
@@ -908,3 +1045,221 @@ def test_associative_memory_json_roundtrip() -> None:
 
     assert restored == config
     assert restored.feature_family == "token_suffix_pair"
+
+
+def test_full_table_update_retains_every_write_of_the_step() -> None:
+    config = AssociativeMemoryConfig(
+        vocab_size=4,
+        block_size=4,
+        suffix_length=2,
+        feature_family="position_token",
+        max_features=8,
+    )
+    learner = AssociativeMemoryLearner(config)
+    state = learner.init()
+    warm = jnp.asarray([1, 1, 1, 1], dtype=jnp.int32)
+    for _ in range(40):
+        state = learner.update(state, warm, jnp.asarray(2, dtype=jnp.int32)).state
+    for step, label in ((0, 0), (1, 1), (2, 2)):
+        context = jnp.asarray(
+            [(2 + step) % 4, (3 + step) % 4, (1 + step) % 4, (2 * step) % 4],
+            dtype=jnp.int32,
+        )
+        state = learner.update(state, context, jnp.asarray(label, dtype=jnp.int32)).state
+
+    context = jnp.asarray([1, 2, 0, 2], dtype=jnp.int32)
+    before = learner.predict(state, context)
+    active = int(jnp.sum(before.feature_mask.astype(jnp.int32)))
+    assert active == 4
+    assert int(jnp.sum(state.counts > 0)) == config.max_features
+
+    result = learner.update(state, context, jnp.asarray(3, dtype=jnp.int32))
+    after = learner.predict(result.state, context)
+    assert int(jnp.sum(after.found[:active])) == active, (
+        "rows written by one update must not evict each other within that "
+        f"same update; retrievable found={[int(x) for x in after.found[:active]]}"
+    )
+    assert int(result.state.replacements - state.replacements) <= active
+
+
+def test_full_table_update_keeps_rows_it_matched_but_has_not_written_yet() -> None:
+    """A row matched by this update's prediction is not this update's victim.
+
+    The scan writes features in context order, so a new key early in the
+    context could take the slot of a matched key that comes later. That key
+    was then no longer found, came back as an empty row, and evicted a second
+    row: the learned values were lost and ``replacements`` counted two
+    evictions for one new key.
+    """
+    config = AssociativeMemoryConfig(
+        vocab_size=4,
+        block_size=2,
+        suffix_length=2,
+        feature_family="position_token",
+        max_features=3,
+    )
+    learner = AssociativeMemoryLearner(config)
+    state = learner.init()
+    # Token 3 in position 1 precedes two different labels, so its row has the
+    # lowest utility of the full table when the update below starts.
+    for warm, warm_label in (([0, 3], 1), ([1, 3], 2)):
+        for _ in range(20):
+            state = learner.update(
+                state,
+                jnp.asarray(warm, dtype=jnp.int32),
+                jnp.asarray(warm_label, dtype=jnp.int32),
+            ).state
+
+    context = jnp.asarray([2, 3], dtype=jnp.int32)
+    before = learner.predict(state, context)
+    assert [int(x) for x in before.feature_mask] == [1, 1, 0]
+    assert [int(x) for x in before.found] == [0, 1, 0]
+    assert int(jnp.sum(state.counts > 0)) == config.max_features
+    matched = int(before.indices[1])
+    assert int(jnp.argmin(state.utility)) == matched
+
+    label = 2
+    result = learner.update(state, context, jnp.asarray(label, dtype=jnp.int32))
+    after = learner.predict(result.state, context)
+
+    assert [int(x) for x in after.found] == [1, 1, 0]
+    assert int(after.indices[1]) == matched
+    assert int(result.state.counts[matched]) == int(state.counts[matched]) + 1
+    expected_row = (state.values[matched] * config.retention).at[label].add(config.write_lr)
+    chex.assert_trees_all_close(result.state.values[matched], expected_row, atol=1e-6)
+    assert int(result.state.replacements - state.replacements) == 1
+
+
+def test_prior_coefficient_is_independent_of_feature_weight_mass() -> None:
+    """The prior enters with a small fixed weight (its documented contract).
+
+    Two states with identical priors and identical weighted-average feature
+    evidence, differing only in matched-row utility (hence total weight
+    mass), must rank the labels identically: the weight normalization
+    applies to the evidence average, never to the prior term.
+    """
+
+    def build(utility_value: float):
+        config = AssociativeMemoryConfig(
+            vocab_size=4,
+            block_size=2,
+            suffix_length=2,
+            feature_family="position_token",
+            max_features=8,
+        )
+        learner = AssociativeMemoryLearner(config)
+        state = learner.init()
+        context = jnp.asarray([0, 1], dtype=jnp.int32)
+        keys, _mask = learner.feature_keys(context)
+        keys_arr = state.keys.at[0].set(keys[0]).at[1].set(keys[1])
+        row = jnp.asarray([0.0, 0.5, 0.0, 0.0], dtype=jnp.float32)
+        values = state.values.at[0].set(row).at[1].set(row)
+        counts = state.counts.at[0].set(1).at[1].set(1)
+        utility = state.utility.at[0].set(utility_value).at[1].set(utility_value)
+        prior = jnp.asarray([10.0, 0.0, 0.0, 0.0], dtype=jnp.float32)
+        state = state.replace(
+            keys=keys_arr,
+            values=values,
+            counts=counts,
+            utility=utility,
+            prior=prior,
+            step_count=jnp.asarray(1, dtype=jnp.int32),
+            last_update=state.last_update.at[0].set(1).at[1].set(1),
+        )
+        return learner, state, context
+
+    predictions = {}
+    for utility_value in (0.0, -8.0):
+        learner, state, context = build(utility_value)
+        predictions[utility_value] = learner.predict(state, context)
+
+    high = predictions[0.0]
+    low = predictions[-8.0]
+    assert int(jnp.argmax(high.logits)) == 1
+    assert int(jnp.argmax(low.logits)) == int(jnp.argmax(high.logits))
+    prior_term_high = high.logits[0]
+    prior_term_low = low.logits[0]
+    chex.assert_trees_all_close(prior_term_high, prior_term_low, atol=1e-6)
+
+
+def test_newly_allocated_row_is_not_born_as_the_eviction_victim() -> None:
+    """A freshly allocated row must not be charged the uniform-loss placeholder.
+
+    When a row is allocated its stored values are still zeros, so the
+    per-feature loss it is scored against is the uniform ``log(vocab_size)``
+    placeholder rather than a measurement of that row.  Charging
+    ``utility_lr * (loss - log(vocab_size))`` against it makes every newborn
+    strictly negative whenever the model already beats uniform on the example,
+    which ranks it below every proven row and makes it the next eviction
+    victim before it has ever been written.
+    """
+    vocab = 32
+    config = AssociativeMemoryConfig(
+        vocab_size=vocab,
+        block_size=4,
+        suffix_length=2,
+        feature_family="token_suffix_pair",
+        max_features=512,
+    )
+    learner = AssociativeMemoryLearner(config)
+    state = learner.init()
+    label = jnp.array(5, dtype=jnp.int32)
+    suffix = [9, 11]
+    for leading in range(2, 8):
+        context = jnp.array([leading, 1, *suffix], dtype=jnp.int32)
+        for _ in range(60):
+            state = learner.update(state, context, label).state
+
+    # A novel leading token over the same well-trained suffix: the model already
+    # predicts the label, so loss < log(vocab_size), and one row is allocated.
+    novel = jnp.array([25, 1, *suffix], dtype=jnp.int32)
+    prediction = learner.predict(state, novel)
+    loss = float(-(prediction.logits[5] - jnp.log(jnp.sum(jnp.exp(prediction.logits)))))
+    assert loss < math.log(vocab)
+
+    # Identify allocations by row occupancy (counts), not by utility: the whole
+    # point of the fix is that a newborn's utility stays at its neutral 0.0, so
+    # keying off a utility change would make this test vacuous.
+    before_counts = np.asarray(state.counts).copy()
+    before = np.asarray(state.utility).copy()
+    updated = learner.update(state, novel, label).state
+    after = np.asarray(updated.utility)
+    after_counts = np.asarray(updated.counts)
+    newborn = [
+        i
+        for i in np.nonzero(before_counts != after_counts)[0]
+        if before_counts[i] == 0 and before[i] == 0.0
+    ]
+    assert newborn, "expected at least one newly allocated row"
+
+    newborn_utility = after[newborn]
+    # Unproven, not penalized: a newborn starts neutral rather than below every
+    # occupied row, so it is not the first slot the replacement scan gives away.
+    np.testing.assert_allclose(newborn_utility, np.zeros_like(newborn_utility), atol=1e-6)
+    occupied = after[after != 0.0]
+    if occupied.size:
+        assert int(after.argmin()) not in set(newborn)
+
+@pytest.mark.parametrize("write_lr", [1.0, 1.0e8])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_balanced_large_writes_keep_uniform_cross_entropy(
+    write_lr: float, compiled: bool
+) -> None:
+    """Equal class evidence must retain log(2) loss at any common offset."""
+    config = AssociativeMemoryConfig(
+        vocab_size=2, block_size=2, suffix_length=2,
+        feature_family="position_token", max_features=4,
+        write_lr=write_lr, retention=1.0, utility_lr=0.0,
+    )
+    learner = AssociativeMemoryLearner(config)
+    context = jnp.array([0, 1], dtype=jnp.int32)
+    with jax.disable_jit(disable=not compiled):
+        state = learner.init()
+        for label in (0, 1):
+            result = learner.update(state, context, jnp.asarray(label, dtype=jnp.int32))
+            assert bool(result.update_applied)
+            state = result.state
+        result = learner.update(state, context, jnp.asarray(0, dtype=jnp.int32))
+    assert bool(result.update_applied)
+    np.testing.assert_allclose(result.predictions, [0.5, 0.5], rtol=1e-6)
+    np.testing.assert_allclose(result.metrics[0], np.log(2.0), rtol=1e-6)

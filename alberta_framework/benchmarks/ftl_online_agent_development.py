@@ -146,7 +146,7 @@ class DevelopmentResult:
     def __post_init__(self) -> None:
         if type(self.schema) is not str or self.schema != SCHEMA:
             raise ValueError("unsupported schema")
-        if self.seed not in FROZEN_SEEDS:
+        if type(self.seed) is not int or self.seed not in FROZEN_SEEDS:
             raise ValueError("seed is outside the frozen development schedule")
         _int(self.steps_per_task, "steps_per_task", 1, MAX_STEPS_PER_TASK)
         _int(self.planning_horizon, "planning_horizon", 1, MAX_PLANNING_HORIZON)
@@ -170,13 +170,12 @@ class DevelopmentResult:
             or self.allowed_task_information[0] != "current_goal"
         ):
             raise ValueError("the planner receives only the current goal as task information")
-        flags = (
-            self.development_only,
-            not self.scientific_promotion_allowed,
-            self.negative_results_must_be_retained,
-            not self.historical_ftl_claim_reused,
-        )
-        if any(type(x) is not bool or not x for x in flags):
+        if (
+            self.development_only is not True
+            or self.scientific_promotion_allowed is not False
+            or self.negative_results_must_be_retained is not True
+            or self.historical_ftl_claim_reused is not False
+        ):
             raise ValueError("result must remain nonpromoting, retained, and historically separate")
 
 
@@ -199,10 +198,16 @@ def _mpc_action(
     queries = 0
     for sequence in itertools.product(range(4), repeat=host_horizon):
         imagined = observation.copy()
+        # arXiv:2507.09177v1 Eq. 2 maximizes the summed H-step reward over the
+        # imagined rollout, and this lane's reported return accumulates the same
+        # per-step cost at every executed step.  Scoring only the terminal
+        # imagined state optimizes a different objective than the one measured,
+        # which stops the privileged-dynamics control from bounding the lane.
+        score = 0.0
         for action in sequence:
             imagined = np.asarray(predict(imagined, action), dtype=np.float32)
             queries += 1
-        score = -float(np.sum((imagined - goal) ** 2))
+            score -= float(np.sum((imagined - goal) ** 2))
         if score > best_score:
             best_score, best_action = score, sequence[0]
     return best_action, queries, candidate_count
@@ -212,7 +217,7 @@ def _run_arm(seed: int, steps: int, horizon: int, arm_id: str) -> ArmResult:
     model = SparseFTLWorldModel(
         SparseFTLWorldModelConfig(observation_dim=2, action_dim=4, projection_dim=4, bins=4)
     )
-    state = model.init(jr.key(seed))
+    state = model.init(jr.key(seed, impl="threefry2x32"))
     initial_bytes = _tree_nbytes(state)
     updates = queries = candidates = 0
     errors: list[float] = []

@@ -43,6 +43,7 @@ from pathlib import Path
 from types import FunctionType
 from typing import Literal, NoReturn, Protocol, cast
 
+from alberta_framework._bounded_containers import require_json_text_nesting
 from alberta_framework.evaluation.continual_ia import (
     ContinualIAConfig,
     IAAcceptanceThresholds,
@@ -147,9 +148,13 @@ from alberta_framework.recurring_feature_gate import (
 _STRICT_IA_ARTIFACT_VALIDATOR = validate_ia_evidence_artifact
 
 MANIFEST_SCHEMA_VERSION = "alberta.evidence_claim_manifest.v1"
+_MAX_JSON_NESTING_DEPTH = 64
 CLAIM_CONTRACT_VERSION = "alberta.evidence_claim_contract.v1"
 DIRTY_STATE_POLICY_VERSION = "alberta.registered_source_dirty_policy.v1"
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_MEASUREMENT_VALIDATION_SOURCE_PATH = Path(
+    "alberta_framework/evaluation/_measurement_validation.py"
+)
 
 _FTL_CLAIM_ID = "ftl_world_model_decision_fidelity"
 _FTL_ARTIFACT_PATH = Path("outputs/ftl_decision/evidence.v1.json")
@@ -717,6 +722,7 @@ EVIDENCE_SPECS: tuple[EvidenceSpec, ...] = (
         source_paths=(
             Path("alberta_framework/core/interaction_features.py"),
             Path("alberta_framework/streams/gauntlet.py"),
+            _MEASUREMENT_VALIDATION_SOURCE_PATH,
             Path("alberta_framework/evaluation/scale_robust_feature.py"),
             Path("alberta_framework/evaluation/scale_robust_feature_artifact.py"),
             Path("alberta_framework/evaluation/scale_robust_feature_cli.py"),
@@ -795,6 +801,7 @@ EVIDENCE_SPECS: tuple[EvidenceSpec, ...] = (
             owner="recurring_multiagent_coadaptation.protocol",
         ),
         source_paths=(
+            _MEASUREMENT_VALIDATION_SOURCE_PATH,
             Path("alberta_framework/evaluation/continual_multiagent.py"),
             Path("alberta_framework/evaluation/continual_multiagent_artifact.py"),
             Path("alberta_framework/evaluation/continual_multiagent_cli.py"),
@@ -934,12 +941,21 @@ def _reject_duplicate_json_keys(
 def _load_strict_json_object(path: Path) -> dict[str, object]:
     """Load a finite UTF-8 JSON object while rejecting duplicate keys."""
 
-    parsed = json.loads(
-        path.read_bytes(),
-        parse_constant=_reject_json_constant,
-        parse_float=_parse_finite_json_float,
-        object_pairs_hook=_reject_duplicate_json_keys,
+    text = path.read_text(encoding="utf-8")
+    require_json_text_nesting(
+        text,
+        max_depth=_MAX_JSON_NESTING_DEPTH,
+        name="evidence manifest",
     )
+    try:
+        parsed = json.loads(
+            text,
+            parse_constant=_reject_json_constant,
+            parse_float=_parse_finite_json_float,
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except RecursionError as exc:
+        raise ValueError("evidence manifest exceeds the JSON nesting limit") from exc
     if not isinstance(parsed, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return parsed

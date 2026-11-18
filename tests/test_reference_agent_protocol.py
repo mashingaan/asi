@@ -521,6 +521,28 @@ def test_outcome_rejects_scalar_that_overflows_during_protocol_conversion() -> N
         )
 
 
+def test_outcome_rejects_integer_reward_that_loses_protocol_precision() -> None:
+    ledger, state, _decision_value, _authorization, _dispatch, receipt = _dispatched()
+    before = state
+
+    with pytest.raises(ValueError, match="reward|precision|representable"):
+        ledger.record_outcome(
+            state,
+            receipt,
+            reward=2**53 + 1,
+            discount=0.9,
+            terminated=False,
+            truncated=False,
+            autoreset=False,
+            bootstrap_observation_id="life-a:observation:1",
+            bootstrap_observation=(0.1, 0.2, 0.3),
+            next_decision_observation_id="life-a:observation:1",
+            next_decision_observation=(0.1, 0.2, 0.3),
+        )
+
+    assert state == before
+
+
 def test_ledger_enforces_one_lifecycle_monotonic_decisions_and_exactly_once_phases() -> None:
     ledger, armed, decision = _armed_ledger()
     with pytest.raises(DecisionOwnershipError, match="phase|armed"):
@@ -777,3 +799,68 @@ def test_boundary_without_autoreset_waits_for_explicit_next_arm() -> None:
     )
     state = ledger.arm(state, reset_decision)
     assert state.phase is TransactionPhase.ARMED
+
+
+def test_legacy_receipt_keeps_executor_applied_action_so_divergence_halts() -> None:
+    ledger, state, decision, _authorization, dispatch = _settled()
+    reducer = reference_agent.ReferenceTransactionReducer(ledger.manifest)
+    state, command = reducer.issue_dispatch(
+        state,
+        dispatch,
+        command_id=f"{decision.decision_id}:command",
+        executor_id="tests.environment_executor.v1",
+        executor_epoch="legacy.preview1",
+    )
+    divergent = ledger.manifest.action_spec.encode((0.5, -0.5))
+    assert divergent != dispatch.effective_action
+
+    receipt = DispatchReceipt(
+        receipt_id=f"{decision.decision_id}:receipt",
+        dispatch=dispatch,
+        executor_id="tests.environment_executor.v1",
+        applied_action=divergent,
+    )
+    assert receipt.command == command
+    assert receipt.applied_action == divergent
+
+    state, _receipt = reducer.record_dispatch(state, receipt)
+    assert state.phase is TransactionPhase.HALTED
+    assert state.halt_reason == "executor applied action differs from the settled command"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        [True, 0.5],
+        (0.5, False),
+        [np.bool_(True), 0.5],
+    ],
+)
+def test_box_space_rejects_booleans_mixed_into_float_values(value: object) -> None:
+    space = SpaceSpec.box(shape=(2,), dtype="float32", low=None, high=None, semantic_id="obs")
+
+    with pytest.raises(ValueError, match="not bool"):
+        space.encode(value)
+
+
+def test_box_space_rejects_booleans_mixed_into_integer_values() -> None:
+    space = SpaceSpec.box(shape=(2,), dtype="int32", low=None, high=None, semantic_id="obs")
+
+    with pytest.raises(ValueError, match="not bool"):
+        space.encode([True, 2])
+
+
+def test_box_space_rejects_nested_booleans_mixed_into_values() -> None:
+    space = SpaceSpec.box(shape=(2, 2), dtype="float32", low=None, high=None, semantic_id="obs")
+
+    with pytest.raises(ValueError, match="not bool"):
+        space.encode([[0.5, 0.5], [0.5, True]])
+
+
+@pytest.mark.parametrize("field", ["low", "high"])
+def test_float_box_bounds_reject_booleans_like_integer_bounds(field: str) -> None:
+    bounds: dict[str, object] = {"low": (0.0, 0.0), "high": (2.0, 2.0)}
+    bounds[field] = (True, 1.0)
+
+    with pytest.raises(ValueError, match="not bool"):
+        SpaceSpec(kind="box", shape=(2,), dtype="float32", semantic_id="obs", **bounds)

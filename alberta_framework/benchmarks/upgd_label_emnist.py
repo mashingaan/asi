@@ -93,10 +93,12 @@ import hashlib
 import json
 import logging
 import math
+import os
 import platform
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, fields
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -107,6 +109,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._bounded_containers import require_json_text_nesting
 from alberta_framework._seed_validation import require_jax_seed, require_unique_jax_seeds
 from alberta_framework.benchmarks.ipmnist_screening import (
     ScreeningStepFn,
@@ -128,19 +131,7 @@ from alberta_framework.core._float32_scalars import validated_float32_scalar
 _INT32_MAX = 2**31 - 1
 
 _ACTUAL_INT_TYPES: frozenset[type] = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
+    {int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")}
 )
 
 
@@ -169,6 +160,7 @@ EMNIST_TOTAL_ROWS = 131_600
 EMNIST_TRAIN_ROWS = 112_800
 EMNIST_TRAIN_PER_CLASS = 2_400
 EMNIST_TEST_PER_CLASS = 400
+_NPY_CACHE_MAX_HEADER_BYTES = 10_000
 
 NONPROMOTING_POLICY: dict[str, object] = {
     "evidence_class": "development_replication_diagnostic",
@@ -484,7 +476,13 @@ def build_schedule(key: Array, config: LabelEMNISTConfig, n_train: int) -> Label
 def _require_finite_real(name: str, value: object) -> float:
     if type(value) is not int and type(value) is not float:
         raise ValueError(f"{name} must be a finite real number")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError as error:
+        # A JSON integer larger than the float range must fail closed with
+        # ValueError like every other malformed metric, not escape as
+        # OverflowError.
+        raise ValueError(f"{name} must be a finite real number") from error
     if not math.isfinite(number):
         raise ValueError(f"{name} must be a finite real number")
     return number
@@ -819,6 +817,72 @@ def _npy_cache_paths(home: Path) -> tuple[Path, Path, Path]:
     )
 
 
+def _load_bounded_npy_cache(
+    path: Path,
+    *,
+    label: str,
+    dtype: np.dtype[Any],
+    maximum_shape: tuple[int, ...],
+) -> np.ndarray:
+    """Validate one cache header and byte extent before materializing it."""
+    try:
+        with path.open("rb") as handle:
+            version = np.lib.format.read_magic(handle)
+            if version == (1, 0):
+                length_bytes = 2
+            elif version in ((2, 0), (3, 0)):
+                length_bytes = 4
+            else:
+                raise ValueError(f"{label} cache uses an unsupported npy version")
+            length_prefix = handle.read(length_bytes)
+            if len(length_prefix) != length_bytes:
+                raise ValueError(f"{label} cache npy header is invalid")
+            header_length = int.from_bytes(length_prefix, "little")
+            if header_length > _NPY_CACHE_MAX_HEADER_BYTES:
+                raise ValueError(f"{label} cache npy header exceeds its byte budget")
+            header = handle.read(header_length)
+            if len(header) != header_length:
+                raise ValueError(f"{label} cache npy header is invalid")
+            header_buffer = BytesIO(length_prefix + header)
+            if version == (1, 0):
+                shape, _fortran_order, stored_dtype = (
+                    np.lib.format.read_array_header_1_0(header_buffer)
+                )
+            else:
+                shape, _fortran_order, stored_dtype = (
+                    np.lib.format.read_array_header_2_0(header_buffer)
+                )
+            header_bytes = handle.tell()
+            resolved_shape = tuple(int(dimension) for dimension in shape)
+            resolved_dtype = np.dtype(stored_dtype)
+            if len(resolved_shape) != len(maximum_shape) or any(
+                dimension < 1 for dimension in resolved_shape
+            ):
+                raise ValueError(f"{label} cache array has an invalid shape")
+            element_count = math.prod(resolved_shape)
+            maximum_elements = math.prod(maximum_shape)
+            if element_count > maximum_elements:
+                raise ValueError(f"{label} cache array exceeds its element budget")
+            if any(
+                actual > maximum
+                for actual, maximum in zip(resolved_shape, maximum_shape, strict=True)
+            ):
+                raise ValueError(f"{label} cache array exceeds its axis budget")
+            if resolved_dtype != dtype or resolved_dtype.hasobject:
+                raise ValueError(f"{label} cache array has an invalid dtype")
+            expected_file_bytes = header_bytes + element_count * resolved_dtype.itemsize
+            if os.fstat(handle.fileno()).st_size != expected_file_bytes:
+                raise ValueError(f"{label} cache array has an invalid byte extent")
+            handle.seek(0)
+            loaded = np.load(handle, allow_pickle=False)
+    except (EOFError, OSError, KeyError) as error:
+        raise ValueError(f"{label} cache npy header is invalid") from error
+    array = np.asarray(loaded)
+    if array.shape != resolved_shape or array.dtype != resolved_dtype:
+        raise ValueError(f"{label} cache array differs from its admitted header")
+    return array
+
+
 def load_emnist_balanced_train(
     data_home: Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
@@ -843,8 +907,20 @@ def load_emnist_balanced_train(
     home = data_home if data_home is not None else default_openml_data_home()
     x_path, y_path, meta_path = _npy_cache_paths(home)
     if x_path.is_file() and y_path.is_file() and meta_path.is_file():
-        x = np.load(x_path)
-        y = np.load(y_path)
+        x = _load_bounded_npy_cache(
+            x_path,
+            label="EMNIST input",
+            dtype=np.dtype(np.float32),
+            maximum_shape=(EMNIST_TRAIN_ROWS, 784),
+        )
+        y = _load_bounded_npy_cache(
+            y_path,
+            label="EMNIST label",
+            dtype=np.dtype(np.int32),
+            maximum_shape=(EMNIST_TRAIN_ROWS,),
+        )
+        if x.shape[0] != y.shape[0]:
+            raise ValueError("EMNIST cache input and label row counts differ")
         cached_meta = _strict_json_object(meta_path)
         if (
             materialized_array_sha256(x) != cached_meta["x_sha256"]
@@ -1063,6 +1139,10 @@ def build_plan_payload(
     }
 
 
+_MAX_JSON_NESTING_DEPTH = 64
+
+
+
 def _strict_json_object(path: Path) -> dict[str, Any]:
     def pairs_hook(pairs: list[tuple[str, object]]) -> dict[str, object]:
         parsed: dict[str, object] = {}
@@ -1082,12 +1162,24 @@ def _strict_json_object(path: Path) -> dict[str, Any]:
             raise ValueError(f"non-finite JSON number is forbidden: {value}")
         return parsed
 
-    payload = json.loads(
-        Path(path).read_text(encoding="utf-8"),
-        object_pairs_hook=pairs_hook,
-        parse_constant=reject_constant,
-        parse_float=parse_float,
-    )
+    text = Path(path).read_text(encoding="utf-8")
+    try:
+        require_json_text_nesting(
+            text, max_depth=_MAX_JSON_NESTING_DEPTH, name="JSON payload"
+        )
+    except ValueError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+    try:
+        payload = json.loads(
+            text,
+            object_pairs_hook=pairs_hook,
+            parse_constant=reject_constant,
+            parse_float=parse_float,
+        )
+    except RecursionError as exc:
+        raise ValueError(
+            f"{path}: JSON payload exceeds the parser recursion limit"
+        ) from exc
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: payload must be one JSON object")
     return payload
@@ -1120,6 +1212,23 @@ def _validated_float_hyperparameters(
     return {str(name): cast(float, entry) for name, entry in value.items()}
 
 
+_PLAN_BODY_FIELDS = frozenset(
+    {
+        "benchmark",
+        "config",
+        "matches_selected_publication_configuration",
+        "learner_ids",
+        "hyperparameters",
+        "seed_ids",
+        "planned_shard_count",
+        "dataset",
+        "deviations",
+        "paper_reference",
+        "notes",
+    }
+)
+
+
 def load_plan(path: Path) -> dict[str, Any]:
     """Load and structurally validate a v1 plan file."""
     payload = _strict_json_object(path)
@@ -1130,6 +1239,13 @@ def load_plan(path: Path) -> dict[str, Any]:
     body = payload.get("plan")
     if not isinstance(body, dict):
         raise ValueError(f"{path}: plan body must be an object")
+    if set(body) != _PLAN_BODY_FIELDS:
+        missing = sorted(_PLAN_BODY_FIELDS - set(body))
+        extra = sorted(set(body) - _PLAN_BODY_FIELDS)
+        raise ValueError(
+            f"{path}: plan body fields do not match its schema; "
+            f"missing={missing}, extra={extra}"
+        )
     if payload.get("plan_sha256") != canonical_json_sha256(body):
         raise ValueError(f"{path}: plan_sha256 does not match the plan body")
     if body.get("benchmark") != BENCHMARK:
@@ -1143,12 +1259,24 @@ def load_plan(path: Path) -> dict[str, Any]:
     config = LabelEMNISTConfig(**config_payload)
     if n_steps != config.n_steps:
         raise ValueError(f"{path}: plan n_steps is inconsistent with config")
-    learner_ids = body["learner_ids"]
-    if sorted(body["hyperparameters"]) != sorted(learner_ids):
+    learner_ids = body.get("learner_ids")
+    if (
+        type(learner_ids) is not list
+        or not learner_ids
+        or any(type(learner) is not str or not learner for learner in learner_ids)
+        or len(set(learner_ids)) != len(learner_ids)
+    ):
+        raise ValueError(
+            f"{path}: plan learner_ids must be a list of unique non-empty strings"
+        )
+    hyperparameters = body.get("hyperparameters")
+    if not isinstance(hyperparameters, Mapping) or sorted(hyperparameters) != sorted(
+        learner_ids
+    ):
         raise ValueError(f"{path}: hyperparameter learner keys differ from learner_ids")
     for learner in learner_ids:
         provided = _validated_float_hyperparameters(
-            body["hyperparameters"][learner], learner, context=str(path)
+            hyperparameters[learner], learner, context=str(path)
         )
         resolved = resolve_hyperparameters(learner, provided)
         if sorted(resolved) != sorted(provided) or any(
@@ -1163,8 +1291,22 @@ def load_plan(path: Path) -> dict[str, Any]:
     seeds = require_unique_jax_seeds(raw_seeds, name=f"{path}: plan seed_ids")
     if seeds != tuple(sorted(seeds)):
         raise ValueError(f"{path}: plan seed_ids must be sorted")
-    if body["planned_shard_count"] != len(learner_ids) * len(seeds):
+    planned_shard_count = body.get("planned_shard_count")
+    if type(planned_shard_count) is not int:
+        raise ValueError(f"{path}: planned_shard_count must be an exact integer")
+    if planned_shard_count != len(learner_ids) * len(seeds):
         raise ValueError(f"{path}: planned_shard_count is inconsistent")
+    if not isinstance(body.get("dataset"), Mapping):
+        raise ValueError(f"{path}: plan dataset must be an object")
+    if type(body.get("matches_selected_publication_configuration")) is not bool:
+        raise ValueError(
+            f"{path}: matches_selected_publication_configuration must be a boolean"
+        )
+    for fieldname in ("deviations", "notes"):
+        if type(body.get(fieldname)) is not list:
+            raise ValueError(f"{path}: plan {fieldname} must be a list")
+    if not isinstance(body.get("paper_reference"), Mapping):
+        raise ValueError(f"{path}: plan paper_reference must be an object")
     return payload
 
 
@@ -1235,14 +1377,26 @@ def _validated_partial(path: Path, plan: dict[str, Any]) -> dict[str, Any]:
         values = payload.get(field)
         if not isinstance(values, list) or len(values) != n_tasks:
             raise ValueError(f"{path}: {field} must be a list of {n_tasks} numbers")
-        array = np.asarray(values, dtype=np.float64)
-        if not np.all(np.isfinite(array)) or not np.all(array >= lower):
+        array = np.asarray(
+            [
+                _require_finite_real(f"{field}[{index}]", entry)
+                for index, entry in enumerate(values)
+            ],
+            dtype=np.float64,
+        )
+        if not np.all(array >= lower):
             raise ValueError(f"{path}: {field} values are outside the allowed range")
         if upper is not None and not np.all(array <= upper):
             raise ValueError(f"{path}: {field} values are outside the allowed range")
     mean_accuracy = float(np.asarray(payload["per_task_accuracy"], dtype=np.float64).mean())
-    if abs(mean_accuracy - float(payload["average_online_accuracy"])) > 1e-5:
+    average_online_accuracy = _require_finite_real(
+        "average_online_accuracy", payload.get("average_online_accuracy")
+    )
+    if not 0.0 <= average_online_accuracy <= 1.0:
+        raise ValueError(f"{path}: average_online_accuracy must lie in [0, 1]")
+    if abs(mean_accuracy - average_online_accuracy) > 1e-5:
         raise ValueError(f"{path}: average_online_accuracy does not match per-task mean")
+    payload["average_online_accuracy"] = average_online_accuracy
     return payload
 
 

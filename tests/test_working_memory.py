@@ -117,6 +117,49 @@ def test_working_memory_trace_decay_and_feature_causality() -> None:
     chex.assert_trees_all_close(state2.observation_traces[0], jnp.asarray([0.5]))
 
 
+
+
+def test_innovation_uses_fastest_decay_not_first_listed_rate() -> None:
+    """``include_innovations`` subtracts the fastest trace, not ``traces[0]``.
+
+    Decay rates are an unordered supported tuple. The constructor accepts
+    ``(0.99, 0.0)``: 0.99 is a long-horizon EMA and 0.0 is a full replace.
+    After one write of 4.0 the slow row is 0.04 and the fast row is 4.0, so
+    the documented current-minus-fast-trace innovation is 0. Using the first
+    listed row silently returns 3.96 instead.
+    """
+    config = WorkingMemoryConfig(
+        observation_dim=1,
+        action_dim=0,
+        reward_dim=0,
+        observation_decay_rates=(0.99, 0.0),
+        action_decay_rates=(),
+        reward_decay_rates=(),
+        include_current_observation=False,
+        include_current_action=False,
+        include_current_reward=False,
+        include_traces=True,
+        include_innovations=True,
+    )
+    memory = WorkingMemoryFeaturizer(config)
+    observation = jnp.asarray([4.0])
+    state = memory.update(
+        memory.init(),
+        observation,
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    features = memory.features(
+        state,
+        observation,
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    chex.assert_trees_all_close(state.observation_traces[0], jnp.asarray([0.04]), atol=1e-6)
+    chex.assert_trees_all_close(state.observation_traces[1], jnp.asarray([4.0]))
+    chex.assert_trees_all_close(features, jnp.asarray([0.04, 4.0, 0.0]), atol=1e-6)
+
+
 def test_working_memory_reset_semantics() -> None:
     memory = WorkingMemoryFeaturizer(
         WorkingMemoryConfig(observation_dim=2, action_dim=1, reward_dim=1)
@@ -268,7 +311,7 @@ def test_working_memory_step_reports_rejection_with_neutral_features_and_recover
     assert int(recovered.state.step_count) == int(state.step_count) + 1
 
 
-def test_working_memory_step_rejects_finite_post_apply_overflow() -> None:
+def test_working_memory_step_rejects_unrepresentable_innovation() -> None:
     memory = WorkingMemoryFeaturizer(
         WorkingMemoryConfig(
             observation_dim=1,
@@ -278,6 +321,7 @@ def test_working_memory_step_rejects_finite_post_apply_overflow() -> None:
             include_current_observation=False,
             include_current_action=False,
             include_current_reward=False,
+            include_innovations=True,
         )
     )
     limit = jnp.asarray(jnp.finfo(jnp.float32).max, dtype=jnp.float32)
@@ -292,7 +336,7 @@ def test_working_memory_step_rejects_finite_post_apply_overflow() -> None:
 
     assert not bool(rejected.update_applied)
     chex.assert_trees_all_equal(rejected.state, state)
-    chex.assert_trees_all_equal(rejected.features, jnp.zeros((1,), dtype=jnp.float32))
+    chex.assert_trees_all_equal(rejected.features, jnp.zeros((2,), dtype=jnp.float32))
     recovered = memory.step(
         rejected.state,
         jnp.asarray([-limit]),
@@ -391,6 +435,43 @@ def test_working_memory_diagnostics_are_finite() -> None:
     assert float(diagnostics.trace_energy) > 0.0
     assert float(diagnostics.effective_dimension) > 0.0
     chex.assert_tree_all_finite(diagnostics)
+
+
+def test_working_memory_diagnostics_preserve_extreme_finite_ratios() -> None:
+    memory = WorkingMemoryFeaturizer(
+        WorkingMemoryConfig(
+            observation_dim=2,
+            action_dim=0,
+            reward_dim=0,
+            observation_decay_rates=(0.0,),
+            action_decay_rates=(),
+            reward_decay_rates=(),
+        )
+    )
+    observation = jnp.asarray([1.0e38, 9.0e37], dtype=jnp.float32)
+    update = memory.update_checked(
+        memory.init(),
+        observation,
+        memory.zero_action(),
+        memory.zero_reward(),
+    )
+    expected_values = np.asarray(observation, dtype=np.float64)
+    expected_rms = float(np.sqrt(np.mean(expected_values * expected_values)))
+    normalized = expected_values / np.max(np.abs(expected_values))
+    squared = normalized * normalized
+    expected_dimension = float(np.sum(squared) ** 2 / np.sum(squared * squared))
+
+    assert bool(update.update_applied)
+    diagnostics_results = (
+        memory.diagnostics(update.state),
+        jax.jit(memory.diagnostics)(update.state),
+    )
+    for diagnostics in diagnostics_results:
+        assert float(diagnostics.observation_energy) == pytest.approx(expected_rms, rel=1e-6)
+        assert float(diagnostics.trace_energy) == pytest.approx(expected_rms, rel=1e-6)
+        assert float(diagnostics.effective_dimension) == pytest.approx(
+            expected_dimension, rel=1e-6
+        )
 
 
 def test_working_memory_delayed_action_positive_control() -> None:

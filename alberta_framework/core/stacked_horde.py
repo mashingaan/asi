@@ -131,6 +131,20 @@ def _require_positive_normal_float32_step_size(value: object) -> float:
     return cast(float, value) if preserve_builtin_float else narrowed
 
 
+def _importance_ratio_operand(value: object) -> Array:
+    """Reject exact host negatives before float32 narrowing can erase their sign."""
+    actual_type = type(value)
+    if any(actual_type is trusted_type for trusted_type in _TRUSTED_STEP_SIZE_TYPES):
+        try:
+            numerator, _, narrowed = round_real_to_float32_with_ratio(cast(Real, value))
+        except (FloatingPointError, OverflowError, TypeError, ValueError):
+            return jnp.asarray(value, dtype=jnp.float32)
+        if numerator < 0:
+            raise ValueError("rho must be non-negative")
+        return jnp.asarray(narrowed, dtype=jnp.float32)
+    return jnp.asarray(value, dtype=jnp.float32)
+
+
 _INT32_MAX = 2**31 - 1
 _CONFIG_FIELDS = {
     "type",
@@ -141,21 +155,7 @@ _CONFIG_FIELDS = {
     "cumulant_indices",
     "step_size",
 }
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -173,10 +173,15 @@ def _require_sequence(name: str, value: object) -> tuple[object, ...]:
     return cast(tuple[object, ...], value)
 
 
-def _decode_sequence(name: str, value: object) -> tuple[object, ...]:
+def _decode_sequence(
+    name: str, value: object, *, expected_length: int
+) -> tuple[object, ...]:
     if type(value) not in (list, tuple):
         raise ValueError(f"{name} must be an actual list or tuple")
-    return tuple(cast(list[object] | tuple[object, ...], value))
+    sequence = cast(list[object] | tuple[object, ...], value)
+    if len(sequence) != expected_length:
+        raise ValueError(f"{name} must have length n_demons={expected_length}")
+    return tuple(sequence)
 
 
 def _preflight_horde_resources(n_demons: int, feature_dim: int) -> None:
@@ -207,10 +212,12 @@ def _stacked_horde_update_result_extras_bytes(n_demons: int) -> int:
 
 
 def _stacked_horde_update_working_set_bytes(n_demons: int, feature_dim: int) -> int:
-    """Source persist, proposed persist, committed persist, and returned extras."""
+    """Persist copies, returned extras, and bounded TD recovery buffers."""
+    # Conservatively charge six float32-width per-head buffers (including
+    # the narrower recovery mask) for both TD evaluation orders and selection.
     return 3 * _stacked_horde_persistent_bytes(
         n_demons, feature_dim
-    ) + _stacked_horde_update_result_extras_bytes(n_demons)
+    ) + _stacked_horde_update_result_extras_bytes(n_demons) + 24 * n_demons
 
 
 def _preflight_stacked_horde_update_working_set(n_demons: int, feature_dim: int) -> None:
@@ -259,6 +266,8 @@ class StackedHordeConfig:
         """Validate the configuration."""
         n_demons = _require_int32("n_demons", self.n_demons, minimum=1)
         feature_dim = _require_int32("feature_dim", self.feature_dim, minimum=1)
+        _preflight_horde_resources(n_demons, feature_dim)
+        _preflight_stacked_horde_update_working_set(n_demons, feature_dim)
 
         raw_sequences = {
             "gammas": _require_sequence("gammas", self.gammas),
@@ -288,9 +297,6 @@ class StackedHordeConfig:
             _require_int32(f"cumulant_indices[{i}]", idx, minimum=0)
             for i, idx in enumerate(raw_sequences["cumulant_indices"])
         )
-
-        _preflight_horde_resources(n_demons, feature_dim)
-        _preflight_stacked_horde_update_working_set(n_demons, feature_dim)
 
         object.__setattr__(self, "n_demons", n_demons)
         object.__setattr__(self, "feature_dim", feature_dim)
@@ -326,8 +332,16 @@ class StackedHordeConfig:
         serialized_type = config.pop("type")
         if type(serialized_type) is not str or serialized_type != "StackedHordeConfig":
             raise ValueError("unexpected stacked Horde config type")
+        n_demons = _require_int32("n_demons", config["n_demons"], minimum=1)
+        feature_dim = _require_int32("feature_dim", config["feature_dim"], minimum=1)
+        _preflight_horde_resources(n_demons, feature_dim)
+        _preflight_stacked_horde_update_working_set(n_demons, feature_dim)
+        config["n_demons"] = n_demons
+        config["feature_dim"] = feature_dim
         for key in ("gammas", "lamdas", "cumulant_indices"):
-            config[key] = _decode_sequence(key, config[key])
+            config[key] = _decode_sequence(
+                key, config[key], expected_length=n_demons
+            )
         return cls(**config)
 
 
@@ -355,6 +369,11 @@ def nexting_spec(
     feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
     raw_indices = _require_sequence("cumulant_indices", cumulant_indices)
     raw_gammas = _require_sequence("gammas", gammas)
+    n_demons = len(raw_indices) * len(raw_gammas)
+    if n_demons < 1 or n_demons > _INT32_MAX:
+        raise ValueError("derived n_demons must be in the signed int32 domain")
+    _preflight_horde_resources(n_demons, feature_dim)
+    _preflight_stacked_horde_update_working_set(n_demons, feature_dim)
     canonical_indices = tuple(
         _require_int32(f"cumulant_indices[{i}]", value, minimum=0)
         for i, value in enumerate(raw_indices)
@@ -364,11 +383,6 @@ def nexting_spec(
         for i, value in enumerate(raw_gammas)
     )
     canonical_lamda = validated_float32_scalar("lamda", lamda, lower=0.0, upper=1.0)
-    n_demons = len(canonical_indices) * len(canonical_gammas)
-    if n_demons < 1 or n_demons > _INT32_MAX:
-        raise ValueError("derived n_demons must be in the signed int32 domain")
-    _preflight_horde_resources(n_demons, feature_dim)
-    _preflight_stacked_horde_update_working_set(n_demons, feature_dim)
     idxs: list[int] = []
     gs: list[float] = []
     for c in canonical_indices:
@@ -536,28 +550,38 @@ class StackedLinearHorde:
         cumulants = cumulant_source[self._cumulant_idx]  # (n_demons,)
         requested = ~jnp.isnan(cumulants)
         active = jnp.isfinite(cumulants)
-        rho_vec = jnp.broadcast_to(jnp.asarray(rho, dtype=jnp.float32), (cfg.n_demons,))
-        rho_valid = jnp.isfinite(rho_vec)
+        rho_vec = jnp.broadcast_to(_importance_ratio_operand(rho), (cfg.n_demons,))
+        rho_valid = jnp.isfinite(rho_vec) & (rho_vec >= 0.0)
 
         v = state.weights @ features  # (n_demons,)
         v_next = state.weights @ next_features
         # gamma=0 must not multiply an inf bootstrap (0*inf).
         bootstrap = jnp.where(self._gammas == 0.0, 0.0, self._gammas * v_next)
-        raw_td_errors = cumulants + bootstrap - v
+        cumulant_bootstrap = cumulants + bootstrap
+        # Keep ordinary rounding; recover only an overflowing partial sum
+        # whose subtraction of the current prediction can make TD finite.
+        raw_td_errors = jnp.where(
+            jnp.isfinite(cumulant_bootstrap),
+            cumulant_bootstrap - v,
+            cumulants + (bootstrap - v),
+        )
         prediction_valid = jnp.isfinite(v) & ((self._gammas == 0.0) | jnp.isfinite(v_next))
         channel_valid = active & rho_valid & prediction_valid & jnp.isfinite(raw_td_errors)
-        safe_cumulants = jnp.where(channel_valid, cumulants, 0.0)
-        td_errors = safe_cumulants + bootstrap - v
+        td_errors = jnp.where(channel_valid, raw_td_errors, 0.0)
 
         # Per-decision IS with the ratio composed into the trace:
         # z_d = rho_d * (gamma_d * lamda_d * z_d + x).
         decay = (self._gammas * self._lamdas)[:, None]  # (n_demons, 1)
         carried = jnp.where(decay == 0.0, jnp.zeros_like(state.traces), decay * state.traces)
         accumulated = carried + features[None, :]
-        # Inactive demons: trace decays but the current gradient is withheld.
+        # A NaN cumulant withholds the current feature. The importance ratio
+        # belongs to the question that was asked, so a quiet demon's trace
+        # decays by gamma*lambda only (rho=0 must not wipe it).
         decayed_only = carried
         safe_rho = jnp.where(rho_valid, rho_vec, 0.0)
-        proposed_traces = safe_rho[:, None] * jnp.where(active[:, None], accumulated, decayed_only)
+        proposed_traces = jnp.where(
+            active[:, None], safe_rho[:, None] * accumulated, decayed_only
+        )
 
         masked_delta = jnp.where(channel_valid, td_errors, 0.0)
         proposed_weights = state.weights + cfg.step_size * masked_delta[:, None] * proposed_traces
@@ -568,6 +592,7 @@ class StackedLinearHorde:
             jnp.all(jnp.isfinite(features))
             & jnp.all(jnp.isfinite(next_features))
             & source_weights_finite
+            & (state.step_count >= 0)
         )
         candidate_finite = jnp.all(jnp.isfinite(proposed_weights), axis=1) & jnp.all(
             jnp.isfinite(proposed_traces), axis=1

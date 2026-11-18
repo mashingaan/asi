@@ -13,9 +13,10 @@ import math
 import re
 import statistics
 import time
+import zipfile
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import IO, Any, cast
 
 import numpy as np
 
@@ -51,6 +52,14 @@ BUCKETS = (
     (3500, 5000),
 )
 _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+MAX_CEILING_TASKS = 200
+MAX_CEILING_TASK_LENGTH = 5_000
+MAX_CEILING_METADATA_BYTES = 16 * 1024 * 1024
+MAX_CEILING_PER_STEP_BYTES = MAX_CEILING_TASKS * MAX_CEILING_TASK_LENGTH
+MAX_CEILING_UNCOMPRESSED_BYTES = (
+    MAX_CEILING_PER_STEP_BYTES + MAX_CEILING_METADATA_BYTES + 8192
+)
+_NPZ_REQUIRED_MEMBERS = frozenset({"metadata.npy", "per_step.npy"})
 
 
 def _safe_identifier(value: object, *, name: str) -> str:
@@ -86,28 +95,110 @@ def _frontier_arms(value: object, *, base: str) -> tuple[str, ...]:
 def across_seed_spread(values: Sequence[float] | np.ndarray[Any, Any]) -> float:
     """Return sample standard deviation, or zero below two observations."""
     array = np.asarray(values, dtype=np.float64).ravel()
+    if not bool(np.all(np.isfinite(array))):
+        raise ValueError("values must be finite")
     if array.size < 2:
         return 0.0
-    return float(array.std(ddof=1))
+    with np.errstate(over="ignore", invalid="ignore"):
+        spread = float(array.std(ddof=1))
+    if not math.isfinite(spread):
+        raise ValueError("across-seed spread must be finite")
+    return spread
 
 
 def _json_object(path: Path) -> dict[str, Any]:
     return load_strict_json_object(path)
 
 
-def seed_means(root: Path, config_name: str) -> dict[int, float]:
-    """Read mean per-task accuracy by seed for one campaign arm."""
+def _seed_measurements(
+    root: Path,
+    config_name: str,
+) -> tuple[dict[int, float], tuple[str, str, str, int | None] | None]:
+    """Read one arm and retain the protocol identity its means came from."""
     config_name = _safe_identifier(config_name, name="config_name")
     result: dict[int, float] = {}
+    protocol_signature: tuple[str, str, str, int | None] | None = None
+    # The protocol signature above covers schema, config and noise only.
+    # base_learner and hyperparameters live at the top level of a shard,
+    # not inside config, so they need their own consistency check, matching
+    # _validate_screening_arm_contract in ipmnist_screening.py. Without it,
+    # runs of different mechanisms could be averaged under one arm name.
+    # A missing field is consistent only with another missing field, so
+    # synthetic shards that omit both fields keep working.
+    learner_signature: tuple[object, object] | None = None
     for path in sorted(root.glob(f"{config_name}_seed*.json")):
         payload = _json_object(path)
         raw_seed = payload.get("seed")
         accuracies = payload.get("per_task_accuracy")
         if type(accuracies) is not list or not accuracies:
             raise ValueError(f"{path} lacks a valid seed or per_task_accuracy")
+        schema = payload.get("schema")
+        if schema not in (
+            "alberta.ipmnist_screening.shard.v1",
+            "alberta.ipmnist_screening.shard.v2",
+        ):
+            raise ValueError(f"{path} has an unsupported screening shard schema")
+        config = payload.get("config")
+        if type(config) is not dict:
+            raise ValueError(f"{path} lacks a valid config")
+        n_tasks = config.get("n_tasks")
+        if type(n_tasks) is not int or n_tasks <= 0 or len(accuracies) != n_tasks:
+            raise ValueError(f"{path} per_task_accuracy length disagrees with config n_tasks")
+        noise_mode = payload.get(
+            "noise_mode",
+            "step" if schema == "alberta.ipmnist_screening.shard.v1" else None,
+        )
+        if type(noise_mode) is not str or noise_mode not in ("step", "pool"):
+            raise ValueError(f"{path} noise_mode must be 'step' or 'pool'")
+        noise_pool_steps = payload.get("noise_pool_steps")
+        if noise_mode == "step":
+            if noise_pool_steps is not None:
+                raise ValueError(
+                    f"{path} noise_pool_steps must be null or absent when noise_mode='step'"
+                )
+        elif type(noise_pool_steps) is not int or noise_pool_steps < 2:
+            raise ValueError(
+                f"{path} noise_pool_steps must be a built-in integer >= 2 "
+                "when noise_mode='pool'"
+            )
+        signature = (
+            schema,
+            json.dumps(config, sort_keys=True, separators=(",", ":"), allow_nan=False),
+            noise_mode,
+            noise_pool_steps,
+        )
+        if protocol_signature is None:
+            protocol_signature = signature
+        elif signature != protocol_signature:
+            raise ValueError(f"{config_name} shards span multiple protocol signatures")
         seed = require_jax_seed(raw_seed, name=f"{path} seed")
         if path.name != f"{config_name}_seed{seed}.json":
             raise ValueError(f"{path} filename disagrees with payload seed")
+        payload_name = payload.get("config_name")
+        if payload_name is not None and payload_name != config_name:
+            raise ValueError(
+                f"{path}: config_name {payload_name!r} does not match "
+                f"expected arm {config_name!r}"
+            )
+        base_learner = payload.get("base_learner")
+        if base_learner is not None and (
+            type(base_learner) is not str or not base_learner
+        ):
+            raise ValueError(f"{path} base_learner must be a non-empty string")
+        hyperparameters = payload.get("hyperparameters")
+        if hyperparameters is not None and type(hyperparameters) is not dict:
+            raise ValueError(f"{path} hyperparameters must be a dict")
+        current_learner = (base_learner, hyperparameters)
+        if learner_signature is None:
+            learner_signature = current_learner
+        elif current_learner != learner_signature:
+            raise ValueError(
+                f"config {config_name!r} has inconsistent base_learner or "
+                f"hyperparameters across seeds; refusing to average runs of "
+                f"different mechanisms under one config_name"
+            )
+        if any(type(value) is not int and type(value) is not float for value in accuracies):
+            raise ValueError(f"{path} per_task_accuracy must contain JSON numbers")
         values = np.asarray(accuracies, dtype=np.float64)
         if (
             values.ndim != 1
@@ -118,7 +209,13 @@ def seed_means(root: Path, config_name: str) -> dict[int, float]:
         if seed in result:
             raise ValueError(f"duplicate seed {seed} for {config_name}")
         result[seed] = statistics.mean(float(value) for value in values)
-    return result
+    return result, protocol_signature
+
+
+def seed_means(root: Path, config_name: str) -> dict[int, float]:
+    """Read mean per-task accuracy by seed for one campaign arm."""
+    means, _ = _seed_measurements(root, config_name)
+    return means
 
 
 def build_frontier(
@@ -140,33 +237,45 @@ def build_frontier(
         created_unix = _finite_scalar(created_unix, name="created_unix")
         if created_unix < 0:
             raise ValueError("created_unix must be nonnegative")
-    screen_base = seed_means(screen_dir, base)
-    confirm_base = seed_means(confirm_dir, base)
+    screen_base, screen_protocol = _seed_measurements(screen_dir, base)
+    confirm_base, confirm_protocol = _seed_measurements(confirm_dir, base)
     if not screen_base:
         raise ValueError(f"screen base {base!r} has no seeds")
     rows: list[dict[str, Any]] = []
     for arm in checked_arms:
-        screen = seed_means(screen_dir, arm)
-        confirm = seed_means(confirm_dir, arm)
+        screen, arm_screen_protocol = _seed_measurements(screen_dir, arm)
+        confirm, arm_confirm_protocol = _seed_measurements(confirm_dir, arm)
+        if arm_screen_protocol != screen_protocol:
+            raise ValueError(
+                f"screen protocol signatures differ for {arm!r} and base {base!r}"
+            )
         if screen.keys() != screen_base.keys():
             raise ValueError(
                 f"screen seed sets differ for {arm!r} and base {base!r}: "
                 f"{sorted(screen)} != {sorted(screen_base)}"
             )
         paired_seeds = sorted(screen)
+        screen_deltas = [
+            screen[seed] - screen_base[seed] for seed in paired_seeds
+        ]
+        screen_paired_delta = statistics.mean(screen_deltas)
         row: dict[str, Any] = {
             "config_name": arm,
             "n_screen_seeds": len(paired_seeds),
             "screen_mean": statistics.mean(screen[seed] for seed in paired_seeds),
-            "screen_paired_delta_vs_base": statistics.mean(
-                screen[seed] - screen_base[seed] for seed in paired_seeds
-            ),
-            "screen_per_seed_delta": [
-                round(screen[seed] - screen_base[seed], 6) for seed in paired_seeds
-            ],
+            "screen_paired_delta_vs_base": screen_paired_delta,
+            "screen_per_seed_delta": [round(delta, 6) for delta in screen_deltas],
         }
-        row["confirmation_candidate"] = row["screen_paired_delta_vs_base"] > threshold
+        row["confirmation_candidate"] = (
+            len(paired_seeds) >= 2
+            and all(delta > 0.0 for delta in screen_deltas)
+            and screen_paired_delta > threshold
+        )
         if confirm:
+            if arm_confirm_protocol != confirm_protocol:
+                raise ValueError(
+                    f"confirm protocol signatures differ for {arm!r} and base {base!r}"
+                )
             if confirm.keys() != confirm_base.keys():
                 raise ValueError(
                     f"confirm seed sets differ for {arm!r} and base {base!r}: "
@@ -212,6 +321,69 @@ def build_frontier(
     }
 
 
+def _npy_header(buffer: IO[bytes]) -> tuple[tuple[int, ...], np.dtype]:
+    try:
+        version = np.lib.format.read_magic(buffer)
+        if version == (1, 0):
+            shape, _fortran, dtype = np.lib.format.read_array_header_1_0(buffer)
+        elif version in ((2, 0), (3, 0)):
+            shape, _fortran, dtype = np.lib.format.read_array_header_2_0(buffer)
+        else:
+            raise ValueError("ceiling NPZ npy version is unsupported")
+    except (ValueError, OSError, EOFError, KeyError) as exc:
+        raise ValueError("ceiling NPZ npy header is invalid") from exc
+    try:
+        parsed = tuple(int(dim) for dim in shape)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ceiling NPZ npy header is invalid") from exc
+    return parsed, np.dtype(dtype)
+
+
+def _preflight_ceiling_npz(path: Path) -> None:
+    if not zipfile.is_zipfile(path):
+        raise ValueError(f"{path} ceiling NPZ size is empty or unbounded")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"{path} ceiling NPZ size is empty or unbounded") from exc
+    with archive:
+        names = archive.namelist()
+        if len(names) != 2 or set(names) != _NPZ_REQUIRED_MEMBERS:
+            raise ValueError(f"{path} ceiling NPZ must contain exactly metadata and per_step")
+        uncompressed = 0
+        for info in archive.infolist():
+            if info.is_dir() or ".." in info.filename or info.filename.startswith("/"):
+                raise ValueError(
+                    f"{path} ceiling NPZ must contain exactly metadata and per_step"
+                )
+            if info.file_size < 0 or info.file_size > MAX_CEILING_UNCOMPRESSED_BYTES:
+                raise ValueError(f"{path} ceiling NPZ size is empty or unbounded")
+            uncompressed += info.file_size
+            if uncompressed > MAX_CEILING_UNCOMPRESSED_BYTES:
+                raise ValueError(f"{path} ceiling NPZ size is empty or unbounded")
+        with archive.open("per_step.npy") as handle:
+            step_shape, step_dtype = _npy_header(handle)
+        with archive.open("metadata.npy") as handle:
+            metadata_shape, metadata_dtype = _npy_header(handle)
+    if step_dtype != np.dtype(np.uint8):
+        raise ValueError(f"{path} per_step must be a uint8 binary matrix")
+    if (
+        len(step_shape) != 2
+        or step_shape[1] != MAX_CEILING_TASK_LENGTH
+        or not 1 <= step_shape[0] <= MAX_CEILING_TASKS
+    ):
+        raise ValueError(f"{path} ceiling NPZ size is empty or unbounded")
+    metadata_size = 1
+    for dim in metadata_shape:
+        metadata_size *= dim
+    if (
+        metadata_dtype.kind not in {"U", "S"}
+        or metadata_size != 1
+        or metadata_dtype.itemsize * metadata_size > MAX_CEILING_METADATA_BYTES
+    ):
+        raise ValueError(f"{path} ceiling NPZ size is empty or unbounded")
+
+
 def _ceiling_runs(
     ceiling_dir: Path,
     prefix: str,
@@ -240,6 +412,7 @@ def _ceiling_runs(
             input_paths.extend((path, per_step_path))
         runs[seed] = payload
     for path in sorted(ceiling_dir.glob(f"{prefix}_seed*.npz")):
+        _preflight_ceiling_npz(path)
         with np.load(path, allow_pickle=False) as archive:
             payload = load_strict_json_object_from_text(
                 archive["metadata"].item(),
@@ -343,9 +516,16 @@ def _validated_ceiling_run(
 
 
 def _finite_vector(value: object, *, name: str) -> np.ndarray[Any, np.dtype[np.float64]]:
-    array = np.asarray(value, dtype=np.float64)
+    if type(value) is not list or any(
+        type(item) is not int and type(item) is not float for item in value
+    ):
+        raise ValueError(f"{name} must be a finite numeric vector")
+    try:
+        array = np.asarray(value, dtype=np.float64)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite numeric vector") from exc
     if array.ndim != 1 or not bool(np.all(np.isfinite(array))):
-        raise ValueError(f"{name} must be a finite vector")
+        raise ValueError(f"{name} must be a finite numeric vector")
     return array
 
 

@@ -50,21 +50,7 @@ _CONFIG_TYPE = "OptionSearchControlConfig"
 _MAX_BACKUP_BUDGET = 4_096
 _MAX_CANDIDATE_DIAGNOSTIC_SLOTS = 262_144
 _INT32_MAX = 2_147_483_647
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 def _require_int32(name: str, value: object, *, minimum: int = 1, maximum: int = _INT32_MAX) -> int:
@@ -398,6 +384,30 @@ def _all_integer_leaves_nonnegative(value: Any) -> Bool[Array, ""]:
     return valid
 
 
+def _float32_model_delta(weights: Array, observation: Array) -> Array:
+    """Return one next-state row that keeps large finite cancellation.
+
+    JIT rewrites ``weights @ observation`` into a GEMV. That GEMV turns an
+    exact cancelling pair of large finite products into a huge finite delta
+    and changes the selected option. A power-of-two scaled product sum
+    replaces that result. Eagerly, a direct product that already matches
+    stays bit for bit.
+    """
+
+    products = weights * observation
+    max_abs = jnp.max(jnp.abs(products), axis=-1, keepdims=True)
+    # Scale by a power of two. Dividing by max_abs compiles to a reciprocal
+    # multiply, and the reciprocal of a value above 2**126 flushes to zero.
+    _, exponent = jnp.frexp(max_abs)
+    scaled_sum = jnp.sum(jnp.ldexp(products, -exponent), axis=-1)
+    stable = jnp.ldexp(scaled_sum, jnp.reshape(exponent, (-1,)))
+    direct = weights @ observation
+    gap = jnp.abs(direct - stable)
+    limit = jnp.maximum(jnp.abs(stable), jnp.asarray(1.0, dtype=jnp.float32))
+    use_stable = jnp.isfinite(stable) & (gap > limit * jnp.asarray(1024.0, dtype=jnp.float32))
+    return jnp.where(use_stable, stable, direct)
+
+
 def _array_has_contract(
     value: Any,
     shape: tuple[int, ...],
@@ -423,9 +433,21 @@ class OptionSearchControl:
     ) -> None:
         self._agent = stomp_agent
         self._config = config or OptionSearchControlConfig()
-        if self._agent.config.n_options < 1:
+        n_options = self._agent.config.n_options
+        if type(n_options) is not int:
+            raise ValueError(
+                f"n_options must be an integer in [1, {_MAX_BACKUP_BUDGET}] "
+                "for option-search arange work"
+            )
+        if n_options < 1:
             raise ValueError("option search control requires at least one option")
-        candidate_slots = self._agent.config.n_options * self._config.backup_budget
+        if n_options > _MAX_BACKUP_BUDGET:
+            raise ValueError(
+                f"n_options must be an integer in [1, {_MAX_BACKUP_BUDGET}] "
+                "for option-search arange work"
+            )
+        self._n_options = n_options
+        candidate_slots = n_options * self._config.backup_budget
         if candidate_slots > _MAX_CANDIDATE_DIAGNOSTIC_SLOTS:
             raise ValueError(
                 "backup_budget * n_options exceeds the option-search "
@@ -442,7 +464,7 @@ class OptionSearchControl:
     def resource_budget(self) -> OptionSearchControlResourceBudget:
         """Return exact logical work maxima for one call."""
 
-        n_options = self._agent.config.n_options
+        n_options = self._n_options
         backup_budget = self._config.backup_budget
         candidate_slots = n_options * backup_budget
         # Dense logical payload: decision observation; eighteen boolean scalar
@@ -589,7 +611,7 @@ class OptionSearchControl:
         models = state.option_models
         if not isinstance(models, OptionModelsState):
             return False
-        n_options = self._agent.config.n_options
+        n_options = self._n_options
         observation_dim = self._agent.config.observation_dim
         return (
             _array_has_contract(models.cumreward_ema, (n_options,), jnp.float32)
@@ -647,7 +669,7 @@ class OptionSearchControl:
             jnp.isfinite(observation)
         )
         budget = self._config.backup_budget
-        n_options = self._agent.config.n_options
+        n_options = self._n_options
         matrix_shape = (budget, n_options)
         return OptionSearchControlDiagnostics(
             decision_observation=jnp.where(values_finite, observation, 0.0),
@@ -709,7 +731,7 @@ class OptionSearchControl:
         """Evaluate all option targets and residuals from one learner state."""
 
         models = state.option_models
-        n_options = self._agent.config.n_options
+        n_options = self._n_options
         base_values = self._agent.base_learner.predict(
             learner_state,
             observation,
@@ -741,7 +763,7 @@ class OptionSearchControl:
                 models.next_state_weights[index],
                 jnp.zeros_like(models.next_state_weights[index]),
             )
-            predicted_next = observation + weights @ observation
+            predicted_next = observation + _float32_model_delta(weights, observation)
             next_values = self._agent.base_learner.predict(
                 learner_state,
                 predicted_next,
@@ -752,10 +774,16 @@ class OptionSearchControl:
                 jnp.zeros_like(discount),
                 discount * jnp.max(next_values),
             )
-            target = (
-                models.env_return_ema[index]
-                - state.base_average_reward * models.baseline_mass_ema[index]
-                + bootstrap
+            reward_term = models.env_return_ema[index]
+            baseline_term = state.base_average_reward * models.baseline_mass_ema[index]
+            direct_target = reward_term - baseline_term + bootstrap
+            # Left association overflows when reward and baseline cancel through
+            # the bootstrap. Use the other association only for that finite value.
+            recovered_target = reward_term - (baseline_term - bootstrap)
+            target = jnp.where(
+                jnp.isfinite(direct_target) | ~jnp.isfinite(recovered_target),
+                direct_target,
+                recovered_target,
             )
             residual = target - option_values[index]
             prediction_finite = (
@@ -869,7 +897,7 @@ class OptionSearchControl:
         )
 
         budget = self._config.backup_budget
-        n_options = self._agent.config.n_options
+        n_options = self._n_options
         matrix_shape = (budget, n_options)
         completion_supported_log = jnp.zeros(matrix_shape, dtype=jnp.bool_)
         semantics_valid_log = jnp.zeros(matrix_shape, dtype=jnp.bool_)
@@ -985,7 +1013,7 @@ class OptionSearchControl:
                 .set(selected_target)
             )
 
-            def propose_update(_: None) -> tuple[MultiHeadMLPState, Array]:
+            def propose_update(_: None) -> tuple[MultiHeadMLPState, Array, Array]:
                 update = self._agent.base_learner.update(
                     trace_neutral_state,
                     safe_observation,
@@ -999,12 +1027,16 @@ class OptionSearchControl:
                         normalizer_state=learner_state.normalizer_state,
                     ),
                 )
-                return restored, update.errors[selected_extended]
+                return restored, update.errors[selected_extended], update.update_applied
 
-            def skip_update(_: None) -> tuple[MultiHeadMLPState, Array]:
-                return learner_state, jnp.float32(0.0)
+            def skip_update(_: None) -> tuple[MultiHeadMLPState, Array, Array]:
+                return (
+                    learner_state,
+                    jnp.float32(0.0),
+                    jnp.asarray(False, dtype=jnp.bool_),
+                )
 
-            candidate_state, candidate_td_error = jax.lax.cond(
+            candidate_state, candidate_td_error, learner_update_applied = jax.lax.cond(
                 any_valid,
                 propose_update,
                 skip_update,
@@ -1026,7 +1058,12 @@ class OptionSearchControl:
                     learner_state.head_traces,
                 )
             )
-            accepted = candidate_finite & traces_preserved
+            # The planner's own finite/trace checks cannot see a rejected
+            # learner transaction: a rejection restores the exact input
+            # state, so the restored candidate is finite with preserved
+            # traces and a neutralized zero TD error. Only the learner's
+            # verdict distinguishes an applied backup from that no-op.
+            accepted = candidate_finite & traces_preserved & learner_update_applied
             next_learner_state = jax.lax.cond(
                 accepted,
                 lambda _: candidate_state,

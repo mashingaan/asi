@@ -122,7 +122,13 @@ def _metrics(
     key: Array,
 ) -> tuple[Array, Array, Array]:
     accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
-    after = _loss(forward(params, x, key, False), y)
+    # ``loss`` came from the training-mode forward that produced the gradient.
+    # The runner's ``_step_metrics`` applies one forward function to both sides
+    # of the plasticity ratio, so the post-update loss is scored in the same
+    # mode from the same per-step key: for ``aid`` and ``ordinary_dropout`` that
+    # re-derives the identical activation mask, leaving the parameter update as
+    # the only thing that moved.  Every mode-independent arm is unaffected.
+    after = _loss(forward(params, x, key, True), y)
     plasticity = jnp.clip(1.0 - after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0)
     return accuracy, loss, plasticity
 
@@ -361,13 +367,18 @@ def _runtime_identity() -> tuple[str, str, str, str]:
     return (platform.python_version(), jax.__version__, np.__version__, jax.default_backend())
 
 
-def _current_source_identity() -> tuple[str, str, str]:
-    names = ("activation_feature_ipmnist.py", "ipmnist_screening.py", "upgd_ipmnist.py")
+def _current_source_identity() -> tuple[str, str, str, str]:
+    names = (
+        "activation_feature_ipmnist.py",
+        "ipmnist_screening.py",
+        "upgd_ipmnist.py",
+        "plasticity_comparators.py",
+    )
     digests = tuple(
         hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
         for name in names
     )
-    return digests[0], digests[1], digests[2]
+    return digests[0], digests[1], digests[2], digests[3]
 
 
 def _host_array(value: object, *, name: str, dtype: np.dtype[Any]) -> np.ndarray:
@@ -382,7 +393,7 @@ class ActivationFeatureRunResult:
     screening: ScreeningRunResult
     dataset_sha256: str
     schedule_sha256: str
-    source_identity: tuple[str, str, str]
+    source_identity: tuple[str, str, str, str]
     runtime_identity: tuple[str, str, str, str]
     n_train: int
     retained_schedule_numeric_bytes: int
@@ -439,7 +450,11 @@ def run_activation_feature_arm(
         raise ValueError("activation/feature lane exceeds its 2000000-step bound")
     if type(seed) is not int or not 0 <= seed <= 2**32 - 1:
         raise ValueError("seed must be an exact uint32 value")
-    if arm.startswith("deep_fourier") and (config.hidden1 % 2 or config.hidden2 % 2):
+    if (
+        arm.startswith("deep_fourier")
+        and arm != "deep_fourier_off"
+        and (config.hidden1 % 2 or config.hidden2 % 2)
+    ):
         raise ValueError("Deep Fourier arms require even hidden widths")
     host_x = _host_array(data_x, name="data_x", dtype=np.dtype(np.float32))
     host_y = _host_array(data_y, name="data_y", dtype=np.dtype(np.int32))
@@ -672,7 +687,9 @@ def _activation_feature_result_payload(
             "gradient_evaluations": steps,
             "optimizer_scalar_updates": steps * allocated,
             "model_queries": 2 * steps,
-            "random_bernoulli_variates": steps * activation_width if stochastic else 0,
+            # Both metric forwards run in training mode, so a stochastic arm
+            # draws one mask per hidden unit in each of them.
+            "random_bernoulli_variates": 2 * steps * activation_width if stochastic else 0,
             "activation_scalar_evaluations": 2 * steps * activation_width,
             "allocated_parameter_scalars": allocated,
             "active_parameter_scalars": active,
@@ -885,7 +902,7 @@ def _validate_activation_feature_result(
         "gradient_evaluations": steps,
         "optimizer_scalar_updates": steps * allocated,
         "model_queries": 2 * steps,
-        "random_bernoulli_variates": steps * (hidden1 + hidden2) if stochastic else 0,
+        "random_bernoulli_variates": 2 * steps * (hidden1 + hidden2) if stochastic else 0,
         "activation_scalar_evaluations": 2 * steps * (hidden1 + hidden2),
         "allocated_parameter_scalars": allocated,
         "active_parameter_scalars": active,

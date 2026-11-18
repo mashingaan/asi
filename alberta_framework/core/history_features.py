@@ -64,21 +64,12 @@ class HistoryFeatureState:
 # =============================================================================
 
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+# One 12-bit cardinality budget bounds direct tuple validation, serialized-list
+# normalization, and the implicit all-channel expansion before per-item work.
+_MAX_HISTORY_CONFIGURATION_ITEMS = 1 << 12
+_MAX_HISTORY_DECAY_RATES = _MAX_HISTORY_CONFIGURATION_ITEMS
+_MAX_HISTORY_CHANNELS = _MAX_HISTORY_CONFIGURATION_ITEMS
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int) -> int:
@@ -113,12 +104,13 @@ def _preflight_history_resources(
         float32_scalars=feature_dim,
     )
     # Charge source/product/zero/carried/contribution/proposed/finite-mask/
-    # selected trace banks; raw/finite/zero/safe observation vectors; channel
+    # selected trace banks, plus the equality mask and fixed-point selection;
+    # raw/finite/zero/safe observation vectors; channel
     # indices and tracked observations; decay temporaries; the returned output;
     # and scalar predicates. Every logical element is charged at four bytes,
     # conservatively covering float32, int32, and boolean arrays.
     step_scalars = (
-        8 * trace_scalars
+        10 * trace_scalars
         + 4 * raw_dim
         + 2 * n_channels
         + 3 * n_decays
@@ -135,6 +127,10 @@ def _require_decay_rates(value: object) -> tuple[float, ...]:
     if type(value) is not tuple:
         raise ValueError("decay_rates must be an actual tuple")
     rates = cast(tuple[object, ...], value)
+    if len(rates) > _MAX_HISTORY_DECAY_RATES:
+        raise ValueError(
+            f"decay_rates must contain at most {_MAX_HISTORY_DECAY_RATES} rates"
+        )
     return tuple(
         validated_float32_scalar(
             f"decay_rates[{index}]",
@@ -152,6 +148,11 @@ def _require_channels(value: object, raw_dim: int) -> tuple[int, ...] | None:
         return None
     if type(value) is not tuple:
         raise ValueError("channels must be an actual tuple or None")
+    channels = cast(tuple[object, ...], value)
+    if len(channels) > _MAX_HISTORY_CHANNELS:
+        raise ValueError(
+            f"channels must contain at most {_MAX_HISTORY_CHANNELS} indices"
+        )
     return tuple(
         _require_int32(
             f"channels[{index}]",
@@ -159,7 +160,7 @@ def _require_channels(value: object, raw_dim: int) -> tuple[int, ...] | None:
             minimum=0,
             maximum=raw_dim - 1,
         )
-        for index, channel in enumerate(cast(tuple[object, ...], value))
+        for index, channel in enumerate(channels)
     )
 
 
@@ -240,6 +241,10 @@ class HistoryFeatureExtractor:
             n_channels=channel_count,
             feature_dim=feature_dim,
         )
+        if channel_count > _MAX_HISTORY_CHANNELS:
+            raise ValueError(
+                f"channels must contain at most {_MAX_HISTORY_CHANNELS} indices"
+            )
         if canonical_channels is None:
             canonical_channels = tuple(range(raw_dim))
 
@@ -295,6 +300,23 @@ class HistoryFeatureExtractor:
         if state.traces.shape != expected_shape or state.traces.dtype != jnp.float32:
             raise ValueError("state.traces has an invalid shape or dtype")
 
+    def _require_observation_contract(self, observation: object) -> Array:
+        actual_type = type(observation)
+        if not (
+            issubclass(actual_type, jax.Array)
+            or issubclass(actual_type, jax.core.Tracer)
+        ):
+            raise TypeError("observation must be a JAX array")
+        trusted = cast(Array, observation)
+        if trusted.shape != (self._raw_dim,):
+            raise ValueError(
+                f"observation must have shape ({self._raw_dim},), "
+                f"got {trusted.shape}"
+            )
+        if trusted.dtype != jnp.float32:
+            raise ValueError("observation must have dtype float32")
+        return trusted
+
     def step(
         self,
         state: HistoryFeatureState,
@@ -314,6 +336,7 @@ class HistoryFeatureExtractor:
             - ``new_state`` carries the updated trace values
         """
         self._require_state_contract(state)
+        observation = self._require_observation_contract(observation)
         return cast(
             tuple[Float[Array, " out_dim"], HistoryFeatureState],
             self._step_jit(state, observation),
@@ -345,6 +368,10 @@ class HistoryFeatureExtractor:
         # decay=0 times an inf stored trace is 0*inf = NaN. Skip that product.
         carried = jnp.where(decay == 0.0, jnp.zeros_like(state.traces), decay * state.traces)
         proposed_traces = carried + (1.0 - decay) * obs_tracked[None, :]
+        # Equal inputs are an EMA fixed point; intermediate products may flush to zero.
+        proposed_traces = jnp.where(
+            state.traces == obs_tracked[None, :], state.traces, proposed_traces
+        )
         traces_finite = jnp.all(jnp.isfinite(proposed_traces))
         new_traces = jnp.where(
             observation_valid & traces_finite, proposed_traces, state.traces
@@ -373,12 +400,21 @@ class HistoryFeatureExtractor:
     def from_config(cls, config: dict[str, Any]) -> HistoryFeatureExtractor:
         """Reconstruct from config dict."""
         config = dict(config)
-        config.pop("type", None)
+        if config.pop("type", None) != "HistoryFeatureExtractor":
+            raise ValueError("type must be 'HistoryFeatureExtractor'")
         raw_rates = config["decay_rates"]
         if type(raw_rates) is list:
+            if len(raw_rates) > _MAX_HISTORY_DECAY_RATES:
+                raise ValueError(
+                    f"decay_rates must contain at most {_MAX_HISTORY_DECAY_RATES} rates"
+                )
             raw_rates = tuple(raw_rates)
         raw_channels = config["channels"]
         if type(raw_channels) is list:
+            if len(raw_channels) > _MAX_HISTORY_CHANNELS:
+                raise ValueError(
+                    f"channels must contain at most {_MAX_HISTORY_CHANNELS} indices"
+                )
             raw_channels = tuple(raw_channels)
         return cls(
             raw_dim=config["raw_dim"],

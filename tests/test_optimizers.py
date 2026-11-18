@@ -1,5 +1,6 @@
 """Tests for LMS, IDBD, Autostep, and ObGD optimizers."""
 
+import math
 from collections.abc import Callable
 from typing import NoReturn
 
@@ -162,6 +163,49 @@ class TestIDBD:
         smallest_subnormal = float(np.nextafter(np.float32(0.0), np.float32(1.0)))
         state = IDBD(meta_step_size=smallest_subnormal).init(feature_dim=2)
         assert float(state.meta_step_size) == smallest_subnormal
+
+    @pytest.mark.parametrize("initial_step_size", [1e-38, 1e-40])
+    def test_subnormal_initial_step_size_keeps_finite_logs_and_can_update(
+        self, initial_step_size: float
+    ) -> None:
+        narrowed = np.float32(initial_step_size)
+        assert np.float32(0.0) < narrowed < np.finfo(np.float32).tiny
+        expected_log = np.float32(math.log(float(narrowed)))
+
+        optimizer = IDBD(initial_step_size=initial_step_size, meta_step_size=0.0)
+        vector_state = optimizer.init(feature_dim=2)
+        parameter_state = optimizer.init_for_shape((2, 2))
+
+        np.testing.assert_array_equal(
+            np.asarray(vector_state.log_step_sizes), np.full(2, expected_log)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(parameter_state.log_step_sizes), np.full((2, 2), expected_log)
+        )
+
+        vector_update = optimizer.update(
+            vector_state,
+            jnp.array(1.0, dtype=jnp.float32),
+            jnp.ones(2, dtype=jnp.float32),
+        )
+        parameter_update = optimizer.update_from_gradient_checked(
+            parameter_state, jnp.ones((2, 2), dtype=jnp.float32)
+        )
+        assert bool(vector_update.update_applied)
+        assert bool(parameter_update.update_applied)
+
+    @pytest.mark.parametrize("initial_step_size", [0.001, 0.01, 0.1, 1.0])
+    def test_initial_log_stays_bit_identical_for_normal_step_sizes(
+        self, initial_step_size: float
+    ) -> None:
+        direct = np.asarray(jnp.log(jnp.asarray(initial_step_size, dtype=jnp.float32)))
+        optimizer = IDBD(initial_step_size=initial_step_size)
+        np.testing.assert_array_equal(
+            np.asarray(optimizer.init(3).log_step_sizes), np.full(3, direct)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(optimizer.init_for_shape((2, 3)).log_step_sizes), np.full((2, 3), direct)
+        )
 
     def test_update_returns_correct_shapes(self, sample_observation):
         """IDBD update should return correctly shaped deltas."""
@@ -399,6 +443,47 @@ class TestAutostep:
             + result.new_state.bias_step_size
         )
         assert float(effective) <= 1.0 + 1e-6
+
+    @pytest.mark.parametrize("magnitude", [3e3, 1e4, 1e5])
+    def test_overshoot_bound_holds_at_large_feature_scale(self, magnitude: float):
+        """The Algorithm 5 guarantee must survive the numerical-safety clip.
+
+        Normalization is the last operation on alpha in Mahmood et al. 2012
+        (Algorithm 5 lines 8-10), precisely so sum(alpha_i * x_i^2) <= 1 at
+        update time; a floor applied afterwards can raise alpha back above
+        the normalized value once sum(x_i^2) is large enough, turning the
+        overshoot guard into an error amplifier.
+        """
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        feature_dim = 100
+        state = optimizer.init(feature_dim=feature_dim)
+
+        observation = jnp.ones(feature_dim) * magnitude
+        error = jnp.array(1.0)
+        result = optimizer.update(state, error, observation)
+
+        effective = (
+            jnp.sum(result.new_state.step_sizes * observation**2)
+            + result.new_state.bias_step_size
+        )
+        assert float(effective) <= 1.0 + 1e-4
+
+        prediction_change = float(
+            jnp.dot(result.weight_delta, observation) + result.bias_delta
+        )
+        assert abs(1.0 - prediction_change) <= 1.0 + 1e-4
+
+    def test_overshoot_bound_holds_on_gradient_path_at_large_scale(self):
+        """The shape-generic path shares the Algorithm 5 guarantee."""
+        optimizer = Autostep(initial_step_size=0.01, meta_step_size=0.01)
+        state = optimizer.init_for_shape((100,))
+        gradient = jnp.ones(100) * 1e4
+        error = jnp.array(1.0)
+
+        step, new_state = optimizer.update_from_gradient(state, gradient, error=error)
+
+        effective = float(jnp.sum(new_state.step_sizes * gradient**2))
+        assert effective <= 1.0 + 1e-4
 
     def test_normalizer_tracks_meta_gradient_not_primary(self):
         """v_i should track |δ*x*h| (meta-gradient), not |δ*x| (primary gradient)."""
@@ -717,6 +802,80 @@ class TestAutostepGTDLambda:
         chex.assert_trees_all_close(result2.new_state.eligibility_traces, expected, atol=1e-6)
 
 
+    def test_bias_update_uses_accumulated_bias_eligibility(self):
+        """The bias is a weight on the constant feature, so it must use z_bias."""
+        optimizer = AutostepGTDLambda(
+            initial_step_size=0.01, meta_step_size=0.0, trace_decay=0.5
+        )
+        state = optimizer.init(feature_dim=1)
+        observation = jnp.array([1.0], dtype=jnp.float32)
+        error = jnp.array(1.0, dtype=jnp.float32)
+
+        first = optimizer.update(state, error, observation)
+        second = optimizer.update(first.new_state, error, observation)
+
+        assert float(second.new_state.bias_eligibility_trace) == pytest.approx(1.5)
+        assert float(second.bias_delta) == pytest.approx(0.015, rel=1e-6)
+        chex.assert_trees_all_close(second.bias_delta, second.weight_delta[0], rtol=1e-6)
+
+    def test_constant_feature_weight_and_bias_paths_stay_symmetric(self):
+        """With a constant unit feature, z_weight == z_bias must force exact
+        weight/bias symmetry through meta-gradient, normalizer, effective-step
+        normalization, and delta (review finding on 27e35f6f: with the bias
+        eligibility only post-multiplied onto the delta, nonzero meta
+        adaptation diverged the two step sizes).
+
+        A nonzero meta step size and a nontrivial error sequence are required
+        to exercise the meta paths; ``meta_step_size=0`` hides the mismatch.
+        """
+        optimizer = AutostepGTDLambda(
+            initial_step_size=0.2, meta_step_size=0.1, tau=100.0, trace_decay=0.8
+        )
+        state = optimizer.init(feature_dim=1)
+        observation = jnp.array([1.0], dtype=jnp.float32)
+
+        result = None
+        for error_value in (1.0, -0.2, 0.7):
+            result = optimizer.update(
+                state, jnp.asarray(error_value, dtype=jnp.float32), observation
+            )
+            state = result.new_state
+
+        assert result is not None
+        # The accumulated traces coincide on the constant feature...
+        assert float(state.eligibility_traces[0]) == pytest.approx(2.44, abs=1e-6)
+        assert float(state.bias_eligibility_trace) == pytest.approx(2.44, abs=1e-6)
+        # ...so every adapted quantity must coincide exactly.
+        assert float(state.step_sizes[0]) == float(state.bias_step_size)
+        chex.assert_trees_all_close(
+            result.bias_delta, result.weight_delta[0], rtol=0.0, atol=0.0
+        )
+
+    def test_bias_eligibility_enters_effective_step_normalization(self):
+        """z_bias must sit inside the joint overshoot normalization, not only
+        scale the final delta. With ``meta_step_size=0`` the deltas have a
+        closed form: after two steps with ``trace_decay=0.5`` and observation
+        2, ``z_weight = 3`` and ``z_bias = 1.5``, so
+        ``M = max(0.2*9 + 0.2*2.25, 1) = 2.25`` and the deltas are
+        ``alpha/M * delta * z``. The post-scale variant normalizes the bias
+        with the stale implicit feature 1 instead (M = 2.0) and cannot match.
+        """
+        optimizer = AutostepGTDLambda(
+            initial_step_size=0.2, meta_step_size=0.0, tau=100.0, trace_decay=0.5
+        )
+        state = optimizer.init(feature_dim=1)
+        observation = jnp.array([2.0], dtype=jnp.float32)
+
+        first = optimizer.update(state, jnp.asarray(1.0, dtype=jnp.float32), observation)
+        second = optimizer.update(
+            first.new_state, jnp.asarray(-0.2, dtype=jnp.float32), observation
+        )
+
+        assert float(second.new_state.eligibility_traces[0]) == pytest.approx(3.0)
+        assert float(second.new_state.bias_eligibility_trace) == pytest.approx(1.5)
+        assert float(second.weight_delta[0]) == pytest.approx(0.2 / 2.25 * -0.2 * 3.0, rel=1e-5)
+        assert float(second.bias_delta) == pytest.approx(0.2 / 2.25 * -0.2 * 1.5, rel=1e-5)
+
 class TestObGD:
     """Tests for the ObGD optimizer."""
 
@@ -914,6 +1073,19 @@ class TestAdaptiveObGDBounding:
         chex.assert_trees_all_close(bounded[0], steps[0] / rms)
         chex.assert_trees_all_close(bounded[1], steps[1] / rms)
 
+    def test_large_finite_rms_stage_does_not_collapse(self):
+        bounder = AdaptiveObGDBounding(kappa=0.0, eps=0.0)
+        steps = (jnp.full((8,), 7e18, dtype=jnp.float32),)
+
+        bounded, scale = bounder.bound(
+            steps,
+            jnp.asarray(1.0, dtype=jnp.float32),
+            (jnp.zeros((8,), dtype=jnp.float32),),
+        )
+
+        assert float(scale) == 1.0
+        np.testing.assert_allclose(bounded[0], jnp.ones((8,)), rtol=1e-6)
+
     def test_produces_finite_zero_steps(self):
         """Zero steps should remain finite and unchanged."""
         bounder = AdaptiveObGDBounding()
@@ -1018,8 +1190,15 @@ class TestIDBDParamState:
         expected_h = -0.01 * 2.0 * jnp.ones(5)
         chex.assert_trees_all_close(new_state.traces, expected_h, atol=1e-6)
 
-    def test_meta_update_uses_prediction_grads_only(self):
-        """Meta-update should use z * h (no error), matching Meyer."""
+    def test_meta_update_uses_loss_gradient_correlation(self):
+        """Meta-update should use (-error * z) * h, matching Meyer.
+
+        Meyer's reference (idbd.py line 206) advances beta with
+        ``meta_lr * grad * h`` where ``grad`` is the loss gradient, so a
+        repeated identical error/gradient pair -- perfectly correlated
+        successive loss gradients -- must GROW the step-size (Sutton 1992's
+        defining property for the linear case z = x).
+        """
         optimizer = IDBD(initial_step_size=0.1, meta_step_size=0.1)
         state = optimizer.init_for_shape((3,))
 
@@ -1030,13 +1209,54 @@ class TestIDBDParamState:
         _, state = optimizer.update_from_gradient(state, z, error=error)
         log_alpha_after_1 = state.log_step_sizes
 
-        # Step 2: h = -alpha * error * z < 0, meta = z * h < 0
-        # With negative h, meta-gradient z * h < 0 -> step-size decreases
+        # Step 2: h = -alpha * error * z < 0, meta = (-error * z) * h > 0
         _, state = optimizer.update_from_gradient(state, z, error=error)
         log_alpha_after_2 = state.log_step_sizes
 
-        # Step-sizes should decrease (meta-gradient is negative)
+        assert jnp.all(log_alpha_after_2 > log_alpha_after_1)
+
+    def test_meta_update_shrinks_on_alternating_errors(self):
+        """Anti-correlated successive loss gradients must shrink step-sizes."""
+        optimizer = IDBD(initial_step_size=0.1, meta_step_size=0.1)
+        state = optimizer.init_for_shape((3,))
+        z = jnp.ones(3)
+
+        _, state = optimizer.update_from_gradient(state, z, error=jnp.array(1.0))
+        log_alpha_after_1 = state.log_step_sizes
+        _, state = optimizer.update_from_gradient(state, z, error=jnp.array(-1.0))
+        log_alpha_after_2 = state.log_step_sizes
+
         assert jnp.all(log_alpha_after_2 < log_alpha_after_1)
+
+    def test_step_size_adaptation_is_invariant_to_target_sign(self):
+        """Relabelling y -> -y mirrors the problem; alphas must not change.
+
+        The error path's step-size dynamics may depend only on gradient
+        correlations, never on the arbitrary sign convention of the target
+        (the linear ``update`` path already has this invariance).
+        """
+        optimizer = IDBD(initial_step_size=0.05, meta_step_size=0.05)
+        errors = [0.7, -0.3, 1.1, 0.4, -0.9, 0.6]
+        gradients = [
+            jnp.array([1.0, -0.5], dtype=jnp.float32),
+            jnp.array([0.3, 0.8], dtype=jnp.float32),
+            jnp.array([-0.6, 0.2], dtype=jnp.float32),
+        ] * 2
+
+        state_pos = optimizer.init_for_shape((2,))
+        state_neg = optimizer.init_for_shape((2,))
+        for error, z in zip(errors, gradients, strict=True):
+            _, state_pos = optimizer.update_from_gradient(
+                state_pos, z, error=jnp.array(error, dtype=jnp.float32)
+            )
+            _, state_neg = optimizer.update_from_gradient(
+                state_neg, z, error=jnp.array(-error, dtype=jnp.float32)
+            )
+
+        chex.assert_trees_all_close(
+            state_pos.log_step_sizes, state_neg.log_step_sizes, atol=1e-7
+        )
+        chex.assert_trees_all_close(state_pos.traces, -state_neg.traces, atol=1e-7)
 
     def test_loss_grads_mode(self):
         """loss_grads h_decay_mode should produce finite results."""
@@ -1228,11 +1448,11 @@ def test_optimizer_state_allocations_are_preflighted_at_exact_byte_bounds() -> N
     with pytest.raises(ValueError, match="ObGD state byte count"):
         ObGD().init(obgd_last + 1)
 
-    td_last = (float32_scalar_limit - 5) // 3
+    td_last = (float32_scalar_limit - 6) // 3
     with pytest.raises(ValueError, match="TDIDBD state byte count"):
         TDIDBD().init(td_last + 1)
 
-    auto_td_last = (float32_scalar_limit - 7) // 4
+    auto_td_last = (float32_scalar_limit - 8) // 4
     with pytest.raises(ValueError, match="AutoTDIDBD state byte count"):
         AutoTDIDBD().init(auto_td_last + 1)
 
@@ -1251,8 +1471,8 @@ def test_optimizer_parameter_shape_products_are_preflighted_without_allocation()
         (Autostep(), 3 * 4 + 5),
         (AutostepGTDLambda(), 4 * 4 + 7),
         (ObGD(), 4 + 5),
-        (TDIDBD(), 3 * 4 + 5),
-        (AutoTDIDBD(), 4 * 4 + 7),
+        (TDIDBD(), 3 * 4 + 6),
+        (AutoTDIDBD(), 4 * 4 + 8),
     ],
 )
 def test_optimizer_vector_state_resource_formulas_are_exact(

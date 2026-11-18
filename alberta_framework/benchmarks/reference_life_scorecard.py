@@ -32,6 +32,7 @@ from typing import Any, NoReturn, cast
 import jax
 import numpy as np
 
+from alberta_framework._bounded_containers import require_json_text_nesting
 from alberta_framework.core.oak import OaKConfig
 from alberta_framework.core.options import STOMPConfig
 from alberta_framework.core.prototype_agent import PrototypeAgentConfig
@@ -129,6 +130,7 @@ REFERENCE_LIFE_SCORECARD_PLAN_V1_SHA256 = (
 # A complete 144-shard aggregate is comfortably below this limit.  Keeping
 # the cap explicit prevents validation inputs from becoming an unbounded read.
 MAX_SCORECARD_JSON_INPUT_BYTES = 64 * 1024 * 1024
+_MAX_JSON_NESTING_DEPTH = 64
 MAX_SCORECARD_AGGREGATE_INPUT_BYTES = 256 * 1024 * 1024
 
 CONTROL_GATE_T_CRITICAL = 2.201
@@ -193,6 +195,15 @@ def canonical_json_bytes(value: Any) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise ValueError("value does not have a canonical JSON encoding") from exc
+
+
+def _admit_validator_payload(value: object, *, path: str) -> dict[str, Any]:
+    """Admit an exact, deeply canonical JSON object before validator access."""
+
+    if type(value) is not dict:
+        raise ValueError(f"{path}: validator payload must be an exact JSON object")
+    _validate_json_value(value, path=path)
+    return cast(dict[str, Any], value)
 
 
 def _sha256_json(value: Any) -> str:
@@ -984,8 +995,10 @@ def _sample_sd(values: Sequence[float]) -> float:
     return math.sqrt(math.fsum((value - average) ** 2 for value in values) / (len(values) - 1))
 
 
-def _stderr(values: Sequence[float]) -> float:
-    return _sample_sd(values) / math.sqrt(len(values)) if values else 0.0
+def _stderr(values: Sequence[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    return _sample_sd(values) / math.sqrt(len(values))
 
 
 def _paired_lcb(values: Sequence[float]) -> float | None:
@@ -1467,9 +1480,13 @@ def _open_output_parent(path: Path, *, create: bool) -> tuple[Path, int]:
 
     destination = Path(os.path.abspath(os.fspath(path)))
     parent = destination.parent
+    # Path traversal needs only search permission.  Linux O_PATH descriptors
+    # keep a search-only ancestor (for example a 0711 home or tenant root)
+    # usable as dir_fd without requiring read permission on it.
+    access = getattr(os, "O_PATH", os.O_RDONLY)
     descriptor = os.open(
         os.path.sep,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        access | os.O_DIRECTORY | os.O_CLOEXEC,
     )
     try:
         for component in parent.parts[1:]:
@@ -1482,7 +1499,7 @@ def _open_output_parent(path: Path, *, create: bool) -> tuple[Path, int]:
                     pass
             next_descriptor = os.open(
                 component,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                access | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
                 dir_fd=descriptor,
             )
             os.close(descriptor)
@@ -1504,11 +1521,24 @@ def _link_unnamed_file(file_fd: int, parent_fd: int, name: str) -> None:
         ctypes.c_int,
     )
     linkat.restype = ctypes.c_int
-    if linkat(file_fd, b"", parent_fd, os.fsencode(name), 0x1000) != 0:
-        error = ctypes.get_errno()
-        if error == errno.EEXIST:
-            raise FileExistsError(error, os.strerror(error), name)
-        raise OSError(error, os.strerror(error), name)
+    if linkat(file_fd, b"", parent_fd, os.fsencode(name), 0x1000) == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(error, os.strerror(error), name)
+
+    # AT_EMPTY_PATH requires CAP_DAC_READ_SEARCH on some otherwise capable
+    # Linux runtimes.  Following the procfs descriptor symlink publishes the
+    # same unnamed inode without weakening the create-only destination link.
+    if error in {errno.ENOENT, errno.EPERM}:
+        proc_fd_path = os.fsencode(f"/proc/self/fd/{file_fd}")
+        if linkat(-100, proc_fd_path, parent_fd, os.fsencode(name), 0x400) == 0:
+            return
+        fallback_error = ctypes.get_errno()
+        if fallback_error == errno.EEXIST:
+            raise FileExistsError(fallback_error, os.strerror(fallback_error), name)
+        raise OSError(fallback_error, os.strerror(fallback_error), name)
+    raise OSError(error, os.strerror(error), name)
 
 
 def write_new_json(path: Path, value: Any) -> Path:
@@ -1620,11 +1650,19 @@ def _load_json_strict_with_metadata(
             source = encoded.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError(f"{path}: strict JSON input is not UTF-8") from exc
-        payload = json.loads(
+        require_json_text_nesting(
             source,
-            object_pairs_hook=pairs_hook,
-            parse_constant=reject_constant,
+            max_depth=_MAX_JSON_NESTING_DEPTH,
+            name="scorecard JSON",
         )
+        try:
+            payload = json.loads(
+                source,
+                object_pairs_hook=pairs_hook,
+                parse_constant=reject_constant,
+            )
+        except RecursionError as exc:
+            raise ValueError("scorecard JSON exceeds the JSON nesting limit") from exc
     except ValueError:
         raise
     except (OSError, json.JSONDecodeError) as exc:
@@ -1860,6 +1898,110 @@ def _validate_environment_manifest_descriptor(value: Any, *, path: str) -> None:
         raise ValueError(f"{path} manifest identity does not recompute")
 
 
+_MAX_REPORTED_RESOLVED_MISMATCHES = 8
+_MAX_MISMATCH_VALUE_REPR = 160
+_MAX_REPORTED_AGGREGATE_FAILURES = 10
+_MISMATCH_TRUNCATION_NOTICE = "... additional diverging fields are not shown"
+
+
+def _bounded_mismatch_repr(value: object) -> str:
+    text = repr(value)
+    if len(text) > _MAX_MISMATCH_VALUE_REPR:
+        text = text[: _MAX_MISMATCH_VALUE_REPR - 3] + "..."
+    return text
+
+
+def _note_resolved_mismatch(failures: list[str], entry: str) -> bool:
+    """Append one diverging-field entry; return True once the report saturates."""
+
+    if len(failures) < _MAX_REPORTED_RESOLVED_MISMATCHES:
+        failures.append(entry)
+        return False
+    if failures[-1] != _MISMATCH_TRUNCATION_NOTICE:
+        failures.append(_MISMATCH_TRUNCATION_NOTICE)
+    return True
+
+
+def _collect_resolved_mismatches(
+    recorded: Any,
+    canonical: Any,
+    path: str,
+    failures: list[str],
+) -> None:
+    """Name the first diverging leaves between a record and its canonical rebuild.
+
+    The traversal mirrors :func:`_json_exact_equal` — exact types, dicts by key
+    sets, lists elementwise, floats by IEEE-754 bit pattern — so every reported
+    leaf is one the exact comparison actually rejected. The 2026-09-15
+    aggregate run (34950746882) failed 26 RiverSwim records on a single
+    float64 ulp of LAPACK kernel noise in ``oracle_average_reward``; naming
+    the diverging paths and both bit patterns in the error removes the
+    download-and-structural-diff forensics that failure otherwise requires.
+    """
+
+    mismatch = (
+        f"{path} holds {_bounded_mismatch_repr(recorded)} where the canonical "
+        f"components hold {_bounded_mismatch_repr(canonical)}"
+    )
+    if type(recorded) is not type(canonical):
+        _note_resolved_mismatch(failures, mismatch)
+        return
+    if type(recorded) is dict:
+        for key in sorted(set(recorded) - set(canonical)):
+            if _note_resolved_mismatch(
+                failures, f"{path}.{key} is missing from the canonical components"
+            ):
+                return
+        for key in sorted(set(canonical) - set(recorded)):
+            if _note_resolved_mismatch(
+                failures, f"{path}.{key} is missing from the record"
+            ):
+                return
+        for key in sorted(set(recorded) & set(canonical)):
+            _collect_resolved_mismatches(
+                recorded[key], canonical[key], f"{path}.{key}", failures
+            )
+            if failures and failures[-1] == _MISMATCH_TRUNCATION_NOTICE:
+                return
+        return
+    if type(recorded) is list:
+        if len(recorded) != len(canonical):
+            _note_resolved_mismatch(
+                failures,
+                f"{path} holds {len(recorded)} entries where the canonical "
+                f"components hold {len(canonical)}",
+            )
+            return
+        for index, (recorded_entry, canonical_entry) in enumerate(
+            zip(recorded, canonical)
+        ):
+            _collect_resolved_mismatches(
+                recorded_entry, canonical_entry, f"{path}[{index}]", failures
+            )
+            if failures and failures[-1] == _MISMATCH_TRUNCATION_NOTICE:
+                return
+        return
+    if type(recorded) is float:
+        # ``0.0 == -0.0`` and near-ulp neighbours compare equal with ``!=``;
+        # the exact comparison is the bit pattern, so report on that.
+        if struct.pack(">d", recorded) != struct.pack(">d", canonical):
+            _note_resolved_mismatch(failures, mismatch)
+        return
+    if recorded != canonical:
+        _note_resolved_mismatch(failures, mismatch)
+
+
+def _resolved_mismatch_report(
+    recorded: Mapping[str, Any],
+    canonical: Mapping[str, Any],
+    *,
+    path: str,
+) -> list[str]:
+    failures: list[str] = []
+    _collect_resolved_mismatches(dict(recorded), dict(canonical), path, failures)
+    return failures
+
+
 def _validate_resolved_components(
     resolved: Mapping[str, Any],
     *,
@@ -1913,9 +2055,13 @@ def _validate_resolved_components(
     canonical_runner = build_scorecard_runner(plan, spec)
     canonical_resolved = _resolved_components(plan, spec, canonical_runner)
     if not _json_exact_equal(dict(resolved), canonical_resolved):
+        mismatch_report = _resolved_mismatch_report(
+            resolved, canonical_resolved, path=path
+        )
         raise ValueError(
             f"{path} does not match the canonical resolved components for the "
-            "scheduled arm and exact environment definition"
+            "scheduled arm and exact environment definition; diverging fields: "
+            + "; ".join(mismatch_report)
         )
 
 
@@ -2081,6 +2227,38 @@ def _validate_metric_window(
     ):
         raise ValueError(f"{path}.reward_sum is outside the exact reward lattice")
     return reward_sum
+
+
+def _validate_riverswim_reward_visit_consistency(
+    *,
+    reward_sum: float,
+    event_count: int,
+    high_end_visit_count: int,
+    protocol: Mapping[str, Any],
+    path: str,
+) -> None:
+    """Reject reward totals that require more high-end decisions than visits."""
+
+    initial_high_end = int(protocol["initial_state"] == protocol["n_states"] - 1)
+    high_end_decision_bound = min(
+        event_count,
+        high_end_visit_count + initial_high_end,
+    )
+    non_high_end_maximum = max(
+        0.0,
+        float(np.float32(protocol["reward_left"])),
+    )
+    right_end_reward = float(np.float32(protocol["reward_right"]))
+    reward_upper_bound = (
+        event_count * non_high_end_maximum
+        + high_end_decision_bound
+        * max(0.0, right_end_reward - non_high_end_maximum)
+    )
+    tolerance = 1e-9 * max(1.0, abs(reward_sum), abs(reward_upper_bound))
+    if reward_sum > reward_upper_bound + tolerance:
+        raise ValueError(
+            f"{path} right-end rewards exceed high-end visits bound"
+        )
 
 
 def _validate_completed_outcome(
@@ -2312,6 +2490,13 @@ def _validate_completed_outcome(
         )
         if not _numerically_equal(rate, visits / horizon):
             raise ValueError(f"{path}.high_end_visit_rate is inconsistent")
+        _validate_riverswim_reward_visit_consistency(
+            reward_sum=reward_sum,
+            event_count=horizon,
+            high_end_visit_count=visits,
+            protocol=protocol,
+            path=path,
+        )
     else:
         raise ValueError(f"{path} has an unsupported environment")
 
@@ -2447,6 +2632,7 @@ def _validate_partial_outcome(
         if set(windows) != {"initial_a", "first_b", "return_a"}:
             raise ValueError(f"{path}.windows does not match the A/B/A contract")
         window = protocol["post_switch_window"]
+        window_reward_sums = [0.0, 0.0]
         for name, start, phase in (
             ("initial_a", 0, 0),
             ("first_b", phase_length, 1),
@@ -2459,7 +2645,7 @@ def _validate_partial_outcome(
                     raise ValueError(f"{path}.windows.{name} must be empty")
             else:
                 rewards = [float(item) for row in payoffs[phase] for item in row]
-                _validate_metric_window(
+                window_reward_sums[phase] += _validate_metric_window(
                     value,
                     event_count=expected_count,
                     oracle_reward=oracle_rewards[phase],
@@ -2468,6 +2654,13 @@ def _validate_partial_outcome(
                     reward_values=rewards,
                     path=f"{path}.windows.{name}",
                 )
+        if any(
+            window_sum > phase_sum + 1e-9
+            for window_sum, phase_sum in zip(
+                window_reward_sums, phase_reward_values, strict=True
+            )
+        ):
+            raise ValueError(f"{path}.windows exceed their switching-phase rewards")
         if partial["high_end_visit_count"] is not None or partial[
             "high_end_visit_rate"
         ] is not None:
@@ -2493,6 +2686,7 @@ def _validate_partial_outcome(
             raise ValueError(f"{path}.phase_reward_sums violates RiverSwim rewards")
         if set(windows) != {"early", "late"}:
             raise ValueError(f"{path}.windows does not match the RiverSwim contract")
+        window_reward_sum = 0.0
         for name, start, stop in (
             ("early", 0, protocol["early_window"]),
             ("late", horizon - protocol["late_window"], horizon),
@@ -2503,7 +2697,7 @@ def _validate_partial_outcome(
                 if value is not None:
                     raise ValueError(f"{path}.windows.{name} must be empty")
             else:
-                _validate_metric_window(
+                window_reward_sum += _validate_metric_window(
                     value,
                     event_count=expected_count,
                     oracle_reward=oracle_rewards[0],
@@ -2512,6 +2706,8 @@ def _validate_partial_outcome(
                     reward_values=river_rewards,
                     path=f"{path}.windows.{name}",
                 )
+        if window_reward_sum > phase_reward_values[0] + 1e-9:
+            raise ValueError(f"{path}.windows exceed the stationary reward sum")
         visits = partial["high_end_visit_count"]
         if type(visits) is not int or not 0 <= visits <= accepted:
             raise ValueError(f"{path}.high_end_visit_count is invalid")
@@ -2523,6 +2719,13 @@ def _validate_partial_outcome(
             rate_value = _require_finite_number(rate, path=f"{path}.high_end_visit_rate")
             if not _numerically_equal(rate_value, visits / accepted):
                 raise ValueError(f"{path}.high_end_visit_rate is inconsistent")
+        _validate_riverswim_reward_visit_consistency(
+            reward_sum=reward_sum,
+            event_count=accepted,
+            high_end_visit_count=visits,
+            protocol=protocol,
+            path=path,
+        )
     else:
         raise ValueError(f"{path} has an unsupported environment")
     expected_oracle = math.fsum(
@@ -2731,6 +2934,24 @@ def _validate_run_record(
         )
         if failure["stage"] in {"build", "init"} and failure["accepted_events"] != 0:
             raise ValueError(f"{path} pre-step failure cannot claim accepted events")
+        if failure["stage"] in {"build", "init"} and (
+            optional_durations["cold_step_seconds"] is not None or warmed_count != 0
+        ):
+            raise ValueError(f"{path}.telemetry claims step work before the step stage")
+        if failure["stage"] == "build" and optional_durations["setup_seconds"] is not None:
+            raise ValueError(f"{path}.telemetry claims setup completed after a build failure")
+        if failure["stage"] == "step":
+            accepted_events = failure["accepted_events"]
+            cold_step_recorded = optional_durations["cold_step_seconds"] is not None
+            if optional_durations["setup_seconds"] is None:
+                raise ValueError(f"{path}.telemetry omits setup before a step failure")
+            if not cold_step_recorded and warmed_count != 0:
+                raise ValueError(f"{path}.telemetry records warmed work without a cold step")
+            timed_step_count = int(cold_step_recorded) + warmed_count
+            if timed_step_count not in {accepted_events, accepted_events + 1}:
+                raise ValueError(
+                    f"{path}.telemetry timed step count differs from accepted events"
+                )
         if failure["stage"] == "build":
             if any(
                 resolved[field] is not None
@@ -2755,6 +2976,8 @@ def _validate_run_record(
 
 def validate_scorecard_artifact(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Strictly validate and recompute one scorecard aggregate."""
+
+    payload = _admit_validator_payload(payload, path="$")
 
     required = {
         "schema",
@@ -3366,6 +3589,7 @@ def validate_scorecard_run_record(
 ) -> dict[str, Any]:
     """Validate one shard against its canonical schedule identity."""
 
+    payload = _admit_validator_payload(payload, path="$")
     effective_plan = build_development_plan() if plan is None else plan
     environment = payload.get("environment_kind")
     arm = payload.get("arm")
@@ -3412,6 +3636,7 @@ def summarize_shard_files(
     if len(paths) != expected_count:
         raise ValueError(f"aggregate requires exactly {expected_count} shard paths")
     records: list[dict[str, Any]] = []
+    validation_failures: list[tuple[str, str]] = []
     seen_files: set[tuple[int, int]] = set()
     total_bytes = 0
     consistency_identities = _current_consistency_identities()
@@ -3426,12 +3651,37 @@ def summarize_shard_files(
             raise ValueError("aggregate shard paths must name unique regular files")
         seen_files.add(identity)
         total_bytes += metadata.st_size
-        validate_scorecard_run_record(
-            payload,
-            plan=effective_plan,
-            _consistency_identities=consistency_identities,
-        )
+        try:
+            validate_scorecard_run_record(
+                payload,
+                plan=effective_plan,
+                _consistency_identities=consistency_identities,
+            )
+        except ValueError as error:
+            # Collect instead of stopping at the first bad record: one run of
+            # the 144-shard campaign must yield the complete failure list, the
+            # way run 34950746882 hidden 26 of its 144 mismatches behind its
+            # first raise. Rejection semantics are unchanged.
+            validation_failures.append((str(path), str(error)))
+            continue
         records.append(payload)
+    if validation_failures:
+        shown = "; ".join(
+            f"{location}: {message}"
+            for location, message in validation_failures[
+                :_MAX_REPORTED_AGGREGATE_FAILURES
+            ]
+        )
+        hidden = len(validation_failures) - _MAX_REPORTED_AGGREGATE_FAILURES
+        raise ValueError(
+            f"{len(validation_failures)} of {len(paths)} shard records failed "
+            f"validation: {shown}"
+            + (
+                f"; {hidden} additional failed records are not shown"
+                if hidden > 0
+                else ""
+            )
+        )
     artifact = build_scorecard_artifact(effective_plan, records)
     validate_scorecard_artifact(artifact)
     return artifact

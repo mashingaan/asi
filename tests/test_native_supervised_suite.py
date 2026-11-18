@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sys
+from types import FrameType
+from typing import Any
 
 import jax
 import numpy as np
 import pytest
 
+from alberta_framework.benchmarks import native_supervised_suite as native_suite
 from alberta_framework.benchmarks.native_supervised_suite import (
     ARM_IDS,
     BENCHMARK_IDS,
@@ -146,6 +150,26 @@ def test_validator_rejects_promotion_and_counter_forgery() -> None:
         validate_result(dataclasses.asdict(result))
 
 
+def test_validator_rejects_forged_headline_accuracy() -> None:
+    """The headline must reconstruct from the retained per-task accuracies."""
+    images, labels = _fixture(10, (4, 4))
+    result = run_native_suite(
+        "split_mnist", images, labels, seed=FROZEN_SEEDS[0], examples_per_task=2
+    )
+    original = result.arms[0]
+    forged_accuracy = 0.0 if original.online_accuracy != 0.0 else 1.0
+    forged = dataclasses.replace(
+        result,
+        arms=(
+            dataclasses.replace(original, online_accuracy=forged_accuracy),
+            *result.arms[1:],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="accuracy record mismatch"):
+        validate_result(forged)
+
+
 @pytest.mark.parametrize(
     ("seed", "count"), [(True, 1), (FROZEN_SEEDS[0], True), (0, 1), (FROZEN_SEEDS[0], 65)]
 )
@@ -155,8 +179,60 @@ def test_hostile_axes_are_rejected(seed: object, count: object) -> None:
         build_task_stream("split_mnist", images, labels, seed=seed, examples_per_task=count)
 
 
+@pytest.mark.parametrize("arm_id", ("online_sgd", "replay_sgd"))
+def test_sgd_arms_reject_nonfinite_numeric_state_from_finite_inputs(arm_id: str) -> None:
+    task = native_suite.TaskBatch(
+        task_index=0,
+        inputs=np.full((2, 1), np.float32(1e30), dtype=np.float32),
+        labels=np.asarray((0, 1), dtype=np.int32),
+    )
+
+    with pytest.raises(ValueError, match="non-finite"):
+        native_suite._run_arm((task,), n_classes=2, capacity=1, arm_id=arm_id)
+
+
+def test_centroid_arm_rejects_nonfinite_numeric_state_from_finite_inputs() -> None:
+    task = native_suite.TaskBatch(
+        task_index=0,
+        inputs=np.full((2, 1), np.float32(3e38), dtype=np.float32),
+        labels=np.asarray((0, 0), dtype=np.int32),
+    )
+
+    with pytest.raises(ValueError, match="non-finite"):
+        native_suite._run_arm((task,), n_classes=2, capacity=1, arm_id="running_centroid")
+
+
 def test_catalog_cli_is_metadata_only(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["--catalog"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload == catalog_payload()
     assert payload["avalanche_revision"].endswith("eb075be393e1f458b2c352514ff6c17b5a2c0f4e")
+
+
+def test_replay_buffer_never_exceeds_the_reported_peak() -> None:
+    task = native_suite.TaskBatch(
+        task_index=0,
+        inputs=np.eye(4, dtype=np.float32),
+        labels=np.asarray((0, 1, 0, 1), dtype=np.int32),
+    )
+    observed: list[int] = []
+    code = native_suite._run_arm.__code__
+
+    def local(frame: FrameType, event: str, arg: Any) -> Any:
+        replay = frame.f_locals.get("replay")
+        if replay is not None:
+            observed.append(len(replay))
+        return local
+
+    def tracer(frame: FrameType, event: str, arg: Any) -> Any:
+        return local if frame.f_code is code else None
+
+    previous = sys.gettrace()
+    sys.settrace(tracer)
+    try:
+        arm = native_suite._run_arm((task,), n_classes=2, capacity=2, arm_id="replay_sgd")
+    finally:
+        sys.settrace(previous)
+
+    assert max(observed) == 2
+    assert arm.receipt.peak_replay_bytes == max(observed) * (4 * 4 + 4)

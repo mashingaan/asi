@@ -46,6 +46,7 @@ import operator
 from typing import Any, SupportsIndex, cast
 
 import chex
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
@@ -65,24 +66,21 @@ def _skip_zero_scale(scale: Array, value: Array) -> Array:
     return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
 
 
+def _finite_nonnegative_mean(values: Array) -> Array:
+    """Preserve an ordinary mean unless only its reduction overflowed."""
+    ordinary = jnp.mean(values)
+    scale = jnp.max(values)
+    _, exponent = jnp.frexp(scale)
+    scaled = jnp.ldexp(values, -exponent)
+    stable = jnp.ldexp(jnp.mean(scaled), exponent)
+    reduction_overflowed = ~jnp.isfinite(ordinary) & jnp.isfinite(scale)
+    return jnp.where(reduction_overflowed, stable, ordinary)
+
+
 # Paper default for the step-size floor: eta_min = e^-15.
 _INT32_MAX = 2**31 - 1
 _FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -117,10 +115,12 @@ def _swift_td_update_result_extras_bytes(feature_dim: int) -> int:
 
 
 def _swift_td_update_working_set_bytes(feature_dim: int) -> int:
-    """Source persist, proposed persist, committed persist, and returned extras."""
+    """Three persist copies, returned extras, and reduction fallback scratch."""
     return 3 * _swift_td_persistent_bytes(
         feature_dim
-    ) + _swift_td_update_result_extras_bytes(feature_dim)
+    ) + _swift_td_update_result_extras_bytes(feature_dim) + 4 * (
+        4 * (feature_dim + 1) + 5
+    ) + 4 * (2 * feature_dim + 6)
 
 
 def _preflight_swift_td_update_working_set(feature_dim: int) -> None:
@@ -131,23 +131,53 @@ def _preflight_swift_td_update_working_set(feature_dim: int) -> None:
 
 _DEFAULT_ETA_MIN = math.exp(-15.0)
 
+
+def _bounded_trace_increment(
+    log_step_sizes: Array, phi: Array, eta: Array
+) -> tuple[Array, Array, Array]:
+    """Evaluate the existing bound without losing representable increments.
+
+    Keep ordinary arithmetic unchanged. When squared features overflow or
+    the bound times alpha underflows before multiplication by phi, evaluate
+    the same expression in log space. The always-on bias guarantees at least
+    one nonzero feature. The reported scale may itself round to zero even
+    when the complete bounded increment is representable.
+    """
+    alphas = jnp.exp(log_step_sizes)
+    tau = jnp.sum(alphas * phi**2)
+    bound_scale = jnp.minimum(1.0, eta / tau)
+    scaled_alphas = bound_scale * alphas
+    increment = scaled_alphas * phi
+    needs_stable_bound = (
+        ~jnp.isfinite(tau)
+        | ~jnp.all(jnp.isfinite(increment))
+        | jnp.any((scaled_alphas == 0.0) & (phi != 0.0))
+    )
+
+    def stable_bound() -> tuple[Array, Array, Array]:
+        log_abs_phi = jnp.log(jnp.abs(phi))
+        log_energy = log_step_sizes + 2.0 * log_abs_phi
+        peak = jnp.max(log_energy)
+        log_tau = peak + jnp.log(jnp.sum(jnp.exp(log_energy - peak)))
+        log_eta = jnp.log(eta)
+        log_scale = jnp.minimum(0.0, log_eta - log_tau)
+        stable_increment = jnp.sign(phi) * jnp.exp(log_step_sizes + log_abs_phi + log_scale)
+        return stable_increment, jnp.exp(log_scale), log_tau > log_eta
+
+    return cast(
+        tuple[Array, Array, Array],
+        jax.lax.cond(
+            needs_stable_bound, stable_bound, lambda: (increment, bound_scale, tau > eta)
+        ),
+    )
+
 _SUPPORTED_CONFIG_REAL_TYPES: tuple[type[object], ...] = (
     int,
     float,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.longlong,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.ulonglong,
-    np.float16,
-    np.float32,
-    np.float64,
-    np.longdouble,
+    *(
+        np.dtype(code).type
+        for code in ("b", "B", "h", "H", "i", "I", "l", "L", "q", "Q", "e", "f", "d", "g")
+    ),
 )
 
 
@@ -493,12 +523,11 @@ class SwiftTD:
         # --- Trace extension for phi (second loop of Algorithm 1) ---
         # True Online correction: change the previous update made to V(phi).
         v_delta = jnp.dot(state.prev_weight_update, phi)
-        alphas = jnp.exp(state.log_step_sizes)
         # Correction ratio tau = sum_i alpha_i * phi_i^2; the overshoot bound
         # caps the effective ratio of this update at eta.
-        tau = jnp.sum(alphas * phi**2)
-        bound_scale = jnp.minimum(1.0, eta / tau)
-        z_delta = bound_scale * alphas * phi
+        z_delta, bound_scale, decay_triggered = _bounded_trace_increment(
+            state.log_step_sizes, phi, eta
+        )
         trace_dot = jnp.dot(state.eligibility_traces, phi)
         z_ext = state.eligibility_traces + z_delta * (1.0 - trace_dot)
         p_ext = state.p_traces + state.h_old_traces * phi
@@ -514,10 +543,14 @@ class SwiftTD:
         # Step-size decay: when the bound is active, decay the step-sizes of
         # the features responsible (proportional to phi_i^2) and reset the
         # meta-learning traces.
-        decay_triggered = tau > eta
         log_alphas = jnp.where(
             decay_triggered,
-            state.log_step_sizes + jnp.log(state.step_size_decay) * phi**2,
+            jnp.clip(
+                state.log_step_sizes
+                + _skip_zero_scale(jnp.log(state.step_size_decay), phi**2),
+                jnp.log(state.eta_min),
+                jnp.log(eta),
+            ),
             state.log_step_sizes,
         )
         h_ext = jnp.where(decay_triggered, 0.0, state.h_traces)
@@ -534,7 +567,11 @@ class SwiftTD:
 
         # Meta-update: beta_i += (theta / alpha_i) * (delta' - v_delta) * p_i,
         # clipped to [ln(eta_min), ln(eta)].
-        meta_delta = (theta / jnp.exp(log_alphas)) * (delta - v_delta) * p_ext
+        # A zero meta trace contributes exactly zero even if the unused
+        # learning-rate/error prefactor overflows for a valid transition.
+        meta_delta = _skip_zero_scale(
+            p_ext, (theta / jnp.exp(log_alphas)) * (delta - v_delta)
+        )
         new_log_step_sizes = jnp.where(
             jnp.isfinite(meta_delta),
             jnp.clip(
@@ -578,10 +615,10 @@ class SwiftTD:
 
         weight_alphas = jnp.exp(new_log_step_sizes[:-1])
         candidate_metrics = {
-            "mean_step_size": jnp.mean(weight_alphas),
+            "mean_step_size": _finite_nonnegative_mean(weight_alphas),
             "min_step_size": jnp.min(weight_alphas),
             "max_step_size": jnp.max(weight_alphas),
-            "mean_eligibility_trace": jnp.mean(jnp.abs(new_z[:-1])),
+            "mean_eligibility_trace": _finite_nonnegative_mean(jnp.abs(new_z[:-1])),
             "bound_scale": bound_scale,
             "decay_triggered": decay_triggered.astype(jnp.float32),
         }

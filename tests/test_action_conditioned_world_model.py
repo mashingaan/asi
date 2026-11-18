@@ -150,6 +150,28 @@ def test_action_conditioned_world_model_rejects_size_one_scalar_aliases(
         jax.jit(call)()
 
 
+def test_action_conditioned_world_model_preserves_wide_integer_action_identity() -> None:
+    """A legal int32 action must not be rounded through float32 before encoding."""
+    expected_action = 2**24 + 1
+    model = ActionConditionedWorldModel(
+        ActionConditionedWorldModelConfig(
+            observation_dim=1,
+            n_actions=expected_action + 1,
+            hidden_sizes=(),
+        )
+    )
+    action = jnp.asarray(expected_action, dtype=jnp.int32)
+
+    @jax.jit
+    def selected_entries(value: jax.Array) -> jax.Array:
+        encoded = model.encode_action(value)
+        # Consume only the two relevant entries so XLA can fuse away the
+        # logically large one-hot vector required to expose the float32 cliff.
+        return jnp.asarray([encoded[expected_action], encoded[expected_action - 1]])
+
+    np.testing.assert_array_equal(selected_entries(action), [1.0, 0.0])
+
+
 def test_action_world_model_preserves_direct_numeric_dtype_canonicalization() -> None:
     model = ActionConditionedWorldModel(
         ActionConditionedWorldModelConfig(
@@ -171,6 +193,50 @@ def test_action_world_model_preserves_direct_numeric_dtype_canonicalization() ->
     )
     assert features.dtype == jnp.float32
     assert targets.dtype == jnp.float32
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["observation", "action", "reward", "discount", "next_observation"],
+)
+def test_action_world_model_update_rejects_complex_operands(field: str) -> None:
+    """A direct update must not discard imaginary transition components."""
+    model = ActionConditionedWorldModel(
+        ActionConditionedWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            hidden_sizes=(),
+            sparsity=0.0,
+        )
+    )
+    state = model.init(jr.key(13))
+    values = {
+        "observation": jnp.zeros((2,), dtype=jnp.float32),
+        "action": jnp.asarray(0, dtype=jnp.int32),
+        "reward": jnp.asarray(0.5, dtype=jnp.float32),
+        "discount": jnp.asarray(0.9, dtype=jnp.float32),
+        "next_observation": jnp.ones((2,), dtype=jnp.float32),
+    }
+    values[field] = jnp.full(
+        values[field].shape,
+        1.0 + 2.0j,
+        dtype=jnp.complex64,
+    )
+
+    def call() -> object:
+        return model.update(
+            state,
+            values["observation"],
+            values["action"],
+            values["reward"],
+            values["discount"],
+            values["next_observation"],
+        )
+
+    with pytest.raises(ValueError, match=rf"{field} must have a real numeric dtype"):
+        call()
+    with pytest.raises(ValueError, match=rf"{field} must have a real numeric dtype"):
+        jax.jit(call)()
 
 
 def test_action_conditioned_world_model_update_and_prediction_shapes() -> None:
@@ -222,6 +288,28 @@ def test_action_conditioned_world_model_config_roundtrip() -> None:
     )
     chex.assert_shape(features, (7,))
     chex.assert_trees_all_close(features[-4:], jnp.array([0.0, 0.0, 1.0, 0.0]))
+
+
+@pytest.mark.parametrize("tamper", ["missing_type", "wrong_type", "extra_field"])
+def test_action_world_model_from_config_rejects_noncanonical_outer_schema(
+    tamper: str,
+) -> None:
+    payload = ActionConditionedWorldModel(
+        ActionConditionedWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            hidden_sizes=(),
+        )
+    ).to_config()
+    if tamper == "missing_type":
+        del payload["type"]
+    elif tamper == "wrong_type":
+        payload["type"] = "OneStepWorldModel"
+    else:
+        payload["undeclared"] = None
+
+    with pytest.raises(ValueError, match="fields|type"):
+        ActionConditionedWorldModel.from_config(payload)
 
 
 def test_action_conditioned_world_model_optional_interaction_features() -> None:
@@ -370,6 +458,76 @@ def test_action_conditioned_world_model_scan_loop_shapes() -> None:
     chex.assert_tree_all_finite(result.prediction_errors)
 
 
+def test_action_conditioned_world_model_scan_preserves_initialized_host_clocks() -> None:
+    model = ActionConditionedWorldModel(
+        ActionConditionedWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            hidden_sizes=(),
+            step_size=0.05,
+            sparsity=0.0,
+        )
+    )
+    initial = model.init(jr.key(17))
+    initial = dataclasses.replace(
+        initial,
+        learner_state=dataclasses.replace(
+            initial.learner_state,
+            birth_timestamp=1700000000.125,
+            uptime_s=12.5,
+        ),
+    )
+    observations = jnp.array([[1.0, 0.0], [0.0, 1.0]], dtype=jnp.float32)
+    next_observations = observations[::-1]
+    actions = jnp.array([0, 1], dtype=jnp.int32)
+    rewards = jnp.array([0.5, -0.25], dtype=jnp.float32)
+    discounts = jnp.array([0.99, 0.0], dtype=jnp.float32)
+    result = run_action_conditioned_world_model_learning_loop(
+        model, initial, observations, actions, rewards, next_observations, discounts
+    )
+    continued = run_action_conditioned_world_model_learning_loop(
+        model,
+        result.state,
+        observations,
+        actions,
+        rewards,
+        next_observations,
+        discounts,
+    )
+
+    for returned in (result.state, continued.state):
+        assert type(returned.learner_state.birth_timestamp) is float
+        assert returned.learner_state.birth_timestamp == 1700000000.125
+        assert type(returned.learner_state.uptime_s) is float
+        assert returned.learner_state.uptime_s == 12.5
+    assert int(continued.state.step_count) == 4
+
+
+@pytest.mark.parametrize("dtype", [np.int64, np.uint64])
+def test_action_world_model_scan_rejects_wide_host_integer_action(dtype) -> None:
+    """Host integers outside int32 cannot wrap onto a legal scan action."""
+    model = ActionConditionedWorldModel(
+        ActionConditionedWorldModelConfig(
+            observation_dim=1,
+            n_actions=2,
+            hidden_sizes=(),
+            sparsity=0.0,
+        )
+    )
+    observations = jnp.zeros((1, 1), dtype=jnp.float32)
+    result = run_action_conditioned_world_model_learning_loop(
+        model,
+        model.init(jr.key(0)),
+        observations,
+        np.asarray([2**32], dtype=dtype),
+        jnp.zeros((1,), dtype=jnp.float32),
+        observations,
+    )
+
+    assert not bool(result.updates_applied[0])
+    assert int(result.state.step_count) == 0
+
+
 def test_default_discounts_do_not_inherit_the_reward_dtype() -> None:
     """An integer or bool reward array must not truncate gamma into the default discounts."""
     config = ActionConditionedWorldModelConfig(
@@ -464,7 +622,7 @@ class _FloatSpoof:
         ({"max_delta_scale": 1e100}, "max_delta_scale must remain finite once narrowed"),
         ({"reward_scale": 1e-100}, "reward_scale must remain positive once narrowed"),
         ({"max_delta_scale": 1e-100}, "max_delta_scale must remain positive once narrowed"),
-        ({"observation_scale": (1e-100, 1.0)}, "must remain positive once narrowed"),
+        ({"observation_scale": (1e-100, 1.0)}, r"must be >= 1\.1754943508222875e-38"),
         (
             {"utility_decay": 1.0 - 1e-10},
             r"utility_decay must remain in \[0.0, 1.0\) once narrowed",
@@ -711,6 +869,59 @@ def test_guarded_dreamer_rejects_warmup_and_accepts_after_real_updates() -> None
     chex.assert_shape(warm.transition.next_observation, (2,))
 
 
+def test_guarded_dreamer_keeps_terminal_discount_zero_under_min_discount() -> None:
+    """A zero model discount is the terminal signal and must survive the floor.
+
+    ``GuardedDreamer.propose`` clips the predicted discount into
+    ``[min_discount, max_discount]``. With ``min_discount > 0`` that floor
+    lifted a terminal prediction (discount zero) into a bootstrapping
+    transition. A continuing prediction below the floor still rises to it.
+    """
+
+    class _FixedDiscountModel:
+        """World model stub returning one fixed predicted discount."""
+
+        def __init__(self, discount: float) -> None:
+            self.config = ActionConditionedWorldModelConfig(
+                observation_dim=2, n_actions=2, hidden_sizes=()
+            )
+            self._discount = discount
+
+        def predict(self, state, observation, action):  # type: ignore[no-untyped-def]
+            del state, action
+            return WorldModelPrediction(
+                next_observation=jnp.asarray(observation, dtype=jnp.float32),
+                reward=jnp.array(1.0, dtype=jnp.float32),
+                raw_predictions=jnp.zeros((4,), dtype=jnp.float32),
+                discount=jnp.array(self._discount, dtype=jnp.float32),
+            )
+
+    model = ActionConditionedWorldModel(
+        ActionConditionedWorldModelConfig(
+            observation_dim=2, n_actions=2, hidden_sizes=(), step_size=0.05, sparsity=0.0
+        )
+    )
+    model_state = model.init(jr.key(1)).replace(
+        step_count=jnp.array(200, dtype=jnp.int32),
+        model_error_ema=jnp.array(0.0, dtype=jnp.float32),
+    )
+    dreamer = GuardedDreamer(
+        DreamingConfig(
+            warmup_steps=100, max_model_error_ema=100.0, max_uncertainty=1.0, min_discount=0.5
+        )
+    )
+    obs = jnp.array([0.0, 0.0], dtype=jnp.float32)
+    action = jnp.array(0, dtype=jnp.int32)
+
+    terminal = dreamer.propose(_FixedDiscountModel(0.0), model_state, obs, action)
+    assert bool(terminal.accepted)
+    assert float(terminal.transition.discount) == 0.0
+
+    continuing = dreamer.propose(_FixedDiscountModel(0.2), model_state, obs, action)
+    assert bool(continuing.accepted)
+    assert float(continuing.transition.discount) == 0.5
+
+
 def test_recent_observation_buffer_ring_and_sample() -> None:
     buffer = RecentObservationBuffer(capacity=2, observation_dim=3)
     state = buffer.init()
@@ -955,3 +1166,71 @@ def test_action_world_model_rolls_back_reduction_overflow() -> None:
     assert not bool(result.update_applied)
     assert float(result.observation_mse) == 0.0
     assert int(result.state.step_count) == 0
+
+
+def test_action_world_model_observation_scale_targets_paired_with_decode() -> None:
+    """Target normalization uses exact scale so decoded predictions match true delta."""
+    for scale in (1.0, 1e-3, 1e-6, 1e-7, 1e-9, 1e-12, 1e-20):
+        config = ActionConditionedWorldModelConfig(
+            observation_dim=1,
+            n_actions=2,
+            hidden_sizes=(),
+            step_size=0.05,
+            use_layer_norm=False,
+            predict_delta=True,
+            observation_scale=(scale,),
+        )
+        model = ActionConditionedWorldModel(config)
+        obs = jnp.asarray([1.0 * scale], dtype=jnp.float32)
+        next_obs = jnp.asarray([3.0 * scale], dtype=jnp.float32)
+        reward = jnp.asarray(0.0, dtype=jnp.float32)
+        discount = jnp.asarray(1.0, dtype=jnp.float32)
+
+        # Target normalized delta must be 2.0 exactly
+        targets = model.targets(obs, reward, discount, next_obs)
+        np.testing.assert_allclose(float(targets[0]), 2.0, rtol=1e-5)
+
+
+def test_absolute_decode_is_not_bounded_by_the_delta_clip() -> None:
+    """``max_delta_scale`` bounds a delta; it must not truncate absolute decodes.
+
+    With ``predict_delta=False`` the training target built by the model is
+    ``next_obs / observation_scale`` -- an absolute normalized observation, with
+    no ``max_delta_scale`` bound applied.  Clipping the same head to
+    +/-``max_delta_scale`` at prediction time makes the model structurally unable
+    to return what it was trained to produce for any observation whose normalized
+    magnitude exceeds that bound.
+    """
+    target = 12.0
+    config = ActionConditionedWorldModelConfig(
+        observation_dim=1,
+        n_actions=2,
+        predict_delta=False,
+        observation_scale=(1.0,),
+        max_delta_scale=5.0,
+        hidden_sizes=(),
+        step_size=0.2,
+        use_layer_norm=False,
+    )
+    model = ActionConditionedWorldModel(config)
+    state = model.init(jr.key(0))
+    observation = jnp.array([0.0], dtype=jnp.float32)
+    next_observation = jnp.array([target], dtype=jnp.float32)
+    action = jnp.array(0, dtype=jnp.int32)
+    for _ in range(600):
+        state = model.update(
+            state,
+            observation,
+            action,
+            jnp.asarray(0.0, dtype=jnp.float32),
+            jnp.asarray(0.99, dtype=jnp.float32),
+            next_observation,
+        ).state
+
+    prediction = model.predict(state, observation, action)
+    learned = float(jnp.asarray(prediction.raw_predictions)[0])
+    decoded = float(jnp.asarray(prediction.next_observation)[0])
+
+    # The head really did learn the absolute target, so this is a decode bug.
+    assert learned == pytest.approx(target, abs=0.5)
+    assert decoded == pytest.approx(target, abs=0.5)

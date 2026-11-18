@@ -35,6 +35,10 @@ from jaxtyping import Float, Int
 
 from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.horde import HordeLearner
+from alberta_framework.core.learners import (
+    _gradient_step_error,
+    _update_from_gradient_with_diagnostics,
+)
 from alberta_framework.core.multi_head_learner import (
     MULTI_HEAD_MLP_STATE_SCHEMA,
     AnyOptimizer,
@@ -99,21 +103,7 @@ _PREDICTION_DEMON_CONFIG_FIELDS = {
     "cumulant_index",
     "terminal_reward",
 }
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _ACTUAL_FLOAT_TYPES = frozenset({float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))})
 
 
@@ -243,7 +233,16 @@ def _preflight_sarsa_direct_state(
     )
     final_width = hidden_sizes[-1] if hidden_sizes else feature_dim
     head_parameters = n_heads * (final_width + 1)
-    horde_direct_scalars = 2 * (trunk_parameters + head_parameters) + sum(hidden_sizes) + 3
+    # Params and traces are one copy each (2x); the LMS optimizer state adds
+    # one scalar step size per (weight, bias) pair: two per trunk layer and
+    # two per head. The +3 covers step_count plus the two step_words.
+    horde_direct_scalars = (
+        2 * (trunk_parameters + head_parameters)
+        + sum(hidden_sizes)
+        + 2 * len(hidden_sizes)
+        + 2 * n_heads
+        + 3
+    )
     # last_observation, last_action, epsilon, step_count, and the two-word
     # Threefry key are all four-byte public-state leaves.
     aggregate_scalars = horde_direct_scalars + feature_dim + 5
@@ -356,7 +355,8 @@ class SARSAUpdateResult:
 
     Attributes:
         state: Updated SARSA state (includes new action a_{t+1})
-        action: Next action a_{t+1} selected for the new state
+        action: Next action a_{t+1} selected for the new state; the prior
+            action when the update is rejected and the state rolls back
         q_values: Q-values for all actions at s_{t+1}
         td_error: TD error for the taken action
         reward: Reward received
@@ -627,6 +627,32 @@ class SARSAAgent:
         """Number of discrete actions."""
         return self._sarsa_config.n_actions
 
+    def reset_control_traces(self, state: SARSAState) -> SARSAState:
+        """Clear the control-head eligibility traces at an episode boundary.
+
+        ``update`` clears these traces itself when ``terminated`` is set, and
+        skips the bootstrap at the same time. A truncated episode, or one cut
+        off by ``run_sarsa_episode``'s ``max_steps``, keeps its bootstrap (the
+        last state is not terminal) but still ends the trajectory, so credit
+        accumulated in the traces must not be applied to the first update of
+        the next, unrelated episode. Parameters, optimizer states,
+        prediction-demon traces, and counters are untouched.
+        """
+        if type(state) is not SARSAState:
+            raise ValueError("state must be a SARSAState")
+        n_actions = self._sarsa_config.n_actions
+        head_traces = list(state.learner_state.head_traces)
+        for i in range(n_actions):
+            w_trace, b_trace = head_traces[i]
+            head_traces[i] = (jnp.zeros_like(w_trace), jnp.zeros_like(b_trace))
+        learner_state = state.learner_state.replace(  # type: ignore[attr-defined]
+            head_traces=tuple(head_traces)
+        )
+        return cast(
+            SARSAState,
+            state.replace(learner_state=learner_state),  # type: ignore[attr-defined]
+        )
+
     def to_config(self) -> dict[str, Any]:
         """Serialize agent configuration to dict."""
         horde_config = self._horde.to_config()
@@ -847,6 +873,41 @@ class SARSAAgent:
             jax.lax.cond(policy_valid, lambda: key, lambda: state.rng_key),
         )
 
+    def _credit_control_trace(
+        self,
+        state: MultiHeadMLPState,
+        index: int,
+        traces: tuple[Array, Array],
+        error: Array,
+    ) -> tuple[Array, Array, tuple[Array, Array], tuple[Any, Any], Array]:
+        """Apply the shared SARSA error to an inactive head's decayed trace."""
+        learner = self._horde.learner
+        optimizer = (
+            learner.head_optimizer if learner.head_optimizer is not None else learner.optimizer
+        )
+        weights, biases = state.head_params.weights[index], state.head_params.biases[index]
+        old_w_opt, old_b_opt = state.head_optimizer_states[index]
+        w_trace, b_trace = traces
+        w_step, w_opt, w_applied = _update_from_gradient_with_diagnostics(
+            optimizer, old_w_opt, w_trace, error=error, param=weights
+        )
+        b_step, b_opt, b_applied = _update_from_gradient_with_diagnostics(
+            optimizer, old_b_opt, b_trace, error=error, param=biases
+        )
+        step_error = _gradient_step_error(optimizer, error)
+        bounder = learner._bounder
+        if bounder is not None:
+            (w_step, b_step), _scale = bounder.bound(
+                (w_step, b_step), step_error, (weights, biases)
+            )
+        return (
+            weights + step_error * w_step,
+            biases + step_error * b_step,
+            (w_trace, b_trace),
+            (w_opt, b_opt),
+            w_applied & b_applied,
+        )
+
     @functools.partial(jax.jit, static_argnums=(0,))
     def update(
         self,
@@ -860,8 +921,9 @@ class SARSAAgent:
         """Perform one SARSA update step.
 
         Computes the SARSA target ``r + gamma * Q(s', a')`` and updates
-        the Horde. Only the previously-taken action's head receives the
-        target; all other Q-heads get NaN (no update).
+        the Horde. Only the previously-taken action's head receives a new
+        prediction gradient. With nonzero lambda, the same TD error also
+        updates other control heads through their decayed eligibility traces.
 
         Args:
             state: Current SARSA state
@@ -978,9 +1040,19 @@ class SARSAAgent:
         # Horde update: learns from (s_t, cumulants, s'). Control heads use
         # zero transition discounts (the SARSA target above already contains
         # the gamma * Q(s', a') bootstrap); prediction demons keep their
-        # configured gammas. Head traces still decay by the spec's
-        # gamma * lamda, which is what makes this SARSA(lambda).
+        # configured gammas on continuing transitions, but a terminal
+        # transition must not bootstrap any demon: s' is terminal (in
+        # continuing mode it is already the next episode's reset
+        # observation), so every discount is zero and the prediction target
+        # is the cumulant plus the demon's terminal reward. Head traces
+        # still decay by the spec's gamma * lamda, which is what makes
+        # this SARSA(lambda).
         discounts = self._horde.horde_spec.gammas.at[:n_actions].set(0.0)
+        discounts = jnp.where(
+            safe_terminated != 0,
+            jnp.zeros_like(discounts),
+            discounts,
+        )
         horde_result = self._horde.update_with_discounts(
             state.learner_state,
             state.last_observation,
@@ -989,27 +1061,67 @@ class SARSAAgent:
             discounts,
         )
 
-        # SARSA(lambda) trace maintenance. The inner learner decays only the
-        # active head's trace (inactive heads are frozen by NaN masking), so
-        # decay the untouched control heads here and clear all control-head
-        # traces at episode boundaries so credit never crosses a reset.
+        # SARSA(lambda) uses one TD error for every eligible state/action.
+        # Horde's NaN masking freezes inactive heads, so decay AND credit
+        # those heads here without adding the current observation gradient.
+        # Apply terminal credit before clearing traces for the next episode.
+        q_old = q_previous[safe_last_action]
+        td_error = jnp.where(action_valid, sarsa_target - q_old, 0.0)
         new_learner_state = horde_result.state
+        trace_updates_applied = jnp.asarray(True, dtype=jnp.bool_)
         if self._lamda > 0.0:
             gl = jnp.asarray(gamma * self._lamda, dtype=jnp.float32)
             head_traces = list(new_learner_state.head_traces)
+            head_weights = list(new_learner_state.head_params.weights)
+            head_biases = list(new_learner_state.head_params.biases)
+            head_opt_states = list(new_learner_state.head_optimizer_states)
             for i in range(n_actions):
                 w_trace, b_trace = head_traces[i]
                 decay = jnp.where(state.last_action == i, 1.0, gl)
                 skipped_w = jnp.where(decay == 0.0, jnp.zeros_like(w_trace), decay * w_trace)
                 skipped_b = jnp.where(decay == 0.0, jnp.zeros_like(b_trace), decay * b_trace)
+                if gamma > 0.0:
+                    weights, biases, traces, opt_states, applied = jax.lax.cond(
+                        state.last_action != i,
+                        lambda: self._credit_control_trace(
+                            new_learner_state, i, (skipped_w, skipped_b), td_error
+                        ),
+                        lambda: (
+                            head_weights[i], head_biases[i], (skipped_w, skipped_b),
+                            head_opt_states[i], jnp.asarray(True, dtype=jnp.bool_),
+                        ),
+                    )
+                    head_weights[i], head_biases[i] = weights, biases
+                    skipped_w, skipped_b = traces
+                    head_opt_states[i] = opt_states
+                    trace_updates_applied = trace_updates_applied & applied
                 new_w = jnp.where(safe_terminated, jnp.zeros_like(w_trace), skipped_w)
                 new_b = jnp.where(safe_terminated, jnp.zeros_like(b_trace), skipped_b)
                 head_traces[i] = (new_w, new_b)
-            new_learner_state = new_learner_state.replace(head_traces=tuple(head_traces))
+            new_learner_state = new_learner_state.replace(
+                head_params=new_learner_state.head_params.replace(
+                    weights=tuple(head_weights), biases=tuple(head_biases)
+                ),
+                head_traces=tuple(head_traces),
+                head_optimizer_states=tuple(head_opt_states),
+            )
 
-        # TD error for the taken action
-        q_old = q_previous[safe_last_action]
-        td_error = jnp.where(action_valid, sarsa_target - q_old, 0.0)
+        # Prediction demons are not control heads, so the loop above does
+        # not touch them, but their traces must not carry past an episode
+        # boundary either: the terminal step's trace would otherwise be
+        # credited by the next episode's first TD error. Clear them at a
+        # terminal transition regardless of the control trace decay.
+        if self._n_prediction_demons > 0:
+            head_traces = list(new_learner_state.head_traces)
+            for i in range(n_actions, self._horde.n_demons):
+                w_trace, b_trace = head_traces[i]
+                head_traces[i] = (
+                    jnp.where(safe_terminated, jnp.zeros_like(w_trace), w_trace),
+                    jnp.where(safe_terminated, jnp.zeros_like(b_trace), b_trace),
+                )
+            new_learner_state = new_learner_state.replace(
+                head_traces=tuple(head_traces),
+            )
 
         # Epsilon decay
         cfg = self._sarsa_config
@@ -1042,6 +1154,7 @@ class SARSAAgent:
             & action_valid
             & inputs_valid
             & (horde_result.update_applied | zero_decay_trace_recovery)
+            & trace_updates_applied
             & candidate_valid
         )
         diagnostic_valid = (
@@ -1056,7 +1169,11 @@ class SARSAAgent:
 
         return SARSAUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=jnp.where(transaction_applied, safe_next_action, -1),
+            # A rejected update rolls the state back, so the state keeps its
+            # prior action: report it instead of the -1 refusal sentinel,
+            # or the recorded action diverges from the action the state
+            # credits in learning. Only a missing prior action keeps -1.
+            action=jnp.where(transaction_applied, safe_next_action, state.last_action),
             q_values=jnp.where(transaction_applied, q_next, jnp.zeros_like(q_next)),
             td_error=jnp.where(diagnostic_valid, td_error, 0.0),
             reward=jnp.where(jnp.isfinite(raw_reward), raw_reward, 0.0),
@@ -1066,6 +1183,21 @@ class SARSAAgent:
 # =============================================================================
 # Learning Loops
 # =============================================================================
+
+
+def _dispatchable_action(action: Array) -> int:
+    """Return an environment action, refusing the rejected-decision sentinel.
+
+    :meth:`SARSAAgent.select_action` returns ``-1`` for a non-finite
+    observation or state. That value only marks the refusal: an environment
+    would read it as an ordinary (often last-index) action.
+    """
+    action_id = int(action)
+    if action_id < 0:
+        raise ValueError(
+            "SARSA rejected the decision, so no action can be dispatched to the environment"
+        )
+    return action_id
 
 
 def run_sarsa_episode(
@@ -1107,7 +1239,9 @@ def run_sarsa_episode(
 
     for _ in range(max_steps):
         # Step environment
-        next_obs, reward, terminated, truncated, _info = env.step(int(action))
+        next_obs, reward, terminated, truncated, _info = env.step(
+            _dispatchable_action(action)
+        )
         next_obs = jnp.asarray(next_obs, dtype=jnp.float32).flatten()
         reward_arr = jnp.array(reward, dtype=jnp.float32)
         term_arr = jnp.array(terminated, dtype=jnp.float32)
@@ -1128,7 +1262,17 @@ def run_sarsa_episode(
         action = next_action
 
         if terminated or truncated:
+            if truncated and not terminated:
+                # The update above bootstrapped correctly (no terminal), but
+                # the episode still ends here: never let its eligibility
+                # traces credit the next episode's first transition.
+                state = agent.reset_control_traces(state)
             break
+    else:
+        # The max_steps budget ran out before either flag ended the episode.
+        # The next call resets the environment just as it does after a
+        # truncation, so the traces must not carry over either.
+        state = agent.reset_control_traces(state)
 
     return SARSAEpisodeResult(
         state=state,
@@ -1178,7 +1322,9 @@ def run_sarsa_continuing(
     total_reward = 0.0
 
     for _ in range(num_steps):
-        next_obs, reward, terminated, truncated, _info = env.step(int(action))
+        next_obs, reward, terminated, truncated, _info = env.step(
+            _dispatchable_action(action)
+        )
         next_obs = jnp.asarray(next_obs, dtype=jnp.float32).flatten()
         reward_arr = jnp.array(reward, dtype=jnp.float32)
 
@@ -1214,6 +1360,60 @@ def run_sarsa_continuing(
     )
 
 
+def _sarsa_successor_observations(
+    observations: Array,
+    terminated: Array,
+    next_observations: Array,
+) -> Array:
+    """Return the observation each row continues from, as ``run_sarsa_continuing`` does.
+
+    A terminal row never bootstraps, so the continuing runner hands the update
+    the reset observation instead: the next action is selected there and it
+    becomes the stored ``last_observation`` for the following row. In arrays
+    that reset observation is ``observations[t + 1]``. A terminal final row
+    has no following row and keeps ``next_observations[-1]``.
+    """
+    if observations.shape != next_observations.shape:
+        raise ValueError("observations and next_observations must have the same shape")
+    following = jnp.concatenate([observations[1:], next_observations[-1:]], axis=0)
+    ended = jnp.asarray(terminated) != 0
+    return jnp.where(ended[:, None], following, next_observations)
+
+
+def _require_sarsa_transition_continuity(
+    state: SARSAState,
+    observations: Array,
+    terminated: Array,
+    next_observations: Array,
+) -> None:
+    """Bind every declared current observation to the transition the scan consumes."""
+    if observations.ndim != 2 or next_observations.ndim != 2:
+        raise ValueError("SARSA observations must be rank-two transition arrays")
+    if terminated.ndim != 1:
+        raise ValueError("SARSA terminated flags must be a rank-one array")
+    if not bool(state.last_action >= 0):
+        raise ValueError("SARSA array state must be primed with a selected last_action")
+
+    source_matches = jnp.array_equal(
+        jnp.asarray(state.last_observation), observations[0]
+    )
+    if not bool(source_matches):
+        raise ValueError(
+            "SARSA transition continuity requires state.last_observation "
+            "to equal observations[0]"
+        )
+    if observations.shape[0] <= 1:
+        return
+
+    continuous_rows = jnp.all(next_observations[:-1] == observations[1:], axis=1)
+    nonterminal_rows = terminated[:-1] == 0
+    if not bool(jnp.all(~nonterminal_rows | continuous_rows)):
+        raise ValueError(
+            "SARSA transition continuity requires each nonterminal "
+            "next_observations[t] to equal observations[t + 1]"
+        )
+
+
 def run_sarsa_from_arrays(
     agent: SARSAAgent,
     state: SARSAState,
@@ -1227,6 +1427,11 @@ def run_sarsa_from_arrays(
     JIT-compiled for maximum throughput. Actions are selected on-policy
     within the scan. Use this loop when transitions are pre-collected
     arrays rather than produced by a live environment interaction loop.
+
+    Row ``t`` is the transition ``observations[t] -> next_observations[t]``.
+    As in :func:`run_sarsa_continuing`, a terminal row does not bootstrap and
+    the agent continues from the reset observation ``observations[t + 1]``:
+    the next action is selected there and stored for the following update.
 
     Args:
         agent: SARSA agent
@@ -1243,7 +1448,8 @@ def run_sarsa_from_arrays(
         TypeError: If an input is not a JAX array.
         ValueError: If ``observations`` is empty, exceeds the documented
             scan-length ceiling (``_SARSA_SEQUENCE_MAX_STEPS``), or the other
-            step arrays do not share its leading length.
+            step arrays do not share its leading length or describe the same
+            contiguous transitions consumed by the scan.
     """
     num_steps = _require_sarsa_sequence_length("observations", observations)
     _require_sarsa_matching_length("rewards", rewards, expected=num_steps)
@@ -1251,33 +1457,44 @@ def run_sarsa_from_arrays(
     _require_sarsa_matching_length(
         "next_observations", next_observations, expected=num_steps
     )
+    _require_sarsa_transition_continuity(
+        state, observations, terminated, next_observations
+    )
+
+    successor_observations = _sarsa_successor_observations(
+        observations, terminated, next_observations
+    )
 
     @jax.jit
     def _scan_fn(
         carry: SARSAState,
-        inputs: tuple[Array, Array, Array, Array],
+        inputs: tuple[Array, Array, Array],
     ) -> tuple[SARSAState, tuple[Array, Array, Array]]:
         s = carry
-        obs, r, term, next_obs = inputs
+        r, term, successor_obs = inputs
 
-        # Select next action for next_obs
-        next_action, new_key = agent.select_action(s, next_obs)
+        # Select the next action where the agent actually continues
+        next_action, new_key = agent.select_action(s, successor_obs)
         s = s.replace(rng_key=new_key)  # type: ignore[attr-defined]
 
-        # Update using current obs/reward/next_obs
-        result = agent.update(s, r, next_obs, term, next_action)
+        result = agent.update(s, r, successor_obs, term, next_action)
 
         return result.state, (result.q_values, result.td_error, result.action)
 
     t0 = time.time()
     final_state, (q_vals, td_errs, actions) = jax.lax.scan(
-        _scan_fn, state, (observations, rewards, terminated, next_observations)
+        _scan_fn, state, (rewards, terminated, successor_observations)
+    )
+    jax.block_until_ready(  # type: ignore[no-untyped-call]
+        (final_state, q_vals, td_errs, actions)
     )
     elapsed = time.time() - t0
 
-    # Update uptime on the inner learner state
+    # Host-only clocks are narrowed while carried through the traced scan.
+    # Restore the incoming values and advance uptime from the host clock.
     final_learner = final_state.learner_state.replace(  # type: ignore[attr-defined]
-        uptime_s=final_state.learner_state.uptime_s + elapsed,
+        birth_timestamp=state.learner_state.birth_timestamp,
+        uptime_s=state.learner_state.uptime_s + elapsed,
     )
     final_state = final_state.replace(learner_state=final_learner)  # type: ignore[attr-defined]
 
@@ -1306,7 +1523,8 @@ def run_sarsa_from_arrays_final_state(
         TypeError: If an input is not a JAX array.
         ValueError: If ``observations`` is empty, exceeds the documented
             scan-length ceiling (``_SARSA_SEQUENCE_MAX_STEPS``), or the other
-            step arrays do not share its leading length.
+            step arrays do not share its leading length or describe the same
+            contiguous transitions consumed by the scan.
     """
     num_steps = _require_sarsa_sequence_length("observations", observations)
     _require_sarsa_matching_length("rewards", rewards, expected=num_steps)
@@ -1314,27 +1532,37 @@ def run_sarsa_from_arrays_final_state(
     _require_sarsa_matching_length(
         "next_observations", next_observations, expected=num_steps
     )
+    _require_sarsa_transition_continuity(
+        state, observations, terminated, next_observations
+    )
+
+    successor_observations = _sarsa_successor_observations(
+        observations, terminated, next_observations
+    )
 
     @jax.jit
     def _scan_fn(
         carry: SARSAState,
-        inputs: tuple[Array, Array, Array, Array],
+        inputs: tuple[Array, Array, Array],
     ) -> tuple[SARSAState, None]:
         s = carry
-        _obs, r, term, next_obs = inputs
-        next_action, new_key = agent.select_action(s, next_obs)
+        r, term, successor_obs = inputs
+        next_action, new_key = agent.select_action(s, successor_obs)
         s = s.replace(rng_key=new_key)  # type: ignore[attr-defined]
-        result = agent.update(s, r, next_obs, term, next_action)
+        result = agent.update(s, r, successor_obs, term, next_action)
         return result.state, None
 
     t0 = time.time()
     final_state, _ = jax.lax.scan(
         _scan_fn,
         state,
-        (observations, rewards, terminated, next_observations),
+        (rewards, terminated, successor_observations),
     )
+    jax.block_until_ready(final_state)  # type: ignore[no-untyped-call]
     elapsed = time.time() - t0
+    # Same host-clock restore as run_sarsa_from_arrays.
     final_learner = final_state.learner_state.replace(  # type: ignore[attr-defined]
-        uptime_s=final_state.learner_state.uptime_s + elapsed,
+        birth_timestamp=state.learner_state.birth_timestamp,
+        uptime_s=state.learner_state.uptime_s + elapsed,
     )
     return final_state.replace(learner_state=final_learner)  # type: ignore[no-any-return, attr-defined]

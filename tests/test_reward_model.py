@@ -10,7 +10,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from alberta_framework.core.reward_model import RLSRewardModel, RLSRewardModelConfig
+from alberta_framework.core.reward_model import (
+    RLSRewardModel,
+    RLSRewardModelConfig,
+    RLSRewardModelState,
+)
 
 
 @pytest.mark.parametrize("operation", ["predict", "update"])
@@ -49,6 +53,39 @@ def test_rls_reward_model_feature_shape_guard_is_jit_stable() -> None:
     for call in (predict, update):
         with pytest.raises(ValueError, match=r"features must have shape \(4,\)"):
             call(jnp.ones((2, 2), dtype=jnp.float32))
+
+
+@pytest.mark.parametrize("operation", ["predict", "update"])
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "outer-jit"])
+@pytest.mark.parametrize(
+    "features",
+    [
+        pytest.param(jnp.asarray([True], dtype=jnp.bool_), id="boolean"),
+        pytest.param(jnp.asarray([1.0 + 7.0j], dtype=jnp.complex64), id="complex"),
+    ],
+)
+def test_rls_reward_model_rejects_non_real_feature_dtypes(
+    operation: str,
+    compiled: bool,
+    features: jax.Array,
+) -> None:
+    """Feature coercion must not turn bool or complex data into plausible rewards."""
+    model = RLSRewardModel(RLSRewardModelConfig(feature_dim=1))
+    state = model.init().replace(weights=jnp.asarray([2.0], dtype=jnp.float32))
+
+    def call(value: jax.Array) -> jax.Array:
+        if operation == "predict":
+            return model.predict(state, value)
+        return model.update(
+            state,
+            value,
+            jnp.asarray(3.0, dtype=jnp.float32),
+        ).state.weights
+
+    wrapped = jax.jit(call) if compiled else call
+
+    with pytest.raises(TypeError, match="features must be real numeric"):
+        wrapped(features)
 
 
 def test_rls_reward_model_config_roundtrip() -> None:
@@ -182,6 +219,28 @@ def test_rls_reward_model_rejects_values_invalid_after_float32_narrowing(
         RLSRewardModel(RLSRewardModelConfig.from_config(payload))
 
 
+def test_rls_reward_model_rejects_subnormal_ridge_before_covariance_init() -> None:
+    """An accepted ridge must remain a usable positive XLA divisor."""
+    subnormal = float(np.nextafter(np.float32(0), np.float32(1)))
+
+    with pytest.raises(ValueError, match="ridge must be at least"):
+        RLSRewardModelConfig(feature_dim=1, ridge=subnormal)
+
+    model = RLSRewardModel(
+        RLSRewardModelConfig(feature_dim=1, ridge=float(np.finfo(np.float32).tiny))
+    )
+    state = model.init()
+    result = model.update(
+        state,
+        jnp.ones((1,), dtype=jnp.float32),
+        jnp.array(1.0, dtype=jnp.float32),
+    )
+
+    chex.assert_tree_all_finite(state.covariance)
+    assert bool(result.update_applied)
+    assert int(result.state.step_count) == 1
+
+
 def test_rls_reward_model_canonicalizes_numpy_scalars() -> None:
     model = RLSRewardModel(
         RLSRewardModelConfig(
@@ -219,6 +278,63 @@ def test_rls_infinite_reward_on_zero_feature_does_not_poison_weights() -> None:
     assert bool(recovered.update_applied)
 
 
+def test_rls_overflowed_denominator_rejects_update_atomically() -> None:
+    """A non-finite RLS divisor must not masquerade as a zero-gain update."""
+    model = RLSRewardModel(
+        RLSRewardModelConfig(feature_dim=1, forgetting=1.0, ridge=10.0)
+    )
+    state = model.init()
+    features = jnp.array([1e20], dtype=jnp.float32)
+    reward = jnp.array(1e20, dtype=jnp.float32)
+
+    covariance_features = state.covariance @ features
+    denominator = jnp.asarray(1.0, dtype=jnp.float32) + jnp.dot(
+        features, covariance_features
+    )
+    assert bool(jnp.isinf(denominator))
+
+    result = model.update(state, features, reward)
+
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+    assert float(result.prediction) == 0.0
+    assert float(result.error) == 0.0
+    chex.assert_trees_all_equal(result.gain, jnp.zeros_like(result.gain))
+
+
+def test_rls_preserves_finite_cancelling_prediction() -> None:
+    """Finite cancelling products must not make prediction reject the update."""
+    model = RLSRewardModel(
+        RLSRewardModelConfig(feature_dim=4, forgetting=1.0, ridge=1.0)
+    )
+    large = jnp.ldexp(jnp.asarray(1.0, dtype=jnp.float32), 127)
+    almost_large = jnp.nextafter(large, jnp.asarray(0.0, dtype=jnp.float32))
+    expected = large - almost_large
+    weights = jnp.asarray([-large, -almost_large, large, large], dtype=jnp.float32)
+    state = model.init().replace(weights=weights)
+    features = jnp.ones((4,), dtype=jnp.float32)
+    reward = expected
+
+    assert float(model.predict(state, features)) == float(expected)
+
+    result = model.update(state, features, reward)
+
+    assert bool(result.update_applied)
+    assert float(result.prediction) == float(expected)
+    assert float(result.error) == 0.0
+    chex.assert_trees_all_equal(result.state.weights, weights)
+
+    silently_cancelled = jnp.asarray(
+        [large, -almost_large, large, -large], dtype=jnp.float32
+    )
+    assert float(model.predict(state.replace(weights=silently_cancelled), features)) == float(
+        expected
+    )
+
+    overflowing_state = state.replace(weights=jnp.full((4,), large, dtype=jnp.float32))
+    assert bool(jnp.isinf(model.predict(overflowing_state, features)))
+
+
 def test_zero_error_decay_does_not_multiply_inf_ema() -> None:
     """error_decay=0 times an infinite abs-error EMA is NaN."""
     model = RLSRewardModel(
@@ -243,6 +359,27 @@ def test_reward_model_step_count_saturates_at_int32_max() -> None:
 
     assert bool(result.update_applied)
     assert int(result.state.step_count) == 2**31 - 1
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+def test_reward_model_negative_step_count_rejects_update_atomically(
+    disable_jit: bool,
+) -> None:
+    model = RLSRewardModel(RLSRewardModelConfig(feature_dim=1, forgetting=1.0))
+    state = model.init().replace(step_count=jnp.asarray(-1, dtype=jnp.int32))
+
+    with jax.disable_jit(disable_jit):
+        result = model.update(
+            state,
+            jnp.asarray([1.0], dtype=jnp.float32),
+            jnp.asarray(1.0, dtype=jnp.float32),
+        )
+
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_trees_all_equal(result.prediction, jnp.zeros_like(result.prediction))
+    chex.assert_trees_all_equal(result.error, jnp.zeros_like(result.error))
+    chex.assert_trees_all_equal(result.gain, jnp.zeros_like(result.gain))
 
 
 def test_rls_reward_model_config_integer_and_scalar_validation() -> None:
@@ -350,3 +487,90 @@ def test_rls_reward_model_rejects_non_scalar_rewards_eager_and_outer_jit(
     compiled = jax.jit(lambda value: model.update(state, features, value).state)
     with pytest.raises(ValueError, match="reward must be a scalar"):
         compiled(reward)
+
+
+def test_rls_reward_model_covariance_preserves_exact_symmetry_single_step() -> None:
+    """Covariance update must remain exactly symmetric in float32."""
+    model = RLSRewardModel(RLSRewardModelConfig(feature_dim=4, forgetting=0.99, ridge=1.0))
+    state = model.init()
+    features = jnp.array([1.2345678, 2.3456789, -3.4567891, 0.5678901], dtype=jnp.float32)
+    reward = jnp.array(1.0, dtype=jnp.float32)
+
+    result = model.update(state, features, reward)
+    cov = np.array(result.state.covariance)
+    assert np.array_equal(cov, cov.T)
+    assert np.max(np.abs(cov - cov.T)) == 0.0
+
+
+def test_rls_reward_model_covariance_preserves_exact_symmetry_multi_step() -> None:
+    """Covariance update must remain exactly symmetric at every compiled step."""
+    model = RLSRewardModel(RLSRewardModelConfig(feature_dim=4, forgetting=0.99, ridge=1.0))
+    state = model.init()
+    rng = np.random.default_rng(12345)
+
+    for step in range(100):
+        features = jnp.array(rng.standard_normal(4), dtype=jnp.float32)
+        reward = jnp.array(rng.standard_normal(), dtype=jnp.float32)
+        state = model.update(state, features, reward).state
+        cov = np.array(state.covariance)
+        assert np.array_equal(cov, cov.T), f"Covariance asymmetry at step {step}"
+        assert np.max(np.abs(cov - cov.T)) == 0.0
+
+
+def test_rls_reward_model_covariance_symmetrization_avoids_finite_overflow() -> None:
+    """Finite extreme covariance does not overflow or trigger false rollback."""
+    model = RLSRewardModel(RLSRewardModelConfig(feature_dim=2, forgetting=1.0, ridge=1.0))
+    cov = jnp.diag(jnp.array([2e38, 2e38], dtype=jnp.float32))
+    state = RLSRewardModelState(
+        weights=jnp.zeros(2, dtype=jnp.float32),
+        covariance=cov,
+        abs_error_ema=jnp.array(0.0, dtype=jnp.float32),
+        step_count=jnp.array(0, dtype=jnp.int32),
+    )
+    features = jnp.zeros(2, dtype=jnp.float32)
+    reward = jnp.array(1.0, dtype=jnp.float32)
+
+    result = model.update(state, features, reward)
+    assert bool(result.update_applied)
+    assert int(result.state.step_count) == 1
+    assert float(result.error) == 1.0
+    cov_out = np.array(result.state.covariance)
+    assert np.all(np.isfinite(cov_out))
+    assert np.array_equal(cov_out, cov_out.T)
+
+
+
+@pytest.mark.parametrize("value", [np.finfo(np.float32).tiny, -np.finfo(np.float32).tiny, 0.25])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_rls_reward_model_preserves_equal_covariance_entries(
+    value: float, compiled: bool
+) -> None:
+    model = RLSRewardModel(RLSRewardModelConfig(feature_dim=2, forgetting=1.0, ridge=1.0))
+    covariance = jnp.array([[1.0, value], [value, 1.0]], dtype=jnp.float32)
+    state = RLSRewardModelState(
+        weights=jnp.zeros(2, dtype=jnp.float32),
+        covariance=covariance,
+        abs_error_ema=jnp.array(0.0, dtype=jnp.float32),
+        step_count=jnp.array(0, dtype=jnp.int32),
+    )
+    with jax.disable_jit(not compiled):
+        result = model.update(state, jnp.zeros(2, dtype=jnp.float32), jnp.float32(0.0))
+    assert bool(result.update_applied)
+    assert int(result.state.step_count) == 1
+    np.testing.assert_array_equal(result.state.covariance, covariance)
+
+
+def test_rls_reward_model_rejects_nonpositive_innovation_denominator() -> None:
+    model = RLSRewardModel(RLSRewardModelConfig(feature_dim=2, forgetting=1.0, ridge=1.0))
+    # Use a finite indefinite covariance directly. Whether an initially
+    # positive covariance becomes indefinite through rounding depends on XLA.
+    covariance = jnp.array([[1.0, 2.0], [2.0, 1.0]], dtype=jnp.float32)
+    state = model.init().replace(covariance=covariance)
+    features = jnp.array([1.0, -1.0], dtype=jnp.float32)
+    assert float(1.0 + features @ (covariance @ features)) == -1.0
+
+    result = model.update(state, features, jnp.float32(1.0))
+
+    assert not bool(result.update_applied)
+    np.testing.assert_array_equal(result.gain, np.zeros(2, dtype=np.float32))
+    chex.assert_trees_all_equal(result.state, state)

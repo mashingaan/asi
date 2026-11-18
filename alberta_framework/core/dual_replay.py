@@ -55,6 +55,7 @@ from alberta_framework._float32 import round_real_to_float32
 DUAL_REPLAY_CONFIG_SCHEMA = "alberta.dual-replay.config.v1"
 DUAL_REPLAY_CHECKPOINT_SCHEMA = "alberta.dual-replay.checkpoint.v1"
 MECHANISM_STATUS = "mechanism-only-no-training-integration"
+_DUAL_REPLAY_PRNG_IMPLEMENTATION = "threefry2x32"
 
 LongTermPolicy = Literal["reservoir", "calibrated"]
 AleatoricControl = Literal["veto", "downweight"]
@@ -64,21 +65,7 @@ LONG_TERM_STRATUM = 1
 
 _INT32_MAX = 2_147_483_647
 _UINT32_MAX = 4_294_967_295
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 @dataclass(frozen=True)
@@ -695,7 +682,10 @@ def _saturating_increment(value: Array) -> Array:
 
 
 def _key_from_data(key_data: Array) -> Array:
-    return cast(Array, jr.wrap_key_data(key_data))
+    return cast(
+        Array,
+        jr.wrap_key_data(key_data, impl=_DUAL_REPLAY_PRNG_IMPLEMENTATION),
+    )
 
 
 def _key_data(key: Array) -> Array:
@@ -1539,13 +1529,22 @@ class DualReplayMemory:
             0.0,
             1.0,
         )
-        distances = jnp.linalg.norm(
-            long_term.observations - transition.observation[None, :], axis=1
+        # Only distances below coverage_scale matter after clipping. Normalize
+        # first, then scale the norm to avoid squaring tiny raw observations.
+        deltas = jnp.clip(
+            (long_term.observations - transition.observation[None, :])
+            / jnp.asarray(cfg.coverage_scale, dtype=jnp.float32),
+            -1.0,
+            1.0,
+        )
+        scales = jnp.max(jnp.abs(deltas), axis=1, keepdims=True)
+        distances = scales[:, 0] * jnp.linalg.norm(
+            deltas / jnp.where(scales > 0.0, scales, 1.0), axis=1
         )
         nearest = jnp.min(jnp.where(long_term.valid, distances, jnp.inf))
         coverage = jnp.where(
             jnp.any(long_term.valid),
-            jnp.clip(nearest / jnp.asarray(cfg.coverage_scale, dtype=jnp.float32), 0.0, 1.0),
+            jnp.clip(nearest, 0.0, 1.0),
             jnp.asarray(1.0, dtype=jnp.float32),
         )
         surprise_weight = jnp.asarray(cfg.surprise_weight, dtype=jnp.float32)
@@ -2253,6 +2252,15 @@ class DualReplayMemory:
                 array: npt.NDArray[np.float32] = np.asarray(value, dtype=np.float32)
             if not np.all(np.isfinite(array)):
                 raise ValueError(f"{name} must contain finite float32 values")
+            for source, narrowed in zip(untyped, array.flat, strict=True):
+                restored = float(narrowed)
+                if (
+                    type(source) is int
+                    and restored != source
+                    or type(source) is float
+                    and restored.hex() != source.hex()
+                ):
+                    raise ValueError(f"{name} must contain exact float32 values")
             return jnp.asarray(array, dtype=jnp.float32)
         if np.issubdtype(expected, np.bool_):
             if any(type(item) is not bool for item in untyped):

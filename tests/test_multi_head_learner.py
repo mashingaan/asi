@@ -11,6 +11,7 @@ import pytest
 
 from alberta_framework import (
     LMS,
+    Adam,
     AGCBounding,
     Autostep,
     AutostepGTDLambda,
@@ -28,6 +29,7 @@ from alberta_framework import (
     run_multi_head_learning_loop,
     run_multi_head_learning_loop_batched,
 )
+from alberta_framework.core.multi_head_learner import _finite_layer_norm
 
 
 class _HostileRepr:
@@ -236,8 +238,11 @@ class TestMultiHeadInit:
         assert calls == 0
 
         overflow = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(1,))
+        # 268,435,448 is the largest feature dim whose corrected persist bytes
+        # still fit signed int32, so the working-set preflight is the one that
+        # fires here; one dim higher the persist bound fires first.
         with pytest.raises(ValueError, match="update working set byte count"):
-            overflow.init(268_435_450, jr.key(0))
+            overflow.init(268_435_448, jr.key(0))
         assert calls == 0
 
         boundary = MultiHeadMLPLearner(n_heads=1, hidden_sizes=(1,))
@@ -359,6 +364,83 @@ class TestMultiHeadInit:
 
 class TestMultiHeadPredict:
     """Tests for MultiHeadMLPLearner.predict."""
+
+    @pytest.mark.parametrize("compiled", (False, True))
+    def test_layer_norm_preserves_ordinary_path_bitwise(self, compiled):
+        values = jnp.array([-2.0, -0.25, 0.5, 3.0], dtype=jnp.float32)
+
+        def ordinary_layer_norm(items):
+            return (items - jnp.mean(items)) / jnp.sqrt(jnp.var(items) + 1e-5)
+
+        normalize = jax.jit(_finite_layer_norm) if compiled else _finite_layer_norm
+        reference = jax.jit(ordinary_layer_norm) if compiled else ordinary_layer_norm
+
+        chex.assert_trees_all_equal(normalize(values), reference(values))
+
+    @staticmethod
+    def _extreme_layer_norm_state(
+        learner: MultiHeadMLPLearner,
+        head_weights: jax.Array,
+    ) -> MultiHeadMLPState:
+        state = learner.init(feature_dim=2, key=jr.key(0))
+        return state.replace(
+            trunk_params=state.trunk_params.replace(
+                weights=(jnp.eye(2, dtype=jnp.float32),),
+                biases=(jnp.zeros(2, dtype=jnp.float32),),
+            ),
+            head_params=state.head_params.replace(
+                weights=(head_weights[None, :],),
+                biases=(jnp.zeros(1, dtype=jnp.float32),),
+            ),
+        )
+
+    def test_layer_norm_preserves_finite_extreme_constant_activation(self):
+        learner = MultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(2,),
+            sparsity=0.0,
+            use_layer_norm=True,
+        )
+        state = self._extreme_layer_norm_state(
+            learner,
+            jnp.ones(2, dtype=jnp.float32),
+        )
+
+        prediction = learner.predict(
+            state,
+            jnp.full(2, 2.0e38, dtype=jnp.float32),
+        )
+
+        chex.assert_tree_all_finite(prediction)
+        np.testing.assert_array_equal(
+            np.asarray(prediction),
+            np.zeros(1, dtype=np.float32),
+        )
+
+    def test_layer_norm_preserves_finite_extreme_contrast(self):
+        learner = MultiHeadMLPLearner(
+            n_heads=1,
+            hidden_sizes=(2,),
+            sparsity=0.0,
+            leaky_relu_slope=0.01,
+            use_layer_norm=True,
+        )
+        state = self._extreme_layer_norm_state(
+            learner,
+            jnp.array([1.0, -1.0], dtype=jnp.float32),
+        )
+
+        prediction = learner.predict(
+            state,
+            jnp.array([1.0e38, -1.0e38], dtype=jnp.float32),
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(prediction),
+            np.array([1.01], dtype=np.float32),
+            rtol=1e-5,
+            atol=0.0,
+        )
 
     def test_returns_n_heads_scalars(self):
         """predict should return array of shape (n_heads,)."""
@@ -831,6 +913,44 @@ class TestMultiHeadUpdateNoneActive:
                 result.state.head_params.biases[i],
                 state.head_params.biases[i],
             )
+
+    def test_trunk_params_unchanged_with_stateful_optimizer(self):
+        """All-NaN targets must not move the shared trunk under Adam.
+
+        Inactive heads are frozen (params, traces, optimizer state), but the
+        trunk optimizer was stepped unconditionally. With a stateful optimizer
+        the stale momentum moves the trunk even though the step carried zero
+        error signal. LMS masks this because a zero gradient yields a zero
+        step, so the test warms up Adam with one active update first.
+        """
+        learner = MultiHeadMLPLearner(
+            n_heads=2, hidden_sizes=(16,), sparsity=0.0,
+            optimizer=Adam(step_size=0.01),
+        )
+        state = learner.init(feature_dim=5, key=jr.key(42))
+
+        obs = jnp.ones(5)
+        warmed = learner.update(
+            state, obs, jnp.array([1.0, -1.0])
+        ).state
+
+        result = learner.update(warmed, obs, jnp.array([jnp.nan, jnp.nan]))
+
+        assert bool(result.update_applied)
+        chex.assert_trees_all_equal(result.state.trunk_traces, warmed.trunk_traces)
+        for i in range(len(warmed.trunk_params.weights)):
+            chex.assert_trees_all_close(
+                result.state.trunk_params.weights[i],
+                warmed.trunk_params.weights[i],
+            )
+            chex.assert_trees_all_close(
+                result.state.trunk_params.biases[i],
+                warmed.trunk_params.biases[i],
+            )
+        chex.assert_trees_all_close(
+            result.state.trunk_optimizer_states,
+            warmed.trunk_optimizer_states,
+        )
 
     def test_normalizer_still_updates(self):
         """Normalizer should update even when no heads are active."""
@@ -1767,3 +1887,50 @@ class TestMultiHeadLinearBaseline:
         assert bool(result.update_applied)
         for utility in result.state.hidden_unit_utilities:
             assert bool(jnp.all(jnp.isfinite(utility)))
+
+
+def test_multi_head_loop_finishes_device_work_before_stopping_uptime_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import alberta_framework.core.multi_head_learner as module
+
+    # LMS step size 1.0 diverges on this stream within 100 steps.
+    learner = MultiHeadMLPLearner(n_heads=3, hidden_sizes=(4,), sparsity=0.0, step_size=0.1)
+    state = learner.init(5, jr.key(0))
+    observations = jnp.full((1024, 5), 0.1, dtype=jnp.float32)
+    targets = jnp.full((1024, 3), 0.2, dtype=jnp.float32)
+    scan_outputs: list[object] = []
+    real_scan = jax.lax.scan
+    real_time = time.time
+
+    def recording_scan(*args: object, **kwargs: object) -> object:
+        result = real_scan(*args, **kwargs)
+        scan_outputs.extend(jax.tree.leaves(result))
+        return result
+
+    def clock() -> float:
+        if scan_outputs:
+            assert all(leaf.is_ready() for leaf in scan_outputs if isinstance(leaf, jax.Array))
+        return real_time()
+
+    monkeypatch.setattr(jax.lax, "scan", recording_scan)
+    monkeypatch.setattr(module, "time", SimpleNamespace(time=clock))
+    result = run_multi_head_learning_loop(learner, state, observations, targets)
+    assert scan_outputs
+    assert int(result.state.step_count) == 1024
+    assert bool(jnp.all(result.updates_applied))
+
+
+def test_multi_head_loop_preserves_exact_birth_timestamp() -> None:
+    """lax.scan must not narrow the host-only birth_timestamp to float32."""
+    learner = MultiHeadMLPLearner(n_heads=2, hidden_sizes=(16,), sparsity=0.0)
+    state = learner.init(feature_dim=5, key=jr.key(0))
+    birth = 1762345678.123456
+    state = state.replace(birth_timestamp=birth, uptime_s=3.25)
+    observations = jr.normal(jr.key(42), (20, 5), dtype=jnp.float32)
+    targets = jr.normal(jr.key(99), (20, 2), dtype=jnp.float32)
+    result = run_multi_head_learning_loop(learner, state, observations, targets)
+    assert result.state.birth_timestamp == birth
+    assert type(result.state.birth_timestamp) is float

@@ -10,6 +10,7 @@ import jax.random as jr
 import numpy as np
 import pytest
 
+import alberta_framework.streams.closed_loop as closed_loop
 from alberta_framework.streams import (
     LEFT_ACTION,
     PHASE_A,
@@ -24,9 +25,14 @@ from alberta_framework.streams.closed_loop import (
     RiverSwimState,
     SwitchingTwoStateState,
     _riverswim_persistent_resources,
+    _stationary_average_reward,
 )
 
 _INT32_MAX = 2**31 - 1
+
+# Correctly rounded exact rational gain of always-right under the development
+# scorecard RiverSwim protocol (n=6, p_up=0.35, p_down=0.05, r_left=0.005, r_right=1).
+SCORECARD_RIVERSWIM_ORACLE_LITERAL = 0.8571501418872549
 _INVALID_PHASE_LENGTHS = (0, -1, False, True, 1.5, None, 2**31, 10**100)
 
 
@@ -237,6 +243,42 @@ class TestSwitchingAnalyticHelpers:
             SwitchingTwoStateConfig(payoffs_a=((0.7, 0.1), (0.0, 0.3)))
         )
         assert stay_best.optimal_average_reward(PHASE_A) == pytest.approx(0.7)
+
+    def test_oracles_are_exact_not_float32_rounded(self):
+        """The documented closed forms must be evaluated exactly.
+
+        Payoffs are float32 lattice points and ``step`` pays them exactly, so
+        the average an optimal controller achieves is the exact half-sum of
+        the toggle cycle. Summing two float32 values in float32 rounds that
+        half-sum, and the rounding can land above or below the true optimum,
+        which turns the privileged oracle regret of an optimal controller into
+        a nonzero (possibly negative) number.
+        """
+        unit = 2.0**-24
+        # float32(1.0 + 3u) rounds up to 1 + 2**-22: oracle above the optimum.
+        above = SwitchingTwoStateMDP(
+            SwitchingTwoStateConfig(payoffs_a=((0.5 + unit, 1.0), (3 * unit, 0.0)))
+        )
+        exact_above = float((Fraction(1) + 3 * Fraction(unit)) / 2)
+        assert above.optimal_average_reward(PHASE_A) == exact_above
+        # float32(1.0 + u) rounds down to 1.0: oracle below the optimum.
+        below = SwitchingTwoStateMDP(
+            SwitchingTwoStateConfig(payoffs_a=((0.5, 1.0), (unit, 0.0)))
+        )
+        exact_below = float((Fraction(1) + Fraction(unit)) / 2)
+        assert below.optimal_average_reward(PHASE_A) == exact_below
+        assert below.uniform_random_average_reward(PHASE_A) == float(
+            (Fraction(0.5) + Fraction(1) + Fraction(unit)) / 4
+        )
+
+        # What the environment actually pays an optimal (toggle) controller.
+        state = below.init(jr.key(0))
+        total = Fraction(0)
+        for _ in range(40):
+            action = 1 - int(state.state_index)
+            _, reward, state = below.step(state, action, jr.key(1))
+            total += Fraction(float(reward))
+        assert float(total / 40) == exact_below
 
     def test_optimal_matches_brute_force_rollouts(self):
         """The closed form equals the best empirical deterministic policy."""
@@ -510,6 +552,129 @@ class TestRiverSwim:
         assert uniform < optimal
         assert always_left < optimal
 
+    def test_stationary_gain_preserves_tiny_categorical_transition_ratios(self):
+        """Stationary mass follows the row-normalized categorical kernel."""
+        env = RiverSwimMDP(
+            RiverSwimConfig(
+                n_states=2,
+                p_right_up=1.0e-7,
+                p_right_down=2.0e-7,
+                reward_left=0.0,
+                reward_right=1.0,
+            )
+        )
+        kernel = env.transition_tensor[RIGHT_ACTION].astype(np.float64)
+        up = kernel[0, 1] / kernel[0].sum()
+        down = kernel[1, 0] / kernel[1].sum()
+        expected_top_state_mass = up / (up + down)
+
+        assert env.policy_average_reward([RIGHT_ACTION, RIGHT_ACTION]) == pytest.approx(
+            expected_top_state_mass,
+            rel=1.0e-12,
+            abs=1.0e-12,
+        )
+
+    def test_policy_gain_is_the_correctly_rounded_exact_rational(self):
+        """The stationary gain is exact rational arithmetic, rounded once."""
+        env = RiverSwimMDP(
+            RiverSwimConfig(
+                n_states=2,
+                p_right_up=0.35,
+                p_right_down=0.05,
+                reward_left=0.0,
+                reward_right=1.0,
+            )
+        )
+        kernel = env.transition_tensor[RIGHT_ACTION]
+        rows = [[Fraction(float(value)) for value in row] for row in kernel]
+        rows = [[value / sum(row) for value in row] for row in rows]
+        # Two-state chain: stationary mass on the top state is P01 / (P01 + P10).
+        expected = rows[0][1] / (rows[0][1] + rows[1][0])
+
+        assert env.policy_average_reward([RIGHT_ACTION, RIGHT_ACTION]) == float(expected)
+
+    def test_scorecard_riverswim_oracle_is_bit_stable(self):
+        """The development-scorecard oracle must not depend on the host CPU.
+
+        This float is written into the RiverSwim environment manifest and hashed
+        into the manifest identity, so every fresh process on every machine must
+        produce exactly this value. The literal is the correctly rounded exact
+        rational gain of the always-right policy for the scorecard protocol.
+        """
+        env = RiverSwimMDP(
+            RiverSwimConfig(
+                n_states=6,
+                p_right_up=0.35,
+                p_right_down=0.05,
+                reward_left=0.005,
+                reward_right=1.0,
+            )
+        )
+
+        assert env.optimal_average_reward() == SCORECARD_RIVERSWIM_ORACLE_LITERAL
+
+    def test_stationary_gain_rejects_multichain_kernels(self):
+        """Two absorbing states have no unique stationary distribution."""
+        kernel = np.eye(2, dtype=np.float32)
+        rewards = np.array([0.0, 1.0], dtype=np.float32)
+
+        with pytest.raises(ValueError, match="unichain"):
+            _stationary_average_reward(kernel, rewards)
+
+    def test_large_valid_policy_gain_does_not_build_dense_rational_system(self, monkeypatch):
+        """A resource-valid RiverSwim policy must use bounded rational work."""
+        n_states = 64
+        env = RiverSwimMDP(RiverSwimConfig(n_states=n_states))
+
+        class BudgetedFraction(Fraction):
+            created = 0
+
+            def __new__(cls, *args, **kwargs):
+                cls.created += 1
+                if cls.created > 500:
+                    raise AssertionError("stationary gain built a dense rational system")
+                return super().__new__(cls, *args, **kwargs)
+
+        monkeypatch.setattr(closed_loop, "Fraction", BudgetedFraction)
+        gain = env.policy_average_reward([RIGHT_ACTION] * n_states)
+        assert 0.0 < gain < 1.0
+
+        BudgetedFraction.created = 0
+        random_gain = env.uniform_random_average_reward()
+        assert 0.0 < random_gain < 1.0
+
+    def test_large_birth_death_gain_matches_exact_small_solver(self):
+        """Sparse adjacent-edge balance preserves the exact 13-state gains."""
+        assert closed_loop._MAX_EXACT_POLICY_STATES < 13
+        env = RiverSwimMDP(RiverSwimConfig(n_states=13))
+        assert env.policy_average_reward([RIGHT_ACTION] * 13) == 0.8571428562393877
+        assert env.policy_average_reward([LEFT_ACTION] * 13) == 0.004999999888241291
+        assert env.policy_average_reward(
+            [RIGHT_ACTION] * 5 + [LEFT_ACTION] + [RIGHT_ACTION] * 7
+        ) == 0.0
+        assert env.uniform_random_average_reward() == 0.0016672949103085104
+
+    @pytest.mark.parametrize(
+        ("invalid_kernel", "message"),
+        [
+            ("off_band", "birth-death kernel"),
+            ("empty_row", "nonnegative mass"),
+            ("no_downward_edge", "positive downward edges"),
+        ],
+    )
+    def test_large_stationary_gain_rejects_invalid_birth_death_kernels(
+        self, invalid_kernel: str, message: str
+    ) -> None:
+        """A large invalid kernel cannot produce a certified stationary gain."""
+        kernel = np.eye(13, dtype=np.float32)
+        if invalid_kernel == "off_band":
+            kernel[0, 0] = 0.9
+            kernel[0, 2] = 0.1
+        elif invalid_kernel == "empty_row":
+            kernel[3] = 0.0
+        with pytest.raises(ValueError, match=message):
+            _stationary_average_reward(kernel, np.zeros(13, dtype=np.float32))
+
     def test_policy_gain_matches_scan_simulation(self):
         """A long scan rollout of always-right attains its analytic gain."""
         env = RiverSwimMDP(RiverSwimConfig(n_states=4))
@@ -546,6 +711,22 @@ class TestRiverSwim:
             RiverSwimMDP(RiverSwimConfig(n_states=3, initial_state=3))
         with pytest.raises(ValueError, match="policy"):
             RiverSwimMDP(RiverSwimConfig(n_states=3)).policy_average_reward([0, 1])
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
+            [0.9, 0.9, 0.9],
+            [1.9, 1.9, 1.9],
+            [False, True, True],
+            [np.float32(0.0), np.float32(1.0), np.float32(1.0)],
+        ],
+    )
+    def test_policy_gain_rejects_noninteger_action_identities(self, policy: object) -> None:
+        """The oracle must not measure a coerced policy under the caller's identity."""
+        env = RiverSwimMDP(RiverSwimConfig(n_states=3))
+
+        with pytest.raises(ValueError, match="policy actions"):
+            env.policy_average_reward(policy)  # type: ignore[arg-type]
 
     def test_riverswim_config_rejects_bool_and_nan_identities(self):
         """The public config record must not persist True/NaN step identities."""
@@ -746,6 +927,26 @@ def test_closed_loop_step_counts_saturate_eager_and_outer_jit() -> None:
 
 
 @pytest.mark.parametrize(
+    "invalid_key",
+    (
+        jr.PRNGKey(0),
+        jr.key(0, impl="rbg"),
+    ),
+)
+def test_closed_loop_rng_consumers_require_typed_threefry_keys(
+    invalid_key: jax.Array,
+) -> None:
+    switching = SwitchingTwoStateMDP()
+    with pytest.raises(TypeError, match="typed scalar threefry2x32"):
+        switching.init(invalid_key)
+
+    river = RiverSwimMDP()
+    river_state = river.init(jr.key(0, impl="threefry2x32"))
+    with pytest.raises(TypeError, match="typed scalar threefry2x32"):
+        river.step(river_state, jnp.asarray(RIGHT_ACTION), invalid_key)
+
+
+@pytest.mark.parametrize(
     "state",
     (
         RiverSwimState(
@@ -847,3 +1048,17 @@ def test_riverswim_probability_exception_is_normalized_without_repr(field: str) 
 
     with pytest.raises(ValueError, match=field):
         RiverSwimMDP(RiverSwimConfig(**{field: ExplodingReal()}))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("n_states", [2, 13])
+@pytest.mark.parametrize("units", [1, -1, 3, -3])
+def test_riverswim_random_gain_preserves_subnormal_rewards(n_states, units):
+    reward = units * 2.0**-149
+    env = RiverSwimMDP(RiverSwimConfig(
+        n_states=n_states, p_right_up=0.5, p_right_down=0.5,
+        reward_left=reward, reward_right=reward,
+    ))
+    # Uniform actions give adjacent balance d[i+1] / d[i] = 1/3.
+    endpoint_mass = Fraction(3**(n_states - 1) + 1, sum(3**i for i in range(n_states)))
+    expected = float(endpoint_mass * Fraction(reward) / 2)
+    assert env.uniform_random_average_reward() == expected

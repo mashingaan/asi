@@ -3,6 +3,7 @@
 import time
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -11,10 +12,12 @@ import pytest
 from alberta_framework import (
     IDBD,
     LMS,
+    TDIDBD,
     Autostep,
     BatchedLearningResult,
     EMANormalizer,
     LinearLearner,
+    MLPLearner,
     NormalizerHistory,
     NormalizerTrackingConfig,
     RandomWalkStream,
@@ -224,6 +227,64 @@ class TestRunLearningLoop:
 
         chex.assert_trees_all_close(state1.weights, state2.weights)
         chex.assert_trees_all_close(metrics1, metrics2)
+
+    @pytest.mark.parametrize("tracking", [False, True])
+    def test_finishes_device_work_before_stopping_uptime_clock(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tracking: bool,
+    ) -> None:
+        """Reported uptime must cover the asynchronous scan, not just dispatch."""
+        from types import SimpleNamespace
+
+        import jax
+
+        import alberta_framework.core.learners as module
+
+        stream = RandomWalkStream(feature_dim=5)
+        learner = LinearLearner()
+        blocked: list[object] = []
+        real_scan = jax.lax.scan
+        real_time = time.time
+        scan_finished = False
+
+        def recording_scan(*args: object, **kwargs: object) -> object:
+            nonlocal scan_finished
+            result = real_scan(*args, **kwargs)
+            scan_finished = True
+            return result
+
+        def recording_block(value: object) -> object:
+            blocked.append(value)
+            return value
+
+        def clock() -> float:
+            if scan_finished:
+                assert blocked
+            return real_time()
+
+        monkeypatch.setattr(jax.lax, "scan", recording_scan)
+        monkeypatch.setattr(jax, "block_until_ready", recording_block)
+        monkeypatch.setattr(module, "time", SimpleNamespace(time=clock))
+
+        result = run_learning_loop(
+            learner,
+            stream,
+            num_steps=8,
+            key=jr.key(271),
+            step_size_tracking=(
+                StepSizeTrackingConfig(interval=4) if tracking else None
+            ),
+        )
+        state, metrics = result[:2]
+
+        assert len(blocked) == 1
+        assert isinstance(blocked[0], tuple)
+        blocked_state, blocked_metrics = blocked[0]
+        assert int(blocked_state.step_count) == 8
+        assert blocked_metrics is metrics
+        assert int(state.step_count) == 8
+        chex.assert_shape(metrics, (8, 3))
 
 
 class TestStepSizeTracking:
@@ -962,3 +1023,157 @@ def test_linear_family_feature_dimensions_are_exact_and_preflighted(learner) -> 
 
     with pytest.raises(ValueError, match="resource"):
         learner.init(2**26)
+
+
+class TestLinearLearnerNormalizedPredict:
+    """``predict`` must apply the configured normalizer exactly as ``update`` does."""
+
+    @staticmethod
+    def _train(normalizer: WelfordNormalizer | EMANormalizer) -> tuple:
+        learner = LinearLearner(optimizer=LMS(0.05), normalizer=normalizer)
+        # Raw features live around 100 so a prediction on un-normalized input is
+        # off by two orders of magnitude from the learned mapping.
+        xs = 100.0 + jr.normal(jr.key(0), (200, 2), dtype=jnp.float32)
+        ys = 0.5 * (xs[:, 0] - 100.0)
+        state = learner.init(2)
+        for x, y in zip(xs, ys, strict=True):
+            state = learner.update(state, x, jnp.atleast_1d(y)).state
+        return learner, state, xs[-1], ys[-1]
+
+    @pytest.mark.parametrize(
+        "normalizer", [WelfordNormalizer(), EMANormalizer(decay=0.99)], ids=["welford", "ema"]
+    )
+    def test_predict_reproduces_the_update_prediction(self, normalizer) -> None:
+        learner, state, x, y = self._train(normalizer)
+        result = learner.update(state, x, jnp.atleast_1d(y))
+        # Same weights, same normalizer statistics as the update used: the public
+        # prediction must be the prediction the update reported.
+        frozen = state.replace(normalizer_state=result.state.normalizer_state)
+        chex.assert_trees_all_close(learner.predict(frozen, x), result.prediction, atol=1e-6)
+        # And it is on the target's scale: the raw affine map ``w @ x + b`` on
+        # these features is off by roughly ``0.5 * 100``.
+        assert abs(float(learner.predict(state, x)[0]) - float(y)) < 2.0
+        raw_affine = float(jnp.dot(state.weights, x) + state.bias)
+        assert abs(raw_affine - float(y)) > 10.0
+
+    def test_predict_without_normalizer_is_the_plain_affine_map(self) -> None:
+        learner = LinearLearner(optimizer=LMS(0.1))
+        state = learner.init(3)
+        state = state.replace(
+            weights=jnp.array([1.0, -2.0, 0.5], dtype=jnp.float32),
+            bias=jnp.array(0.25, dtype=jnp.float32),
+        )
+        x = jnp.array([2.0, 1.0, 4.0], dtype=jnp.float32)
+        chex.assert_trees_all_close(learner.predict(state, x), jnp.array([2.25], dtype=jnp.float32))
+
+
+def _prediction_learners() -> list[tuple[str, object, object]]:
+    linear = LinearLearner(optimizer=LMS(0.1))
+    normalized = LinearLearner(optimizer=LMS(0.1), normalizer=EMANormalizer(decay=0.99))
+    mlp = MLPLearner(hidden_sizes=(4,), optimizer=LMS(0.1))
+    td = TDLinearLearner(optimizer=TDIDBD())
+    true_online = TrueOnlineTDLearner()
+    return [
+        ("linear", linear, linear.init(3)),
+        ("normalized-linear", normalized, normalized.init(3)),
+        ("mlp", mlp, mlp.init(3, jr.key(0))),
+        ("td", td, td.init(3)),
+        ("true-online-td", true_online, true_online.init(3)),
+    ]
+
+
+class TestPredictObservationContract:
+    """One learner prediction must not silently become many or become complex."""
+
+    @pytest.mark.parametrize(
+        "name", ["linear", "normalized-linear", "mlp", "td", "true-online-td"]
+    )
+    @pytest.mark.parametrize(
+        "observation",
+        [
+            jnp.asarray(1.0, dtype=jnp.float32),
+            jnp.ones((3, 2), dtype=jnp.float32),
+            np.full(3, 1.0 + 2.0j, dtype=np.complex64),
+        ],
+        ids=["scalar-broadcast", "batched-matrix", "complex"],
+    )
+    def test_predict_rejects_malformed_observation(self, name, observation) -> None:
+        _, learner, state = next(item for item in _prediction_learners() if item[0] == name)
+
+        with pytest.raises(ValueError, match="observation must"):
+            learner.predict(state, observation)  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(
+        "name", ["linear", "normalized-linear", "mlp", "td", "true-online-td"]
+    )
+    def test_predict_keeps_one_real_prediction_for_valid_observations(self, name) -> None:
+        _, learner, state = next(item for item in _prediction_learners() if item[0] == name)
+
+        for observation in (jnp.ones(3, dtype=jnp.float32), jnp.ones(3, dtype=jnp.int32)):
+            prediction = learner.predict(state, observation)  # type: ignore[attr-defined]
+            assert prediction.shape == (1,)
+            assert prediction.dtype == jnp.float32
+
+    def test_predict_contract_holds_under_vmap(self) -> None:
+        learner = LinearLearner(optimizer=LMS(0.1))
+        state = learner.init(3)
+
+        predictions = jax.vmap(lambda x: learner.predict(state, x))(
+            jnp.ones((2, 3), dtype=jnp.float32)
+        )
+
+        assert predictions.shape == (2, 1)
+
+
+class TestTrackingKeepsEveryRecording:
+    """History arrays must hold every (idx % interval == 0) recording.
+
+    The recording predicate fires ceil(num_steps / interval) times over
+    idx in [0, num_steps); a floor-sized allocation silently drops the
+    trailing recordings (JAX scatters out-of-bounds writes to nowhere)
+    whenever the interval does not divide num_steps.
+    """
+
+    def test_step_size_history_keeps_the_tail_recording(self, rng_key):
+        step_size = 0.05
+        stream = RandomWalkStream(feature_dim=3)
+        learner = LinearLearner(optimizer=LMS(step_size=step_size))
+        config = StepSizeTrackingConfig(interval=3)
+
+        _, _, history = run_learning_loop(
+            learner, stream, num_steps=10, key=rng_key, step_size_tracking=config
+        )
+
+        chex.assert_shape(history.step_sizes, (4, 3))
+        chex.assert_trees_all_close(
+            history.recording_indices, jnp.array([0, 3, 6, 9], dtype=jnp.int32)
+        )
+        chex.assert_trees_all_close(
+            history.step_sizes[-1], jnp.full(3, step_size, dtype=jnp.float32)
+        )
+
+    def test_normalizer_history_keeps_the_tail_recording(self, rng_key):
+        stream = RandomWalkStream(feature_dim=3)
+        learner = LinearLearner(optimizer=IDBD(), normalizer=EMANormalizer())
+        config = NormalizerTrackingConfig(interval=4)
+
+        _, _, history = run_learning_loop(
+            learner, stream, num_steps=10, key=rng_key, normalizer_tracking=config
+        )
+
+        chex.assert_shape(history.means, (3, 3))
+        chex.assert_trees_all_close(
+            history.recording_indices, jnp.array([0, 4, 8], dtype=jnp.int32)
+        )
+
+
+def test_linear_update_preserves_finite_normalizer_variance_means() -> None:
+    learner = LinearLearner(optimizer=LMS(0.1), normalizer=EMANormalizer())
+    state = learner.init(8)
+    observation = jnp.full(8, 1.5e19, dtype=jnp.float32)
+    result = learner.update(state, observation, jnp.asarray(0.0, dtype=jnp.float32))
+    variances = np.asarray(result.state.normalizer_state.var, dtype=np.float64)
+
+    assert bool(result.update_applied)
+    assert np.all(np.isfinite(variances))
+    assert float(result.metrics[3]) == pytest.approx(float(np.mean(variances)), rel=2e-6)

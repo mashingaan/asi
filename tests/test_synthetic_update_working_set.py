@@ -7,12 +7,16 @@ import jax.random as jr
 import pytest
 
 from alberta_framework.streams.synthetic import (
+    CyclicStream,
     DynamicScaleShiftStream,
     HiddenStateAR2Stream,
+    RandomWalkStream,
     ScaleDriftStream,
     SuttonExperiment1Stream,
+    _cyclic_persistent_bytes,
     _hidden_state_ar2_persistent_bytes,
     _preflight_synthetic_step_working_set,
+    _random_walk_persistent_bytes,
     _require_float32_resource,
     _scale_stream_persistent_bytes,
     _sutton_experiment1_persistent_bytes,
@@ -29,6 +33,10 @@ _SCALE_FIRST_OVERFLOW = 76_695_844
 _SUTTON_OVERFLOW_FEATURE_DIM = 200_000_000
 _SUTTON_LAST_FIT = 134_217_725
 _SUTTON_FIRST_OVERFLOW = 134_217_726
+_RANDOM_WALK_LAST_FIT = 134_217_726
+_RANDOM_WALK_FIRST_OVERFLOW = 134_217_727
+_CYCLIC_LAST_FIT_CONFIGURATIONS = 59_652_322
+_CYCLIC_FIRST_OVERFLOW_CONFIGURATIONS = 59_652_323
 
 
 def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
@@ -38,6 +46,32 @@ def test_int32_wrap_forges_a_different_published_byte_identity() -> None:
     )
     assert wrapped_bytes == _INT32_MIN
     assert wrapped_bytes != published_bytes
+
+
+def test_random_walk_rejects_unnameable_step_working_set() -> None:
+    assert _RANDOM_WALK_FIRST_OVERFLOW == _RANDOM_WALK_LAST_FIT + 1
+    last_fit_persist_bytes = _random_walk_persistent_bytes(_RANDOM_WALK_LAST_FIT)
+    assert (
+        _synthetic_step_working_set_bytes(
+            last_fit_persist_bytes,
+            _RANDOM_WALK_LAST_FIT,
+        )
+        == 2_147_483_644
+    )
+    RandomWalkStream(_RANDOM_WALK_LAST_FIT)
+
+    feature_dim = _RANDOM_WALK_FIRST_OVERFLOW
+    persist_bytes = _random_walk_persistent_bytes(feature_dim)
+    working_set_bytes = _synthetic_step_working_set_bytes(persist_bytes, feature_dim)
+    extras_bytes = working_set_bytes - 3 * persist_bytes
+    assert persist_bytes == 536_870_916
+    assert persist_bytes <= _INT32_MAX
+    assert persist_bytes + extras_bytes <= _INT32_MAX
+    assert 4 * feature_dim <= _INT32_MAX
+    assert working_set_bytes == 2_147_483_660
+    assert working_set_bytes > _INT32_MAX
+    with pytest.raises(ValueError, match="working set byte count"):
+        RandomWalkStream(feature_dim)
 
 
 def test_hidden_named_persist_and_width_still_fit_at_overflow() -> None:
@@ -170,6 +204,44 @@ def test_sutton_last_fit_and_first_overflow_are_adjacent() -> None:
         SuttonExperiment1Stream(num_relevant=1, num_irrelevant=first_overflow - 1)
 
 
+def test_cyclic_configuration_matrix_overflows_only_complete_step_envelope() -> None:
+    feature_dim = 3
+    num_configurations = _CYCLIC_FIRST_OVERFLOW_CONFIGURATIONS
+    persist_bytes = _cyclic_persistent_bytes(feature_dim, num_configurations)
+    working_set_bytes = _synthetic_step_working_set_bytes(persist_bytes, feature_dim)
+    extras_bytes = working_set_bytes - 3 * persist_bytes
+    assert persist_bytes == 715_827_888
+    assert persist_bytes <= _INT32_MAX
+    assert persist_bytes + extras_bytes <= _INT32_MAX
+    assert 4 * feature_dim <= _INT32_MAX
+    assert working_set_bytes == 2_147_483_680
+    assert working_set_bytes > _INT32_MAX
+    with pytest.raises(ValueError, match="working set byte count"):
+        CyclicStream(feature_dim, num_configurations=num_configurations)
+
+
+def test_cyclic_last_fit_and_first_overflow_are_adjacent() -> None:
+    feature_dim = 3
+    last_fit = None
+    first_overflow = None
+    for num_configurations in range(
+        _CYCLIC_LAST_FIT_CONFIGURATIONS,
+        _CYCLIC_FIRST_OVERFLOW_CONFIGURATIONS + 2,
+    ):
+        persist_bytes = _cyclic_persistent_bytes(feature_dim, num_configurations)
+        working_set_bytes = _synthetic_step_working_set_bytes(persist_bytes, feature_dim)
+        if working_set_bytes <= _INT32_MAX:
+            last_fit = num_configurations
+        elif first_overflow is None:
+            first_overflow = num_configurations
+            break
+    assert last_fit is not None and first_overflow == last_fit + 1
+    assert last_fit == _CYCLIC_LAST_FIT_CONFIGURATIONS
+    CyclicStream(feature_dim, num_configurations=last_fit)
+    with pytest.raises(ValueError, match="working set byte count"):
+        CyclicStream(feature_dim, num_configurations=first_overflow)
+
+
 def test_persist_bound_still_fires_before_working_set() -> None:
     last_legal = (2**29 - 1 - 3) // 2
     _require_float32_resource(
@@ -198,14 +270,17 @@ def test_persist_bound_still_fires_before_working_set() -> None:
 
 
 def test_legal_small_synthetic_streams_still_step() -> None:
+    assert _random_walk_persistent_bytes(4) == 24
+    random_walk = RandomWalkStream(4)
+    random_walk.step(random_walk.init(jr.key(0)), jnp.asarray(0, dtype=jnp.int32))
     assert _hidden_state_ar2_persistent_bytes(8) == 72
     hidden = HiddenStateAR2Stream(8, visible_dim=2)
-    hidden.step(hidden.init(jr.key(0)), jnp.asarray(0, dtype=jnp.int32))
+    hidden.step(hidden.init(jr.key(1)), jnp.asarray(0, dtype=jnp.int32))
     assert _scale_stream_persistent_bytes(4) == 44
     dynamic = DynamicScaleShiftStream(4)
-    dynamic.step(dynamic.init(jr.key(1)), jnp.asarray(0, dtype=jnp.int32))
+    dynamic.step(dynamic.init(jr.key(2)), jnp.asarray(0, dtype=jnp.int32))
     drift = ScaleDriftStream(4)
-    drift.step(drift.init(jr.key(2)), jnp.asarray(0, dtype=jnp.int32))
+    drift.step(drift.init(jr.key(3)), jnp.asarray(0, dtype=jnp.int32))
     assert _sutton_experiment1_persistent_bytes(5) == 32
     sutton = SuttonExperiment1Stream(num_relevant=2, num_irrelevant=3)
-    sutton.step(sutton.init(jr.key(3)), jnp.asarray(0, dtype=jnp.int32))
+    sutton.step(sutton.init(jr.key(4)), jnp.asarray(0, dtype=jnp.int32))

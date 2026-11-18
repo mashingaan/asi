@@ -16,6 +16,10 @@ from alberta_framework._scan_resources import (
     require_scan_steps,
     require_step_units,
 )
+from alberta_framework.utils.export import (
+    _exported_number,
+    _significance_star_count,
+)
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
@@ -137,6 +141,7 @@ def set_publication_style(
             "savefig.dpi": _current_style["dpi"],
             "lines.linewidth": _current_style["line_width"],
             "lines.markersize": _current_style["marker_size"],
+            "text.usetex": use_latex,
             "axes.linewidth": 0.8,
             "grid.linewidth": 0.5,
             "grid.alpha": 0.3,
@@ -146,7 +151,6 @@ def set_publication_style(
     if use_latex:
         plt.rcParams.update(
             {
-                "text.usetex": True,
                 "font.family": "serif",
                 "font.serif": ["Computer Modern Roman"],
             }
@@ -185,6 +189,8 @@ def plot_learning_curves(
         _require_positive_int("window_size", window_size),
         _VIS_WINDOW_BUDGET,
     )
+    if not results:
+        raise ValueError("plot_learning_curves requires at least one result")
 
     try:
         import matplotlib.pyplot as plt
@@ -280,6 +286,13 @@ def plot_final_performance_bars(
     names = list(results.keys())
     if not names:
         raise ValueError("plot_final_performance_bars requires at least one result")
+    from alberta_framework.utils.statistics import common_final_window
+
+    common_final_window(
+        {name: int(results[name].metric_arrays[metric].shape[1]) for name in names},
+        100,
+        metric,
+    )
     means = [results[name].summary[metric].mean for name in names]
     stds = [results[name].summary[metric].std for name in names]
     means_arr = np.asarray(means, dtype=np.float64)
@@ -385,6 +398,25 @@ def plot_hyperparameter_heatmap(
     )
     require_step_units(n1, n2, _VIS_HEATMAP_BUDGET)
 
+    # Missing configurations/metrics are intentionally represented as NaN,
+    # but a resolved cell is evidence and must not use the same sentinel for a
+    # poisoned summary. Validate the complete grid before creating a figure so
+    # callers cannot mistake a partially rendered plot for an accepted one.
+    data = np.full((n1, n2), np.nan, dtype=np.float64)
+    for i, p1 in enumerate(param1_values):
+        for j, p2 in enumerate(param2_values):
+            name = name_pattern.format(p1=p1, p2=p2)
+            if name in results and metric in results[name].summary:
+                try:
+                    data[i, j] = float(
+                        _exported_number(results[name].summary[metric].mean)
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"heatmap metric mean for {name} must be a finite "
+                        "canonical number"
+                    ) from exc
+
     try:
         import matplotlib.pyplot as plt
     except ImportError:
@@ -394,15 +426,6 @@ def plot_hyperparameter_heatmap(
         fig, ax = plt.subplots()
     else:
         fig = cast("Figure", ax.figure)
-    # Build heatmap data
-    data = np.zeros((n1, n2))
-    for i, p1 in enumerate(param1_values):
-        for j, p2 in enumerate(param2_values):
-            name = name_pattern.format(p1=p1, p2=p2)
-            if name in results and metric in results[name].summary:
-                data[i, j] = results[name].summary[metric].mean
-            else:
-                data[i, j] = np.nan
 
     if lower_is_better:
         cmap_to_use = cmap
@@ -459,6 +482,8 @@ def plot_step_size_evolution(
         Tuple of (figure, axes)
     """
     show_ci = _require_exact_bool("show_ci", show_ci)
+    if not any(metric in agg.metric_arrays for agg in results.values()):
+        raise ValueError(f"plot_step_size_evolution found no result with metric '{metric}'")
 
     try:
         import matplotlib.pyplot as plt
@@ -618,8 +643,25 @@ def save_figure(
     """
     if formats is None:
         formats = ["pdf", "png"]
+    if type(formats) is not list or not formats:
+        raise ValueError("formats must be a non-empty exact list of format names")
+    if any(type(fmt) is not str for fmt in formats):
+        raise ValueError("formats must contain exact format-name strings")
+    if len(set(formats)) != len(formats):
+        raise ValueError("formats must not contain duplicate format names")
+    if type(dpi) is not int or dpi <= 0:
+        raise ValueError("dpi must be a positive exact int")
+    transparent = _require_exact_bool("transparent", transparent)
 
     filename = Path(filename)
+    if not filename.name or filename.suffix:
+        raise ValueError("filename must be a base name without an extension")
+    # Refuse the whole request up front so a late bad format cannot leave a
+    # partial artifact set behind.
+    supported_formats = fig.canvas.get_supported_filetypes()
+    unsupported = [fmt for fmt in formats if fmt not in supported_formats]
+    if unsupported:
+        raise ValueError(f"formats contains unsupported format names: {unsupported}")
     filename.parent.mkdir(parents=True, exist_ok=True)
 
     saved_paths = []
@@ -668,11 +710,8 @@ def _get_significance_marker_for_plot(
     if not result.significant:
         return ""
 
-    p = result.p_value
-    if p < 0.001:
-        return "***"
-    elif p < 0.01:
-        return "**"
-    elif p < 0.05:
-        return "*"
-    return ""
+    stars = _significance_star_count(
+        result.p_value,
+        result.alpha,
+    )
+    return "*" * stars

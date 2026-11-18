@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from alberta_framework import (
+    Adam,
     Autostep,
     DemonType,
     GVFSpec,
@@ -581,6 +582,104 @@ class TestSARSAUpdate:
         pred_changed = not jnp.allclose(old_pred_weights, new_pred_weights)
         assert pred_changed, "Prediction demon head should have been updated"
 
+    def test_terminated_prediction_demon_traces_are_cleared(self):
+        """A terminal transition clears prediction-demon traces like control traces.
+
+        Control heads are zeroed at ``terminated=1`` in ``SARSAAgent.update``,
+        but prediction heads kept their decayed traces, so the next
+        episode's first update credited the dead episode's trace.
+        """
+        pred_demons = [
+            GVFSpec(
+                name="pred_0",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.9,
+                lamda=0.9,
+                cumulant_index=0,
+            ),
+        ]
+        agent = _make_agent(
+            n_actions=2,
+            prediction_demons=pred_demons,
+            hidden_sizes=(),
+            lamda=0.9,
+        )
+        state = agent.init(feature_dim=4, key=jr.key(42))
+        obs = jnp.ones(4, dtype=jnp.float32)
+        state = state.replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=obs,
+        )
+
+        def update(state, terminated):
+            return agent.update(
+                state,
+                reward=jnp.array(1.0),
+                observation=jnp.full(4, 0.5, dtype=jnp.float32),
+                terminated=jnp.array(terminated, dtype=jnp.float32),
+                next_action=jnp.array(0, dtype=jnp.int32),
+                prediction_cumulants=jnp.array([1.0], dtype=jnp.float32),
+            ).state
+
+        # A non-terminal update builds a nonzero prediction trace.
+        state = update(state, 0.0)
+        pred_w_trace, pred_b_trace = state.learner_state.head_traces[2]
+        assert float(jnp.max(jnp.abs(pred_w_trace))) > 0.0
+
+        # The terminal update credits that trace, then clears it.
+        state = update(state, 1.0)
+        for head in state.learner_state.head_traces:
+            chex.assert_trees_all_close(head[0], jnp.zeros_like(head[0]))
+            chex.assert_trees_all_close(head[1], jnp.zeros_like(head[1]))
+
+    def test_terminated_prediction_demons_do_not_bootstrap(self):
+        """At a terminal transition, a prediction demon learns the cumulant.
+
+        The target must not depend on the next observation: in continuing
+        mode the terminal next observation is already the next episode's
+        reset observation, so bootstrapping it would leak one episode's
+        values into the previous episode's prediction.
+        """
+        pred_demons = [
+            GVFSpec(
+                name="pred_0",
+                demon_type=DemonType.PREDICTION,
+                gamma=0.9,
+                lamda=0.0,
+                cumulant_index=0,
+            ),
+        ]
+        agent = _make_agent(
+            n_actions=2, prediction_demons=pred_demons, hidden_sizes=()
+        )
+        state = agent.init(feature_dim=4, key=jr.key(42))
+        obs = jnp.ones(4, dtype=jnp.float32)
+        state = state.replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=obs,
+        )
+
+        next_a = jnp.ones(4, dtype=jnp.float32) * 0.5
+        next_b = jnp.ones(4, dtype=jnp.float32) * -2.0
+        pred_next_a = agent.horde.predict(state.learner_state, next_a)[2]
+        pred_next_b = agent.horde.predict(state.learner_state, next_b)[2]
+        assert not jnp.allclose(pred_next_a, pred_next_b)
+
+        def terminal_weights(next_obs):
+            result = agent.update(
+                state,
+                reward=jnp.array(1.0),
+                observation=next_obs,
+                terminated=jnp.array(1.0),
+                next_action=jnp.array(0, dtype=jnp.int32),
+                prediction_cumulants=jnp.array([1.0], dtype=jnp.float32),
+            )
+            return result.state.learner_state.head_params.weights[2]
+
+        chex.assert_trees_all_close(
+            terminal_weights(next_a), terminal_weights(next_b)
+        )
+
     def test_td_error_uses_last_observation_prediction(self):
         """Returned TD error is target - Q(s_t, a_t), not Q(s_{t+1}, a_t)."""
         agent = _make_agent(n_actions=2, hidden_sizes=(), gamma=0.0, epsilon_start=0.0)
@@ -946,14 +1045,152 @@ class TestSARSAConfigSerialization:
 class TestSARSAScan:
     """Tests for run_sarsa_from_arrays scan loop."""
 
+    @pytest.mark.parametrize("final_state_only", [False, True])
+    def test_finishes_device_work_before_stopping_uptime_clock(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        final_state_only: bool,
+    ) -> None:
+        """Reported uptime must cover scan execution, not only its dispatch."""
+        import time
+        from types import SimpleNamespace
+
+        import alberta_framework.core.sarsa as module
+
+        agent = _make_agent(n_actions=2, hidden_sizes=(4,))
+        observations = jnp.ones((4, 3), dtype=jnp.float32)
+        rewards = jnp.zeros((4,), dtype=jnp.float32)
+        terminated = jnp.zeros((4,), dtype=jnp.float32)
+        state = agent.init(feature_dim=3, key=jr.key(271))
+        action, key = agent.select_action(state, observations[0])
+        state = state.replace(  # type: ignore[attr-defined]
+            last_action=action,
+            last_observation=observations[0],
+            rng_key=key,
+        )
+
+        blocked: list[object] = []
+        real_scan = jax.lax.scan
+        real_time = time.time
+        scan_finished = False
+
+        def recording_scan(*args: object, **kwargs: object) -> object:
+            nonlocal scan_finished
+            result = real_scan(*args, **kwargs)
+            scan_finished = True
+            return result
+
+        def recording_block(value: object) -> object:
+            assert scan_finished
+            blocked.append(value)
+            return value
+
+        def clock() -> float:
+            if scan_finished:
+                assert blocked
+            return real_time()
+
+        monkeypatch.setattr(jax.lax, "scan", recording_scan)
+        monkeypatch.setattr(jax, "block_until_ready", recording_block)
+        monkeypatch.setattr(module, "time", SimpleNamespace(time=clock))
+
+        if final_state_only:
+            result = run_sarsa_from_arrays_final_state(
+                agent,
+                state,
+                observations,
+                rewards,
+                terminated,
+                observations,
+            )
+            assert len(blocked) == 1
+            blocked_state = blocked[0]
+            assert isinstance(blocked_state, SARSAState)
+            assert blocked_state.step_count == result.step_count
+        else:
+            result = run_sarsa_from_arrays(
+                agent,
+                state,
+                observations,
+                rewards,
+                terminated,
+                observations,
+            )
+            assert len(blocked) == 1
+            (
+                blocked_state,
+                blocked_q_values,
+                blocked_td_errors,
+                blocked_actions,
+            ) = blocked[0]  # type: ignore[misc]
+            assert blocked_state.step_count == result.state.step_count
+            assert blocked_q_values is result.q_values
+            assert blocked_td_errors is result.td_errors
+            assert blocked_actions is result.actions
+
+    @pytest.mark.parametrize(
+        "runner",
+        [run_sarsa_from_arrays, run_sarsa_from_arrays_final_state],
+    )
+    def test_scan_rejects_discontinuous_current_observations(self, runner) -> None:
+        """Every declared transition row must be the one the scan consumes."""
+        agent = _make_agent(n_actions=2, hidden_sizes=(), epsilon_start=0.0)
+        observations = jnp.asarray(
+            [[1.0, 0.0], [99.0, -77.0], [1.0, 1.0]], dtype=jnp.float32
+        )
+        next_observations = jnp.asarray(
+            [[0.0, 1.0], [1.0, 1.0], [2.0, 2.0]], dtype=jnp.float32
+        )
+        rewards = jnp.asarray([0.25, -0.5, 1.0], dtype=jnp.float32)
+        terminated = jnp.zeros((3,), dtype=jnp.float32)
+        state = agent.init(feature_dim=2, key=jr.key(7))
+        action, key = agent.select_action(state, observations[0])
+        state = state.replace(  # type: ignore[attr-defined]
+            last_action=action,
+            last_observation=observations[0],
+            rng_key=key,
+        )
+
+        with pytest.raises(ValueError, match="transition continuity"):
+            runner(
+                agent,
+                state,
+                observations,
+                rewards,
+                terminated,
+                next_observations,
+            )
+
+    @pytest.mark.parametrize(
+        "runner",
+        [run_sarsa_from_arrays, run_sarsa_from_arrays_final_state],
+    )
+    def test_scan_rejects_unprimed_state(self, runner) -> None:
+        """An unprimed state would refuse every row without learning or raising."""
+        agent = _make_agent(n_actions=2, hidden_sizes=(), epsilon_start=0.0)
+        state = agent.init(feature_dim=2, key=jr.key(7))
+        observations = jnp.asarray([[0.0, 0.0], [1.0, 0.0]], dtype=jnp.float32)
+        next_observations = jnp.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=jnp.float32)
+
+        with pytest.raises(ValueError, match="must be primed"):
+            runner(
+                agent,
+                state,
+                observations,
+                jnp.ones((2,), dtype=jnp.float32),
+                jnp.zeros((2,), dtype=jnp.float32),
+                next_observations,
+            )
+
     def test_scan_shapes(self):
         """Scan loop produces correct output shapes."""
         agent = _make_agent(n_actions=2, hidden_sizes=(8,))
         state = agent.init(feature_dim=4, key=jr.key(42))
 
         n_steps = 20
-        obs = jax.random.normal(jr.key(0), (n_steps, 4))
-        next_obs = jax.random.normal(jr.key(1), (n_steps, 4))
+        trajectory = jax.random.normal(jr.key(0), (n_steps + 1, 4))
+        obs = trajectory[:-1]
+        next_obs = trajectory[1:]
         rewards = jnp.ones(n_steps)
         terminated = jnp.zeros(n_steps)
 
@@ -996,6 +1233,68 @@ class TestSARSAScan:
 
         # Should run without error and produce finite results
         assert jnp.all(jnp.isfinite(result.td_errors))
+
+    def test_scan_matches_continuing_runner_across_episode_resets(self):
+        """After a terminal row the next row starts from its reset observation."""
+        from alberta_framework import run_sarsa_continuing
+
+        table = np.asarray(jr.normal(jr.key(1), (40, 3)), dtype=np.float32)
+
+        class _EpisodicEnv:
+            """Action-independent episodes of four steps over a fixed table."""
+
+            def __init__(self) -> None:
+                self.index = 0
+                self.t = 0
+
+            def reset(self):
+                self.t = 0
+                self.index += 1
+                return table[self.index - 1], {}
+
+            def step(self, action):
+                del action
+                self.t += 1
+                self.index += 1
+                return table[self.index - 1], float(self.index % 3), self.t == 4, False, {}
+
+        agent = _make_agent(n_actions=2, hidden_sizes=(), gamma=0.9, epsilon_start=0.2)
+        initial = agent.init(feature_dim=3, key=jr.key(0))
+        n_steps = 12
+        continuing = run_sarsa_continuing(agent, initial, _EpisodicEnv(), n_steps)
+
+        env = _EpisodicEnv()
+        observation, _ = env.reset()
+        rows: list[tuple[np.ndarray, float, float, np.ndarray]] = []
+        for _ in range(n_steps):
+            next_observation, reward, terminated, _, _ = env.step(0)
+            rows.append((observation, reward, float(terminated), next_observation))
+            observation = env.reset()[0] if terminated else next_observation
+        obs = jnp.asarray(np.stack([row[0] for row in rows]))
+        rewards = jnp.asarray([row[1] for row in rows], dtype=jnp.float32)
+        terminated = jnp.asarray([row[2] for row in rows], dtype=jnp.float32)
+        next_obs = jnp.asarray(np.stack([row[3] for row in rows]))
+        action, new_key = agent.select_action(initial, obs[0])
+        primed = initial.replace(  # type: ignore[attr-defined]
+            last_action=action,
+            last_observation=obs[0],
+            rng_key=new_key,
+        )
+
+        result = run_sarsa_from_arrays(agent, primed, obs, rewards, terminated, next_obs)
+        final = run_sarsa_from_arrays_final_state(
+            agent, primed, obs, rewards, terminated, next_obs
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(result.td_errors), np.asarray(continuing.td_errors), atol=1e-5
+        )
+        for state in (result.state, final):
+            chex.assert_trees_all_close(
+                state.learner_state.head_params,
+                continuing.state.learner_state.head_params,
+                atol=1e-5,
+            )
 
 
 # =============================================================================
@@ -1177,6 +1476,123 @@ class TestSARSALambdaTraces:
     externally (no internal bootstrap).
     """
 
+    @pytest.mark.parametrize("terminated", [False, True])
+    @pytest.mark.parametrize("lamda", [0.0, 0.8])
+    def test_delayed_reward_credits_previous_action(self, terminated, lamda):
+        """A later action's TD error updates every eligible control head."""
+        agent = _make_agent(
+            hidden_sizes=(), gamma=0.9, epsilon_start=0.0, lamda=lamda, step_size=0.1
+        )
+        state = agent.init(feature_dim=2, key=jr.key(14))
+        inner = state.learner_state
+        # Q(s0, a0) = Q(s1, a1) = 0, but Q(s1, a0) = 0.4. The delayed
+        # update must use the taken action's common TD error, not head 0's.
+        params = inner.head_params.replace(
+            weights=(jnp.array([[0.0, 0.4]]), jnp.zeros((1, 2))),
+            biases=(jnp.zeros(1), jnp.zeros(1)),
+        )
+        state = state.replace(
+            learner_state=inner.replace(head_params=params),
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=jnp.array([1.0, 0.0]),
+        )
+        first = agent.update(
+            state, jnp.array(0.0), jnp.array([0.0, 1.0]), jnp.array(False), jnp.array(1)
+        )
+        result = agent.update(
+            first.state, jnp.array(1.0), jnp.zeros(2), jnp.array(terminated), jnp.array(0)
+        )
+
+        assert int(result.state.step_count) == 2
+        np.testing.assert_allclose(result.td_error, 1.0)
+        expected_credit = 0.1 * 0.9 * lamda
+        np.testing.assert_allclose(
+            result.state.learner_state.head_params.weights[0],
+            [[expected_credit, 0.4]], rtol=1e-6, atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            result.state.learner_state.head_params.biases[0],
+            [expected_credit], rtol=1e-6, atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            result.state.learner_state.head_params.weights[1], [[0.0, 0.1]], rtol=1e-6
+        )
+        if terminated and lamda > 0.0:
+            for trace in jax.tree.leaves(result.state.learner_state.head_traces):
+                np.testing.assert_array_equal(trace, jnp.zeros_like(trace))
+
+    def test_delayed_credit_uses_head_optimizer_and_bounder(self):
+        """Inactive credit respects Adam's delta convention and the step bound."""
+        agent = _make_agent(
+            hidden_sizes=(), gamma=0.9, epsilon_start=0.0, lamda=0.8,
+            head_optimizer=Adam(step_size=0.2, beta1=0.0, beta2=0.0),
+            bounder=ObGDBounding(kappa=10.0),
+        )
+        state = agent.init(feature_dim=2, key=jr.key(15))
+        inner = state.learner_state
+        state = state.replace(
+            learner_state=inner.replace(
+                head_params=jax.tree.map(jnp.zeros_like, inner.head_params)
+            ),
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=jnp.array([1.0, 0.0]),
+        )
+        first = agent.update(
+            state, jnp.array(0.0), jnp.array([0.0, 1.0]), jnp.array(False), jnp.array(1)
+        )
+        result = agent.update(
+            first.state, jnp.array(2.0), jnp.zeros(2), jnp.array(False), jnp.array(0)
+        )
+
+        assert int(result.state.step_count) == 2
+        np.testing.assert_allclose(result.td_error, 2.0)
+        # Adam with beta1=beta2=0 proposes +0.2 on each nonzero coordinate.
+        # Two coordinates (weight+bias) meet ObGD's total-step bound of 0.1.
+        np.testing.assert_allclose(
+            result.state.learner_state.head_params.weights[0], [[0.05, 0.0]],
+            rtol=1e-6, atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            result.state.learner_state.head_params.biases[0], [0.05], rtol=1e-6
+        )
+
+        # The bounder's diagnostic scale must not attenuate eligibility.
+        np.testing.assert_allclose(
+            result.state.learner_state.head_traces[0][0], [[0.72, 0.0]], rtol=1e-6
+        )
+        np.testing.assert_allclose(
+            result.state.learner_state.head_traces[0][1], [0.72], rtol=1e-6
+        )
+
+    def test_nonfinite_delayed_credit_rolls_back_complete_update(self):
+        """A failing inactive-head update cannot commit the active head or clock."""
+        agent = _make_agent(
+            hidden_sizes=(), gamma=0.9, epsilon_start=0.0, lamda=0.8, step_size=0.1
+        )
+        state = agent.init(feature_dim=2, key=jr.key(16))
+        inner = state.learner_state
+        traces = list(inner.head_traces)
+        traces[0] = (jnp.array([[1e20, 0.0]]), jnp.zeros(1))
+        state = state.replace(
+            learner_state=inner.replace(
+                head_params=jax.tree.map(jnp.zeros_like, inner.head_params),
+                head_traces=tuple(traces),
+                birth_timestamp=jnp.array(0.0),
+                uptime_s=jnp.array(0.0),
+            ),
+            last_action=jnp.array(1, dtype=jnp.int32),
+            last_observation=jnp.array([0.0, 1.0]),
+        )
+        result = agent.update(
+            state, jnp.array(1e20), jnp.zeros(2), jnp.array(False), jnp.array(0)
+        )
+
+        # Head 1's 1e19 update is finite; the inactive head's delayed 7.2e38
+        # update overflows float32. Both updates and both counters must roll back.
+        # The rejected update reports the prior action the state kept, not -1.
+        assert int(result.action) == 1
+        chex.assert_trees_all_equal(result.state, state)
+
     def test_control_head_trace_decay_factor(self):
         """Active control head's trace decays by gamma*lamda, not 0."""
         gamma, lamda = 0.9, 0.8
@@ -1295,6 +1711,157 @@ class TestSARSALambdaTraces:
             w_trace, b_trace = result.state.learner_state.head_traces[i]
             assert jnp.allclose(w_trace, 0.0), f"head {i} w-trace not reset"
             assert jnp.allclose(b_trace, 0.0), f"head {i} b-trace not reset"
+
+    def test_truncated_episode_does_not_leak_traces_into_the_next(self):
+        """``run_sarsa_episode`` ends on truncation, so traces must not survive it.
+
+        A truncated transition keeps its bootstrap (the state is not terminal)
+        but the next call resets the environment, so credit accumulated in the
+        eligibility traces must not be applied to the first update of an
+        unrelated episode.
+        """
+        from alberta_framework import run_sarsa_episode
+
+        class _TruncatingCorridor:
+            """One-hot three-state corridor that truncates after three steps."""
+
+            def __init__(self) -> None:
+                self._t = 0
+
+            def reset(self):
+                self._t = 0
+                return np.eye(3, dtype=np.float32)[0], {}
+
+            def step(self, action: int):
+                self._t += 1
+                obs = np.eye(3, dtype=np.float32)[min(self._t, 2)]
+                return obs, 1.0, False, self._t >= 3, {}
+
+        agent = _make_agent(
+            n_actions=1,
+            hidden_sizes=(),
+            gamma=0.9,
+            epsilon_start=0.0,
+            lamda=0.8,
+        )
+        state = agent.init(feature_dim=3, key=jr.key(3))
+        result = run_sarsa_episode(agent, state, _TruncatingCorridor(), max_steps=10)
+        assert result.num_steps == 3
+
+        w_trace, b_trace = result.state.learner_state.head_traces[0]
+        assert jnp.allclose(w_trace, 0.0), "control-head w-trace leaked across truncation"
+        assert jnp.allclose(b_trace, 0.0), "control-head b-trace leaked across truncation"
+
+        # The first update of the next episode credits only the feature it visited.
+        env = _TruncatingCorridor()
+        obs0, _ = env.reset()
+        state = result.state.replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=jnp.asarray(obs0),
+        )
+        obs1, reward, _, _, _ = env.step(0)
+        before = state.learner_state.head_params.weights[0]
+        after = agent.update(
+            state,
+            jnp.array(reward, dtype=jnp.float32),
+            jnp.asarray(obs1),
+            jnp.array(0.0),
+            jnp.array(0, dtype=jnp.int32),
+        ).state.learner_state.head_params.weights[0]
+        delta = np.asarray(after - before).reshape(-1)
+        assert delta[0] != 0.0
+        np.testing.assert_array_equal(delta[1:], 0.0)
+
+    def test_max_steps_cutoff_does_not_leak_traces_into_the_next(self):
+        """Running out of ``max_steps`` also ends the episode, so traces must not survive it.
+
+        The environment never terminates or truncates; the loop's own budget
+        stops it. The next call resets the environment just as it does after a
+        truncation, so the first update of that episode must credit only the
+        feature it visited.
+        """
+        from alberta_framework import run_sarsa_episode
+
+        class _OpenCorridor:
+            """One-hot four-state corridor that never ends an episode itself."""
+
+            def __init__(self) -> None:
+                self._t = 0
+
+            def reset(self):
+                self._t = 0
+                return np.eye(4, dtype=np.float32)[0], {}
+
+            def step(self, action: int):
+                self._t += 1
+                obs = np.eye(4, dtype=np.float32)[min(self._t, 3)]
+                return obs, 1.0, False, False, {}
+
+        agent = _make_agent(
+            n_actions=1,
+            hidden_sizes=(),
+            gamma=0.9,
+            epsilon_start=0.0,
+            lamda=0.8,
+        )
+        state = agent.init(feature_dim=4, key=jr.key(5))
+        result = run_sarsa_episode(agent, state, _OpenCorridor(), max_steps=3)
+        assert result.num_steps == 3
+
+        w_trace, b_trace = result.state.learner_state.head_traces[0]
+        assert jnp.allclose(w_trace, 0.0), "control-head w-trace leaked across max_steps"
+        assert jnp.allclose(b_trace, 0.0), "control-head b-trace leaked across max_steps"
+
+        # The first update of the next episode credits only the feature it visited.
+        env = _OpenCorridor()
+        obs0, _ = env.reset()
+        state = result.state.replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(0, dtype=jnp.int32),
+            last_observation=jnp.asarray(obs0),
+        )
+        obs1, reward, _, _, _ = env.step(0)
+        before = state.learner_state.head_params.weights[0]
+        after = agent.update(
+            state,
+            jnp.array(reward, dtype=jnp.float32),
+            jnp.asarray(obs1),
+            jnp.array(0.0),
+            jnp.array(0, dtype=jnp.int32),
+        ).state.learner_state.head_params.weights[0]
+        delta = np.asarray(after - before).reshape(-1)
+        assert delta[0] != 0.0
+        np.testing.assert_array_equal(delta[1:], 0.0)
+
+    def test_reset_control_traces_clears_only_control_heads(self):
+        """The public reset zeroes control-head traces and touches nothing else."""
+        agent = _make_agent(n_actions=2, hidden_sizes=(), gamma=0.9, epsilon_start=0.0, lamda=0.8)
+        state = agent.init(feature_dim=3, key=jr.key(4)).replace(  # type: ignore[attr-defined]
+            last_action=jnp.array(1, dtype=jnp.int32),
+            last_observation=jnp.array([1.0, 2.0, 3.0], dtype=jnp.float32),
+        )
+        state = agent.update(
+            state,
+            jnp.array(0.5),
+            jnp.array([0.5, -1.0, 2.0], dtype=jnp.float32),
+            jnp.array(0.0),
+            jnp.array(1, dtype=jnp.int32),
+        ).state
+        assert not jnp.allclose(state.learner_state.head_traces[1][0], 0.0)
+
+        reset = agent.reset_control_traces(state)
+        for i in range(2):
+            assert jnp.allclose(reset.learner_state.head_traces[i][0], 0.0)
+            assert jnp.allclose(reset.learner_state.head_traces[i][1], 0.0)
+        chex.assert_trees_all_equal(
+            reset.learner_state.head_params, state.learner_state.head_params
+        )
+        chex.assert_trees_all_equal(
+            reset.learner_state.trunk_traces, state.learner_state.trunk_traces
+        )
+        assert int(reset.step_count) == int(state.step_count)
+        assert int(reset.last_action) == int(state.last_action)
+        with pytest.raises(ValueError, match="SARSAState"):
+            agent.reset_control_traces(state.learner_state)  # type: ignore[arg-type]
 
     def test_external_target_semantics_intact(self):
         """With lamda>0, the TD target is still r + gamma*Q(s',a') (no
@@ -1740,7 +2307,9 @@ def test_sarsa_invalid_next_action_is_an_exact_noop(next_action: int) -> None:
         jnp.asarray(next_action, dtype=jnp.int32),
     )
     _assert_sarsa_state_exact_ignoring_host_time(result.state, state)
-    assert int(result.action) == -1
+    # The update is rejected, so the state keeps its prior action and the
+    # result reports that action instead of the -1 refusal sentinel.
+    assert int(result.action) == int(action)
     assert float(result.td_error) == 0.0
     assert bool(jnp.all(result.q_values == 0.0))
 
@@ -1769,7 +2338,9 @@ def test_sarsa_invalid_dynamic_transition_is_an_exact_noop(reward, terminated) -
         jnp.asarray(0, dtype=jnp.int32),
     )
     _assert_sarsa_state_exact_ignoring_host_time(result.state, state)
-    assert int(result.action) == -1
+    # The update is rejected, so the state keeps its prior action 0 and the
+    # result reports it instead of the -1 refusal sentinel.
+    assert int(result.action) == 0
 
 
 def test_sarsa_public_array_shapes_and_dtypes_fail_before_transaction() -> None:
@@ -1798,3 +2369,52 @@ def test_sarsa_select_action_rejects_nonfinite_without_consuming_rng() -> None:
     )
     assert int(action) == -1
     chex.assert_trees_all_equal(key, state.rng_key)
+
+
+class _RecordingCorridor:
+    """Corridor that records every dispatched action and can emit a NaN sensor row."""
+
+    def __init__(self, *, nan_reset: bool = False, nan_step: bool = False) -> None:
+        self.actions: list[int] = []
+        self._nan_reset = nan_reset
+        self._nan_step = nan_step
+
+    def reset(self):
+        fill = np.nan if self._nan_reset else 1.0
+        return np.full((2,), fill, dtype=np.float32), {}
+
+    def step(self, action: int):
+        self.actions.append(action)
+        fill = np.nan if self._nan_step else 1.0
+        return np.full((2,), fill, dtype=np.float32), 1.0, False, False, {}
+
+
+@pytest.mark.parametrize("runner_name", ["run_sarsa_episode", "run_sarsa_continuing"])
+def test_env_runner_refuses_to_dispatch_rejected_first_action(runner_name: str) -> None:
+    import alberta_framework
+
+    runner = getattr(alberta_framework, runner_name)
+    agent = _make_agent(n_actions=2, hidden_sizes=())
+    state = agent.init(feature_dim=2, key=jr.key(0))
+    env = _RecordingCorridor(nan_reset=True)
+
+    with pytest.raises(ValueError, match="dispatch"):
+        runner(agent, state, env, 3)
+
+    assert env.actions == []
+
+
+@pytest.mark.parametrize("runner_name", ["run_sarsa_episode", "run_sarsa_continuing"])
+def test_env_runner_refuses_to_dispatch_rejected_next_action(runner_name: str) -> None:
+    import alberta_framework
+
+    runner = getattr(alberta_framework, runner_name)
+    agent = _make_agent(n_actions=2, hidden_sizes=())
+    state = agent.init(feature_dim=2, key=jr.key(0))
+    env = _RecordingCorridor(nan_step=True)
+
+    with pytest.raises(ValueError, match="dispatch"):
+        runner(agent, state, env, 3)
+
+    assert len(env.actions) == 1
+    assert env.actions[0] >= 0

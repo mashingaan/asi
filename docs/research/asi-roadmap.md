@@ -246,8 +246,14 @@ dimensions. Post-hoc tradeoff weights cannot turn a regression into a win.
 
 ## Current program priorities
 
-1. **Execute the implemented Switching + RiverSwim development scorecard.** The
-   literal-frozen L0 plan defines 144 fresh-process shards over 12 consumed
+1. **Resolve the measured control-calibration and candidate bottlenecks.** The
+   [completed hosted scorecard](../../outputs/reference_life_scorecard_development/run2-2026-10-09/README.md)
+   is independently validated. Its `valid_baseline_failure` decision reflects
+   nonqualifying RiverSwim controls; no candidate is selected. Use a separately
+   declared bounded investigation rather than relaxing the completed run’s gates.
+   The [hillclimb status](../status.md#reference-life-hillclimb) records the
+   two optimistic RiverSwim controls and the SwitchingTwoState step probe
+   that should inform the next matched plan. The literal-frozen L0 plan defines 144 fresh-process shards over 12 consumed
    development seeds, two environments, and Prototype, frozen/no-learning,
    random, finite-horizon privileged dynamic-programming, differential-SARSA,
    and discounted-SARSA arms. Each shard binds its current source identity, and
@@ -303,3 +309,12 @@ Genuinely new ASI-native protocol and artifact families should use versioned
 `asi.*` schema IDs and may add `asi-*` CLI aliases. A new version that extends a
 frozen Alberta-family schema retains its `alberta.*` lineage and compatible
 loader. New aliases are additive; historical IDs are never renamed.
+
+## October 2026 backlog review
+
+The [issue review](issue-review-2026-10.md) records completed native work and
+research umbrellas retired from the active queue. Closing an umbrella as not
+planned does not certify its external benchmark or erase existing local work.
+The roadmap keeps these directions available for a later concrete integration
+question; the immediate selection gate remains the matched reference-life
+scorecard.

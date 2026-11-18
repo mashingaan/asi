@@ -21,6 +21,18 @@ initialization of the audited reference.  These per-step gradients then enter
 ordinary streaming eligibility traces; the TD error is applied exactly once,
 by the final ObGD update.
 
+For a transition from S_t to S_{t+1}, the supplied discount is gamma_{t+1}
+for the bootstrap.  The prior accepted transition's discount, gamma_t, decays
+the accumulated actor and critic traces.  A terminal reward therefore credits
+the completed episode before its stored traces are cleared.
+
+The state persists ``previous_discount``.  Checkpoints made before that
+field existed cannot identify a variable-discount cursor and must not be
+silently migrated.  Restore with a current ``agent.init()`` template: the
+generic checkpoint loader rejects the old leaf structure.  Start a fresh
+state instead of guessing the missing discount from the current
+configuration.
+
 This is a research core, not a claim of state-of-the-art performance.  Online
 parameter changes make retained RTRL sensitivities stale in the precise sense
 discussed by Farr et al.  The default path retains the ordinary stale trace;
@@ -53,6 +65,7 @@ from alberta_framework.core.update_safety import (
 )
 
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
+_FLOAT32_MIN = float(np.finfo(np.float32).min)
 _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
 _MINIMUM_EXP_LOG = math.log(_FLOAT32_TINY)
 _MAXIMUM_NU_LOG = math.log(-math.log(_FLOAT32_TINY))
@@ -172,6 +185,11 @@ class RecurrentTraceActorCriticState(NamedTuple):
     episode resets and are present only for an adaptive-ObGD configuration.
     ``last_observation``, ``last_action``, ``rng_key``, and ``step_count``
     mirror the lifecycle fields used by Alberta's existing control cores.
+    ``previous_discount`` is the discount of the most recent accepted
+    transition (gamma_t, the discount into the current state's observation);
+    it decays the eligibility traces while the current call's discount only
+    controls the TD bootstrap.  It is initialized to ``config.gamma`` with
+    zero traces.
     """
 
     actor_params: RTUNetworkParameters
@@ -191,6 +209,7 @@ class RecurrentTraceActorCriticState(NamedTuple):
     last_action: Array
     rng_key: Array
     step_count: Array
+    previous_discount: Array
     started: Array
     actor_second_moments: RTUNetworkParameters | None = None
     critic_second_moments: RTUNetworkParameters | None = None
@@ -238,21 +257,7 @@ class AdaptiveObGDUpdate(NamedTuple):
 
 
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _ACTUAL_FLOAT_TYPES = frozenset(
     {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
 )
@@ -265,6 +270,24 @@ def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _IN
     if not minimum <= canonical <= maximum:
         raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     return canonical
+
+
+def _require_typed_threefry_key(name: str, value: object) -> Array:
+    """Reject keys whose physical representation violates the state budget."""
+    if not isinstance(value, jax.Array) or tuple(value.shape) != ():
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key")
+    try:
+        implementation = str(jr.key_impl(value))
+        words = jr.key_data(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key") from error
+    if (
+        implementation != "threefry2x32"
+        or tuple(words.shape) != (2,)
+        or words.dtype != jnp.uint32
+    ):
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key")
+    return value
 
 
 def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
@@ -351,7 +374,9 @@ def _preflight_state_resources(
         + 2 * sensitivity_scalars * (2 if config.rtrl_taylor_correction else 1)
         + 4 * config.hidden_size
         + 4 * width
-        + 3
+        # Reward statistics (mean, m2, discounted return) plus the persisted
+        # previous-discount cursor for eligibility-trace decay.
+        + 4
     )
     # Two statistics counters, last action, typed key, step counter, and the
     # started flag are six logical array elements. The typed key occupies two
@@ -401,6 +426,13 @@ def _copy_config_mapping(name: str, config: object) -> dict[str, Any]:
     if any(type(key) is not str for key in payload):
         raise ValueError(f"{name} fields must be strings")
     return cast(dict[str, Any], payload)
+
+
+# ``to_config`` omits the default adaptive-ObGD fields, and retained receipts
+# predate ``rtrl_taylor_correction``. Every other field is always serialized.
+_OPTIONAL_SERIALIZED_CONFIG_FIELDS = frozenset(
+    {"adaptive_obgd", "beta2", "epsilon", "rtrl_taylor_correction"}
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -604,6 +636,11 @@ class RecurrentTraceActorCriticConfig:
     ) -> RecurrentTraceActorCriticConfig:
         """Reconstruct and validate a configuration mapping."""
         payload = _copy_config_mapping("config", config)
+        missing = {field.name for field in dataclasses.fields(cls)} - (
+            payload.keys() | _OPTIONAL_SERIALIZED_CONFIG_FIELDS
+        )
+        if missing:
+            raise ValueError(f"config has missing fields: {', '.join(sorted(missing))}")
         try:
             return cls(**payload)
         except TypeError as error:
@@ -615,7 +652,45 @@ def parameterless_layer_norm(inputs: Array, epsilon: float = 1e-5) -> Array:
     mean = jnp.mean(inputs, axis=-1, keepdims=True)
     centered = inputs - mean
     variance = jnp.mean(jnp.square(centered), axis=-1, keepdims=True)
-    return centered * jax.lax.rsqrt(variance + jnp.asarray(epsilon, inputs.dtype))
+    epsilon_array = jnp.asarray(epsilon, inputs.dtype)
+    direct = centered * jax.lax.rsqrt(variance + epsilon_array)
+    reduction_only_overflow = (
+        (~jnp.isfinite(mean) | ~jnp.isfinite(variance))
+        & jnp.all(jnp.isfinite(inputs), axis=-1, keepdims=True)
+    )
+
+    scale = jnp.max(jnp.abs(inputs), axis=-1, keepdims=True)
+    safe_scale = jnp.where(scale > 0.0, scale, jnp.ones_like(scale))
+    fallback_inputs = jnp.where(
+        reduction_only_overflow,
+        inputs,
+        jnp.zeros_like(inputs),
+    )
+    fallback_scale = jnp.where(
+        reduction_only_overflow,
+        safe_scale,
+        jnp.ones_like(safe_scale),
+    )
+    # Dividing by a float32 scale above 2**126 can lower to multiplication by
+    # a subnormal reciprocal that XLA:CPU flushes to zero.  Scaling by the
+    # scale's binary exponent is exact and keeps the largest finite input in
+    # [0.5, 1.0), including values near the float32 ceiling.
+    _, fallback_exponent = jnp.frexp(fallback_scale)
+    scaled_inputs = jnp.ldexp(fallback_inputs, -fallback_exponent)
+    scaled_centered = scaled_inputs - jnp.mean(
+        scaled_inputs, axis=-1, keepdims=True
+    )
+    scaled_variance = jnp.mean(
+        jnp.square(scaled_centered), axis=-1, keepdims=True
+    )
+    scaled_epsilon = jnp.ldexp(epsilon_array, -2 * fallback_exponent)
+    stable_denominator = jnp.where(
+        scaled_variance > 0.0,
+        scaled_variance + scaled_epsilon,
+        jnp.ones_like(scaled_variance),
+    )
+    stable = scaled_centered * jax.lax.rsqrt(stable_denominator)
+    return jnp.where(reduction_only_overflow, stable, direct)
 
 
 def leaky_relu(inputs: Array, negative_slope: float = 0.01) -> Array:
@@ -1387,6 +1462,14 @@ def obgd_update(
     denominator = jnp.maximum(1.0, bound_term)
     scale = jnp.reciprocal(denominator)
     step_size = alpha_array * scale
+    # The bound product can overflow even when its alpha-cancelled step fits.
+    # Keep the ordinary path unchanged; divide the remaining factors separately.
+    overflow_step = (
+        jnp.reciprocal(kappa_array) / jnp.maximum(jnp.abs(signal), 1.0) / z_sum
+    )
+    bound_overflow = jnp.isposinf(bound_term)
+    step_size = jnp.where(bound_overflow, overflow_step, step_size)
+    scale = jnp.where(bound_overflow, step_size / alpha_array, scale)
     proposed_updates = jax.tree_util.tree_map(
         lambda trace: step_size * signal * trace,
         traces,
@@ -1411,6 +1494,58 @@ def obgd_update(
         step_size=jnp.where(update_applied, step_size, jnp.zeros_like(step_size)),
         scale=jnp.where(update_applied, scale, jnp.zeros_like(scale)),
         update_applied=update_applied,
+    )
+
+
+def _adaptive_obgd_weighted_square(scale: Array, value: Array) -> Array:
+    """Apply the EMA weight before squaring when a finite square overflows.
+
+    ``scale * value**2`` is the ordinary second-moment increment. A finite
+    square keeps that product bitwise. When the square is outside float32,
+    the exponent form applies ``scale`` before the square so a representable
+    weighted moment stays finite. A result that is still outside float32
+    stays non-finite and the caller rejects the update.
+    """
+    square = value**2
+    ordinary = scale * square
+    value_mantissa, value_exponent = jnp.frexp(value)
+    scale_mantissa, scale_exponent = jnp.frexp(scale)
+    recovered = jnp.ldexp(
+        scale_mantissa * value_mantissa**2,
+        scale_exponent + 2 * value_exponent,
+    )
+    return jnp.where(
+        jnp.isfinite(square) | ~jnp.isfinite(recovered),
+        ordinary,
+        recovered,
+    )
+
+
+def _adaptive_obgd_second_moment_rms(second_moment: Array, correction: Array) -> Array:
+    """Return ``sqrt(moment / correction)`` without overflowing the quotient.
+
+    Bias correction divides by ``1 - beta2**step``. On the first step that
+    divisor is ``1 - beta2``, so the quotient rebuilds ``(signal * z)**2``.
+    A finite direct root stays bitwise. A still-unrepresentable root stays
+    non-finite so the caller rejects the update.
+    """
+    direct = jnp.sqrt(second_moment / correction)
+    moment_mantissa, moment_exponent = jnp.frexp(second_moment)
+    correction_mantissa, correction_exponent = jnp.frexp(correction)
+    exponent_delta = moment_exponent - correction_exponent
+    half_exponent = jnp.floor_divide(exponent_delta, jnp.int32(2))
+    odd_exponent = (exponent_delta & jnp.int32(1)) != 0
+    root = jnp.sqrt(moment_mantissa / correction_mantissa)
+    root = jnp.where(
+        odd_exponent,
+        root * jnp.sqrt(jnp.asarray(2.0, dtype=second_moment.dtype)),
+        root,
+    )
+    recovered = jnp.ldexp(root, half_exponent)
+    return jnp.where(
+        jnp.isfinite(direct) | ~jnp.isfinite(recovered),
+        direct,
+        recovered,
     )
 
 
@@ -1444,23 +1579,24 @@ def adaptive_obgd_update(
 
     beta = jnp.asarray(beta2, dtype=signal.dtype)
     epsilon_array = jnp.asarray(epsilon, dtype=signal.dtype)
+    innovation_scale = 1.0 - beta
     proposed_second_moment = jax.tree_util.tree_map(
         lambda previous, trace: (
             jnp.where(beta == 0.0, jnp.zeros_like(previous), beta * previous)
-            + (1.0 - beta) * jnp.square(signal * trace)
+            + _adaptive_obgd_weighted_square(innovation_scale, signal * trace)
         ),
         second_moment,
         traces,
     )
     bias_correction = 1.0 - beta**step_array
-    corrected_second_moment = jax.tree_util.tree_map(
-        lambda moment: moment / bias_correction,
+    second_moment_rms = jax.tree_util.tree_map(
+        lambda moment: _adaptive_obgd_second_moment_rms(moment, bias_correction),
         proposed_second_moment,
     )
     normalized_traces = jax.tree_util.tree_map(
-        lambda trace, corrected: trace / (jnp.sqrt(corrected) + epsilon_array),
+        lambda trace, root: trace / (root + epsilon_array),
         traces,
-        corrected_second_moment,
+        second_moment_rms,
     )
 
     z_sum = jnp.asarray(0.0, dtype=signal.dtype)
@@ -1825,6 +1961,47 @@ def _runtime_checked_value(
     )
 
 
+def _temperature_scaled_logits(logits: Array, temperature: float) -> Array:
+    """Scale logits for softmax without exposing a rounded argmax to fusion.
+
+    XLA may recompute ``logits * (1 / temperature)`` inside both fused
+    subcomputations of a compiled ``jax.nn.softmax``/``jax.nn.log_softmax``.
+    The contracted multiply-then-subtract leaves a rounding residual at the
+    argmax instead of an exact zero; once ``|logits / temperature|`` is large
+    enough that residual drives the exponential to ``inf`` or ``0`` and a
+    finite input yields a NaN policy, a silently rejected update, or a dropped
+    gradient.
+
+    Both shifts below are exact (softmax and log-softmax are shift invariant),
+    and each blocks one of the two recomputations.  When the temperature
+    exceeds one, halving both operands first is equally exact and keeps the
+    pre-scale centering finite for opposite finite extreme logits whose
+    pairwise distance exceeds the float32 maximum — inputs where the plain
+    ``logits / temperature`` expression stays finite and must stay finite.
+
+    For temperatures at or below one, that centering subtraction and the
+    division itself can still overflow: float32 cannot represent the pairwise
+    distance of ``[3e38, -3e38]``, so the shifted quotient reaches ``-inf``
+    and downstream ``probability * log_probability`` entropy products evaluate
+    ``0 * -inf`` as NaN.  The negative tail is therefore clamped to the finite
+    floating-point minimum, which is exact for every reported quantity:
+    ``exp(floor)`` underflows to zero exactly like ``exp(-inf)``, so softmax
+    results, derived probabilities, and the normalization sum are unchanged,
+    while log-probabilities stay finite and gradients remain finite.
+    """
+    if temperature > 1.0:
+        # Halving both operands is exact and prevents centering opposite finite
+        # extremes from overflowing before a large temperature brings them in range.
+        logits = logits * 0.5
+        temperature *= 0.5
+    # Both shifts preserve softmax/log-softmax while keeping division in range.
+    centered = logits - jax.lax.stop_gradient(jnp.max(logits))
+    scaled = centered / temperature
+    shifted = scaled - jax.lax.stop_gradient(jnp.max(scaled))
+    # NaN propagates through maximum, so genuine NaN inputs still surface.
+    return jnp.maximum(shifted, _FLOAT32_MIN)
+
+
 class RecurrentTraceActorCriticAgent:
     """One-transition-at-a-time softmax actor-critic with RTU-RTRL.
 
@@ -1881,6 +2058,7 @@ class RecurrentTraceActorCriticAgent:
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
         resources = self._config.state_resource_budget(feature_dim)
         _preflight_update_working_set(self._config, resources)
+        key = _require_typed_threefry_key("key", key)
         actor_key, critic_key, policy_key = jr.split(key, 3)
         actor_params = initialize_rtu_network_parameters(
             actor_key,
@@ -1936,6 +2114,7 @@ class RecurrentTraceActorCriticAgent:
             last_action=jnp.asarray(-1, dtype=jnp.int32),
             rng_key=policy_key,
             step_count=jnp.asarray(0, dtype=jnp.int32),
+            previous_discount=jnp.array(self._config.gamma, dtype=jnp.float32),
             started=jnp.asarray(False),
         )
 
@@ -2047,7 +2226,9 @@ class RecurrentTraceActorCriticAgent:
     ) -> Array:
         """Return the softmax policy of the already-advanced actor state."""
         logits = self._network_output(state.actor_params, state.actor_rtu_state)
-        return jax.nn.softmax(logits / self._config.temperature)
+        return jax.nn.softmax(
+            _temperature_scaled_logits(logits, self._config.temperature)
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def value(
@@ -2067,10 +2248,14 @@ class RecurrentTraceActorCriticAgent:
     ) -> tuple[Array, Array, Array]:
         """Sample from the current recurrent policy without advancing it."""
         logits = self._network_output(state.actor_params, state.actor_rtu_state)
-        tempered_logits = logits / self._config.temperature
+        tempered_logits = _temperature_scaled_logits(logits, self._config.temperature)
         probabilities = jax.nn.softmax(tempered_logits)
         key, sample_key = jr.split(state.rng_key)
-        action = jr.categorical(sample_key, tempered_logits).astype(jnp.int32)
+        action = jr.categorical(
+            sample_key,
+            tempered_logits,
+            mode="high",
+        ).astype(jnp.int32)
         return action, key, probabilities
 
     def _advance_actor(
@@ -2210,6 +2395,11 @@ class RecurrentTraceActorCriticAgent:
             "observation must contain only finite values",
         )
         normalized, statistics = self._normalize_observation(state, observation)
+        normalized = _runtime_checked_value(
+            normalized,
+            _floating_tree_is_finite((normalized, statistics)),
+            "observation normalization produced non-finite state",
+        )
         actor_inputs = self._network_encode(state.actor_params, normalized)
         critic_inputs = self._network_encode(state.critic_params, normalized)
         reset = jnp.asarray(True)
@@ -2289,7 +2479,9 @@ class RecurrentTraceActorCriticAgent:
         entropy_sign = jax.lax.stop_gradient(jnp.sign(td_error))
 
         def policy_objective(logits: Array) -> Array:
-            log_probabilities = jax.nn.log_softmax(logits / self._config.temperature)
+            log_probabilities = jax.nn.log_softmax(
+                _temperature_scaled_logits(logits, self._config.temperature)
+            )
             probabilities = jnp.exp(log_probabilities)
             entropy = -jnp.sum(probabilities * log_probabilities)
             return (
@@ -2332,7 +2524,9 @@ class RecurrentTraceActorCriticAgent:
         TD bootstrap.  Boundary precedence is ``episode_boundary``, then
         ``terminated``, then an explicitly supplied zero ``discount``.  A call
         that supplies none of them is continuing even when configured
-        ``gamma`` is zero.
+        ``gamma`` is zero.  The accepted transition's discount is saved as
+        ``state.previous_discount``: the next update's eligibility traces
+        decay with this incoming discount, never with the outgoing one.
 
         Examples:
             A true environment termination can use ``terminated=True``.
@@ -2417,6 +2611,9 @@ class RecurrentTraceActorCriticAgent:
             raise ValueError("state.started must have boolean dtype")
         if not isinstance(started, jax.core.Tracer) and not bool(started):
             raise RuntimeError("start must be called before update")
+        previous_discount = state.previous_discount
+        if previous_discount.shape != () or previous_discount.dtype != jnp.float32:
+            raise ValueError("state.previous_discount must be a scalar float32")
 
         reward_scalar = _validated_scalar(
             "reward",
@@ -2545,7 +2742,9 @@ class RecurrentTraceActorCriticAgent:
             state.actor_params,
             state.actor_rtu_state,
         )
-        current_log_policy = jax.nn.log_softmax(current_logits / self._config.temperature)
+        current_log_policy = jax.nn.log_softmax(
+            _temperature_scaled_logits(current_logits, self._config.temperature)
+        )
         current_policy = jnp.exp(current_log_policy)
         current_entropy = -jnp.sum(current_policy * current_log_policy)
 
@@ -2628,13 +2827,11 @@ class RecurrentTraceActorCriticAgent:
         _, actor_gradient = self._actor_gradient(state, td_error)
 
         # The terminating reward must still credit traces accumulated within
-        # the episode.  Stream AC(lambda) therefore applies gamma*lambda first
-        # and clears the stored trace only after the terminal update.
-        trace_discount = jnp.where(
-            boundary,
-            jnp.asarray(self._config.gamma, dtype=transition_discount.dtype),
-            transition_discount,
-        )
+        # the episode.  Stream AC(lambda) therefore decays by the incoming
+        # discount gamma_t (the prior accepted transition's discount) and
+        # clears the stored trace only after the terminal update; the current
+        # call's outgoing discount controls just the TD bootstrap above.
+        trace_discount = state.previous_discount
         actor_decay = trace_discount * self._config.actor_lamda
         critic_decay = trace_discount * self._config.critic_lamda
         actor_traces = cast(
@@ -2832,6 +3029,7 @@ class RecurrentTraceActorCriticAgent:
             last_normalized_observation=stored_observation,
             last_observation=stored_raw_observation,
             step_count=step_count,
+            previous_discount=transition_discount,
         )
         candidate_applied = (
             actor_update_applied
@@ -2851,6 +3049,8 @@ class RecurrentTraceActorCriticAgent:
             & state.started
             & (state.last_action >= 0)
             & (state.last_action < self._config.n_actions)
+            & (state.previous_discount >= 0.0)
+            & (state.previous_discount <= 1.0)
         )
         action_state = jax.lax.cond(
             candidate_applied,
@@ -2880,7 +3080,7 @@ class RecurrentTraceActorCriticAgent:
             action=jnp.where(
                 update_applied,
                 next_action,
-                jnp.asarray(0, dtype=jnp.int32),
+                state.last_action,
             ),
             policy=jnp.where(update_applied, next_policy, jnp.zeros_like(next_policy)),
             value=jnp.where(update_applied, value, zero),

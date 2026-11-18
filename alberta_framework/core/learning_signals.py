@@ -58,21 +58,7 @@ from alberta_framework.core._float32_scalars import (
 
 _INT32_MAX = 2_147_483_647
 _FLOAT32_MAX = float.fromhex("0x1.fffffep+127")
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -133,9 +119,12 @@ def _ratio_less_equal(left: tuple[int, int], right: tuple[int, int]) -> bool:
 
 
 def _stable_mean(values: Array, *, axis: int | None = None) -> Array:
-    """Average bounded float32 values without overflowing the reduction sum."""
+    """Average bounded values without overflowing or erasing small inputs."""
     count = values.size if axis is None else values.shape[axis]
-    return jnp.sum(values / jnp.asarray(count, dtype=jnp.float32), axis=axis)
+    scale = jnp.max(jnp.abs(values), axis=axis, keepdims=True)
+    safe_scale = jnp.where(scale > 0.0, scale, jnp.ones_like(scale))
+    mean = jnp.sum(values / safe_scale, axis=axis) / jnp.asarray(count, dtype=jnp.float32)
+    return mean * jnp.squeeze(safe_scale, axis=axis)
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -323,17 +312,28 @@ class LearningSignalEstimatorConfig:
         cls,
         config: dict[str, Any],
     ) -> LearningSignalEstimatorConfig:
-        """Reconstruct a configuration and reject a mismatched type marker."""
+        """Reconstruct only the complete schema emitted by :meth:`to_config`."""
         if type(config) is not dict:
             raise ValueError("config must be an actual dict")
-        payload = dict(config)
-        type_name = payload.pop("type", "LearningSignalEstimatorConfig")
+        expected_fields = {
+            *(field.name for field in dataclasses.fields(cls)),
+            "type",
+            "development_only",
+            "accepted_scientific_evidence",
+        }
+        if any(type(key) is not str for key in config):
+            raise ValueError("config fields do not match the serialized schema")
+        type_name = config.get("type")
         if type(type_name) is not str or type_name != "LearningSignalEstimatorConfig":
             raise ValueError("type must be LearningSignalEstimatorConfig")
-        development_only = payload.pop("development_only", True)
+        if set(config) != expected_fields:
+            raise ValueError("config fields do not match the serialized schema")
+        payload = dict(config)
+        payload.pop("type")
+        development_only = payload.pop("development_only")
         if development_only is not True:
             raise ValueError("learning signal estimator is development_only")
-        accepted_evidence = payload.pop("accepted_scientific_evidence", False)
+        accepted_evidence = payload.pop("accepted_scientific_evidence")
         if accepted_evidence is not False:
             raise ValueError("learning signal estimator is not accepted scientific evidence")
         return cls(**payload)
@@ -556,8 +556,8 @@ class LearningSignalEstimator:
         array = jnp.asarray(value)
         if array.shape != shape:
             raise ValueError(f"{name} must have shape {shape}, got {array.shape}")
-        if not jnp.issubdtype(array.dtype, jnp.inexact):
-            raise ValueError(f"{name} must have a floating dtype")
+        if not jnp.issubdtype(array.dtype, jnp.floating):
+            raise ValueError(f"{name} must have a real floating dtype")
         return jnp.asarray(array, dtype=jnp.float32)
 
     @staticmethod

@@ -33,7 +33,7 @@ _FLOAT32_TINY = float(np.finfo(np.float32).tiny)
 _FLOAT32_HALF_MIN_SUBNORMAL_DENOMINATOR = 1 << 150
 _INT32_MAX = 2**31 - 1
 _ACTUAL_REAL_SCALAR_TYPES = frozenset(
-    {float, np.float16, np.float32, np.float64, int}
+    {float, int, *(np.dtype(code).type for code in "efdg")}
 )
 
 _ACTUAL_INT_TYPES = frozenset(
@@ -483,6 +483,11 @@ class TDIDBDState:
         bias_log_step_size: Log step-size for the bias term
         bias_eligibility_trace: Eligibility trace for the bias
         bias_h_trace: h trace for the bias term
+        previous_gamma: Discount from the prior update call, carried so the
+            eligibility traces decay by ``gamma_t`` (the discount of the
+            transition into ``S_t``) while the TD error bootstraps with
+            ``gamma_{t+1}`` (Sutton & Barto 2nd ed., eqs. 12.23/12.25).
+            Seeded to 1.0, which is inert against the zero initial traces.
     """
 
     log_step_sizes: Float[Array, " feature_dim"]
@@ -493,6 +498,7 @@ class TDIDBDState:
     bias_log_step_size: Float[Array, ""]
     bias_eligibility_trace: Float[Array, ""]
     bias_h_trace: Float[Array, ""]
+    previous_gamma: Float[Array, ""]
 
 
 @chex.dataclass(frozen=True)
@@ -517,6 +523,11 @@ class AutoTDIDBDState:
         bias_eligibility_trace: Eligibility trace for the bias
         bias_h_trace: h trace for the bias term
         bias_normalizer: Normalizer for the bias gradient correlation
+        previous_gamma: Discount from the prior update call, carried so the
+            eligibility traces decay by ``gamma_t`` (the discount of the
+            transition into ``S_t``) while the TD error bootstraps with
+            ``gamma_{t+1}`` (Sutton & Barto 2nd ed., eqs. 12.23/12.25).
+            Seeded to 1.0, which is inert against the zero initial traces.
     """
 
     log_step_sizes: Float[Array, " feature_dim"]
@@ -530,6 +541,7 @@ class AutoTDIDBDState:
     bias_eligibility_trace: Float[Array, ""]
     bias_h_trace: Float[Array, ""]
     bias_normalizer: Float[Array, ""]
+    previous_gamma: Float[Array, ""]
 
 
 # Union type for TD optimizer states
@@ -583,6 +595,23 @@ def create_obgd_state(
     )
 
 
+def finite_float32_log(value: float) -> Array:
+    """Return ``log(value)`` as a float32 scalar, finite for a positive float32 subnormal.
+
+    ``jnp.log`` on a float32 subnormal flushes the input to zero and returns
+    ``-inf`` even though the true log (about -87 to -103) fits in float32.
+    Ordinary values take the direct ``jnp.log`` path bit for bit; only a
+    non-finite direct result with a finite true log is replaced.
+    """
+    direct = jnp.log(jnp.asarray(value, dtype=jnp.float32))
+    narrowed = float(np.float32(value))
+    if narrowed > 0.0:
+        stable = jnp.asarray(math.log(narrowed), dtype=jnp.float32)
+        use_stable = jnp.isfinite(stable) & ~jnp.isfinite(direct)
+        return jnp.where(use_stable, stable, direct)
+    return direct
+
+
 def create_tdidbd_state(
     feature_dim: int,
     initial_step_size: float = 0.01,
@@ -600,15 +629,17 @@ def create_tdidbd_state(
     Returns:
         Initial TD-IDBD state
     """
+    log_step_size = finite_float32_log(initial_step_size)
     return TDIDBDState(
-        log_step_sizes=jnp.full(feature_dim, jnp.log(initial_step_size), dtype=jnp.float32),
+        log_step_sizes=jnp.full(feature_dim, log_step_size, dtype=jnp.float32),
         eligibility_traces=jnp.zeros(feature_dim, dtype=jnp.float32),
         h_traces=jnp.zeros(feature_dim, dtype=jnp.float32),
         meta_step_size=jnp.array(meta_step_size, dtype=jnp.float32),
         trace_decay=jnp.array(trace_decay, dtype=jnp.float32),
-        bias_log_step_size=jnp.array(jnp.log(initial_step_size), dtype=jnp.float32),
+        bias_log_step_size=jnp.array(log_step_size, dtype=jnp.float32),
         bias_eligibility_trace=jnp.array(0.0, dtype=jnp.float32),
         bias_h_trace=jnp.array(0.0, dtype=jnp.float32),
+        previous_gamma=jnp.array(1.0, dtype=jnp.float32),
     )
 
 
@@ -631,18 +662,20 @@ def create_autotdidbd_state(
     Returns:
         Initial AutoTDIDBD state
     """
+    log_step_size = finite_float32_log(initial_step_size)
     return AutoTDIDBDState(
-        log_step_sizes=jnp.full(feature_dim, jnp.log(initial_step_size), dtype=jnp.float32),
+        log_step_sizes=jnp.full(feature_dim, log_step_size, dtype=jnp.float32),
         eligibility_traces=jnp.zeros(feature_dim, dtype=jnp.float32),
         h_traces=jnp.zeros(feature_dim, dtype=jnp.float32),
         normalizers=jnp.ones(feature_dim, dtype=jnp.float32),
         meta_step_size=jnp.array(meta_step_size, dtype=jnp.float32),
         trace_decay=jnp.array(trace_decay, dtype=jnp.float32),
         normalizer_decay=jnp.array(normalizer_decay, dtype=jnp.float32),
-        bias_log_step_size=jnp.array(jnp.log(initial_step_size), dtype=jnp.float32),
+        bias_log_step_size=jnp.array(log_step_size, dtype=jnp.float32),
         bias_eligibility_trace=jnp.array(0.0, dtype=jnp.float32),
         bias_h_trace=jnp.array(0.0, dtype=jnp.float32),
         bias_normalizer=jnp.array(1.0, dtype=jnp.float32),
+        previous_gamma=jnp.array(1.0, dtype=jnp.float32),
     )
 
 
@@ -884,7 +917,7 @@ class HordeSpec:
     lamdas: Float[Array, " n_demons"]
 
     def __post_init__(self) -> None:
-        """Reject an empty, oversized, or type-spoofed demon collection."""
+        """Reject invalid demons or cached question arrays that disagree with them."""
         if type(self.demons) is not tuple or not self.demons:
             raise ValueError("demons must be a nonempty tuple of GVFSpec")
         if len(self.demons) > _MAX_HORDE_DEMONS:
@@ -893,6 +926,19 @@ class HordeSpec:
             )
         if any(type(demon) is not GVFSpec for demon in self.demons):
             raise ValueError("demons must be a nonempty tuple of GVFSpec")
+        expected_caches = {
+            "gammas": np.asarray([demon.gamma for demon in self.demons], dtype=np.float32),
+            "lamdas": np.asarray([demon.lamda for demon in self.demons], dtype=np.float32),
+        }
+        for name, value in (("gammas", self.gammas), ("lamdas", self.lamdas)):
+            if not isinstance(value, Array):
+                raise ValueError(f"{name} must be a concrete float32 JAX array")
+            actual = np.asarray(value)
+            expected = expected_caches[name]
+            if actual.dtype != np.dtype(np.float32) or not np.array_equal(actual, expected):
+                raise ValueError(
+                    f"{name} must exactly cache the demons' normalized {name[:-1]} values"
+                )
 
     def to_config(self) -> dict[str, Any]:
         """Serialize to dict.

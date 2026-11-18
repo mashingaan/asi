@@ -11,11 +11,20 @@ from typing import Any
 
 import numpy as np
 
+import alberta_framework.benchmarks.ipmnist_screening as ipmnist_screening_module
 import alberta_framework.benchmarks.rule_discovery as rule_discovery_module
 from alberta_framework._seed_validation import require_jax_seed, require_unique_jax_seeds
-from alberta_framework._strict_json import load_strict_json_object
 from alberta_framework.benchmarks.ipmnist_provenance import analysis_provenance
 from alberta_framework.benchmarks.rule_discovery import NONPROMOTING_POLICY
+
+SCREEN_STAGE_N_TASKS = {
+    "screen": 60,
+    "confirmation": 200,
+}
+SCREEN_N_TASKS = SCREEN_STAGE_N_TASKS["screen"]
+CONFIRMATION_N_TASKS = SCREEN_STAGE_N_TASKS["confirmation"]
+RULE_DISCOVERY_TASK_LENGTH = 5_000
+RULE_DISCOVERY_NOISE_MODE = "step"
 
 SCREEN_ARMS = (
     "disc_r1",
@@ -37,30 +46,54 @@ DISCOVERY_ARMS = (
 CHAMPION = "sigma0_shiftnorm_d099"
 
 
-def _arm(directory: Path, name: str, seeds: Sequence[int]) -> dict[str, Any]:
+def _arm(
+    directory: Path,
+    name: str,
+    seeds: Sequence[int],
+    *,
+    expected_n_tasks: int,
+    expected_config: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     values = []
+    per_seed: dict[int, dict[str, Any]] = {}
+    reference_config = expected_config
     for seed in seeds:
         path = directory / f"{name}_seed{seed}.json"
         if not path.exists():
             raise ValueError(f"{name} is missing seed {seed} in {directory}")
-        payload = load_strict_json_object(path)
-        if (
-            type(payload.get("per_task_accuracy")) is not list
-            or not payload["per_task_accuracy"]
-        ):
-            raise ValueError(f"{path} lacks per_task_accuracy")
+        payload = ipmnist_screening_module.load_shard(path)
+        payload_name = payload["config_name"]
+        if payload_name != name:
+            raise ValueError(
+                f"{path}: config_name {payload_name!r} does not match "
+                f"expected arm {name!r}"
+            )
+        config = payload["config"]
+        if config["n_tasks"] != expected_n_tasks:
+            raise ValueError(
+                f"{path}: n_tasks {config['n_tasks']} does not match expected "
+                f"{expected_n_tasks}"
+            )
+        if config["task_length"] != RULE_DISCOVERY_TASK_LENGTH:
+            raise ValueError(f"{path}: task_length must be {RULE_DISCOVERY_TASK_LENGTH}")
+        if reference_config is None:
+            reference_config = config
+        elif config != reference_config:
+            raise ValueError(
+                f"{path}: protocol config {config} does not match the "
+                f"stage protocol config {reference_config}; arms and seeds "
+                "in one stage must share one protocol config"
+            )
+        if payload["noise_mode"] != RULE_DISCOVERY_NOISE_MODE:
+            raise ValueError(f"{path}: noise_mode must be {RULE_DISCOVERY_NOISE_MODE!r}")
         payload_seed = require_jax_seed(payload.get("seed"), name=f"{path} seed")
         if payload_seed != seed:
             raise ValueError(f"{path} seed does not match requested seed {seed}")
+        per_seed[seed] = payload
         accuracy = np.asarray(payload["per_task_accuracy"], dtype=np.float64)
-        if (
-            accuracy.ndim != 1
-            or not bool(np.all(np.isfinite(accuracy)))
-            or not bool(np.all((0.0 <= accuracy) & (accuracy <= 1.0)))
-        ):
-            raise ValueError(f"{path} has invalid per_task_accuracy")
         values.append(float(np.mean(accuracy)))
-    return {"per_seed": values, "mean": float(np.mean(values))}
+    ipmnist_screening_module._validate_screening_arm_contract(name, per_seed)
+    return {"per_seed": values, "mean": float(np.mean(values))}, reference_config
 
 
 def build_legacy_rule_discovery_summary(
@@ -71,7 +104,17 @@ def build_legacy_rule_discovery_summary(
 ) -> dict[str, Any]:
     """Reconstruct the exact legacy v1 payload for compatibility checks."""
     seeds = require_unique_jax_seeds(seeds)
-    screen = {name: _arm(screen_dir, name, seeds) for name in SCREEN_ARMS}
+    screen: dict[str, Any] = {}
+    screen_config: dict[str, Any] | None = None
+    for name in SCREEN_ARMS:
+        arm, screen_config = _arm(
+            screen_dir,
+            name,
+            seeds,
+            expected_n_tasks=SCREEN_N_TASKS,
+            expected_config=screen_config,
+        )
+        screen[name] = arm
     confirm_names = ("disc_r1_pscale_norms", CHAMPION)
     present = [
         (confirm_dir / f"{name}_seed{seed}.json").exists()
@@ -80,11 +123,18 @@ def build_legacy_rule_discovery_summary(
     ]
     if any(present) and not all(present):
         raise ValueError("rule-discovery confirmation seeds are incomplete")
-    full = (
-        {name: _arm(confirm_dir, name, seeds) for name in confirm_names}
-        if all(present)
-        else {}
-    )
+    full: dict[str, Any] = {}
+    if all(present):
+        confirm_config: dict[str, Any] | None = None
+        for name in confirm_names:
+            arm, confirm_config = _arm(
+                confirm_dir,
+                name,
+                seeds,
+                expected_n_tasks=CONFIRMATION_N_TASKS,
+                expected_config=confirm_config,
+            )
+            full[name] = arm
     champion = np.asarray(screen[CHAMPION]["per_seed"], dtype=np.float64)
     paired: dict[str, Any] = {}
     for name in DISCOVERY_ARMS:
@@ -137,6 +187,19 @@ def build_rule_discovery_summary(
     ).encode()
     maintained = dict(legacy)
     maintained["schema"] = "asi.rule_discovery.real_screen.v2"
+    screen = maintained["screen_60_task"]
+    paired = maintained["paired_vs_champion_60_task"]
+    assert isinstance(screen, dict)
+    assert isinstance(paired, dict)
+    maintained["verdicts"] = {
+        (
+            f"{name}_verbatim" if name in {"disc_r1", "disc_r2", "disc_r3"} else name
+        ): (
+            f"screen mean {screen[name]['mean']:.5f}; paired vs champion "
+            f"{paired[name]['mean']:+.5f}; development screen only"
+        )
+        for name in DISCOVERY_ARMS
+    }
     maintained["legacy_compatibility"] = {
         "schema": legacy["schema"],
         "canonical_sha256": hashlib.sha256(legacy_canonical).hexdigest(),
@@ -153,6 +216,7 @@ def build_rule_discovery_summary(
             for seed in seeds
         ],
         sources={
+            "ipmnist_screening": Path(ipmnist_screening_module.__file__),
             "rule_discovery": Path(rule_discovery_module.__file__),
             "rule_discovery_summary": Path(__file__),
         },

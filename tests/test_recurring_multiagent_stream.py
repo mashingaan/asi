@@ -144,6 +144,17 @@ def test_visible_context_sequence_recurs_a_b_a() -> None:
     ]
 
 
+def test_init_and_resource_budget_enforce_the_threefry_state_contract() -> None:
+    world = RecurringTwoAgentWorld(nuisance_dim=0)
+    expected_budget = world.resource_budget
+
+    with pytest.raises(TypeError, match="threefry2x32"):
+        world.init(jr.key(0, impl="rbg"))
+
+    with jax.default_prng_impl("rbg"):
+        assert world.resource_budget == expected_budget
+
+
 def test_context_switch_does_not_reset_physics_or_terminate() -> None:
     world = RecurringTwoAgentWorld(context_length=2, nuisance_dim=0)
     initial_state = world.init(jr.key(1))
@@ -632,3 +643,34 @@ def test_recurring_resource_budget_rejects_out_of_int32_domain(value: int) -> No
             exact_clock_nbytes=12,
             exact_clock_delta_nbytes=8,
         )
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("world_limit", [1.0, 2e38, 3e38])
+@pytest.mark.parametrize("fractions", [(-0.5, 0.5), (-1.0, 1.0), (0.25, -0.75), (0.5, 0.5)])
+def test_normalized_geometry_survives_large_world_span(
+    compiled: bool, world_limit: float, fractions: tuple[float, float],
+) -> None:
+    world_limit = float(np.float32(world_limit))
+    world = RecurringTwoAgentWorld(
+        world_limit=world_limit, context_length=1, nuisance_dim=0,
+        initial_positions=tuple(world_limit * value for value in fractions),
+    )
+    state = world.init(jr.key(0))
+    assert bool(world.state_is_valid(state))
+    positions = np.asarray(state.positions, dtype=np.float64)
+    expected_relative = (positions[::-1] - positions) / (2.0 * world_limit)
+    expected_distance = abs(float(expected_relative[0]))
+    observe = jax.jit(world.observe) if compiled else world.observe
+    step = jax.jit(world.step_result) if compiled else world.step_result
+    for expected_reward in (1.0 - expected_distance, expected_distance):
+        observation = observe(state)
+        assert np.isfinite(np.asarray(observation)).all()
+        np.testing.assert_allclose(observation[:, 0], positions / world_limit, rtol=1e-6)
+        np.testing.assert_allclose(observation[:, 1], expected_relative, rtol=1e-6, atol=1e-7)
+        result = step(state, jnp.zeros(2, dtype=jnp.float32))
+        assert bool(result.update_applied)
+        np.testing.assert_allclose(result.transition.reward, expected_reward, rtol=1e-6, atol=1e-7)
+        np.testing.assert_array_equal(result.transition.observation, observation)
+        assert np.isfinite(np.asarray(result.transition.next_observation)).all()
+        state = result.state

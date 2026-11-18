@@ -51,7 +51,7 @@ class WorkingMemoryConfig:
         include_current_action: Include the current action vector in output.
         include_current_reward: Include the current reward vector in output.
         include_traces: Include all trace banks in output.
-        include_innovations: Include current-minus-fast-trace innovations.
+        include_innovations: Include current minus the fastest trace (lowest decay, first on ties).
         gated_update: If true, trace updates are scaled by a surprise gate.
         gate_threshold: Surprise level where gated updates start opening.
         gate_temperature: Positive softness for the surprise gate.
@@ -217,19 +217,7 @@ class WorkingMemoryArrayResult:
 
 _INT32_MAX = 2**31 - 1
 _FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_ACTUAL_INT_TYPES: tuple[type, ...] = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 
 
 def _require_int32(name: str, value: object, *, minimum: int) -> int:
@@ -368,9 +356,11 @@ def _validate_config(config: WorkingMemoryConfig) -> None:
     )
     signal_scalars = observation_dim + action_dim + reward_dim
     feature_work = total_state_scalars + feature_dim + 2 * signal_scalars
+    # Five extra per-trace slots cover the weighted fallback's two terms,
+    # sum, selection and finiteness mask (conservatively charged as float32).
     update_work = (
         3 * total_state_scalars
-        + 6 * trace_scalars
+        + 11 * trace_scalars
         + 4 * signal_scalars
         + decay_scalars
         + feature_dim
@@ -387,6 +377,12 @@ def _validate_config(config: WorkingMemoryConfig) -> None:
     _require_float32_resource(
         "WorkingMemoryConfig diagnostics operation", vector_scalars=diagnostics_work
     )
+
+
+
+def _fastest_trace_index(rates: tuple[float, ...]) -> int:
+    """Return the fastest EMA row: lowest decay, first listed on ties."""
+    return min(range(len(rates)), key=lambda index: (rates[index], index))
 
 
 def _empty_or_vector(value: Array, dim: int) -> Array:
@@ -412,30 +408,38 @@ def _flatten_traces(state: WorkingMemoryState) -> Array:
 def _root_mean_square(values: Array) -> Array:
     if values.size == 0:
         return jnp.asarray(0.0, dtype=jnp.float32)
-    scale = jnp.max(jnp.abs(values))
-    safe_scale = jnp.where(scale > 0.0, scale, 1.0)
-    normalized = jnp.where(
-        jnp.abs(values) == scale,
-        jnp.sign(values),
-        values / safe_scale,
-    )
+    normalized, scale = _normalize_by_largest_magnitude(values)
     return jnp.where(scale > 0.0, scale * jnp.sqrt(jnp.mean(normalized * normalized)), 0.0)
 
 
 def _effective_dimension(values: Array) -> Array:
     if values.size == 0:
         return jnp.asarray(0.0, dtype=jnp.float32)
-    scale = jnp.max(jnp.abs(values))
-    safe_scale = jnp.where(scale > 0.0, scale, 1.0)
-    normalized = jnp.where(
-        jnp.abs(values) == scale,
-        jnp.sign(values),
-        values / safe_scale,
-    )
+    normalized, _ = _normalize_by_largest_magnitude(values)
     squared = normalized * normalized
     energy = jnp.sum(squared)
     fourth = jnp.sum(squared * squared)
     return jnp.where(fourth > 0.0, (energy * energy) / fourth, 0.0)
+
+
+def _normalize_by_largest_magnitude(values: Array) -> tuple[Array, Array]:
+    """Normalize finite float32 values without an underflowed reciprocal."""
+    scale = jnp.max(jnp.abs(values))
+    use_exponent_scaling = scale > jnp.asarray(
+        1.0 / _FLOAT32_MIN_NORMAL,
+        dtype=jnp.float32,
+    )
+    direct_scale = jnp.where((scale > 0.0) & (~use_exponent_scaling), scale, 1.0)
+    direct = jnp.where(
+        jnp.abs(values) == scale,
+        jnp.sign(values),
+        values / direct_scale,
+    )
+    mantissa, exponent = jnp.frexp(scale)
+    safe_mantissa = jnp.where(scale > 0.0, mantissa, 1.0)
+    exponent_scaled = jnp.ldexp(values, -exponent) / safe_mantissa
+    normalized = jnp.where(use_exponent_scaling, exponent_scaled, direct)
+    return jnp.where(scale > 0.0, normalized, 0.0), scale
 
 
 class WorkingMemoryFeaturizer:
@@ -552,10 +556,16 @@ class WorkingMemoryFeaturizer:
         """Return a zero reward vector with the configured dimension."""
         return jnp.zeros((self._config.reward_dim,), dtype=jnp.float32)
 
-    def _surprise_gate(self, traces: Array, value: Array, threshold: Array) -> Array:
+    def _surprise_gate(
+        self,
+        traces: Array,
+        value: Array,
+        threshold: Array,
+        fast_index: int,
+    ) -> Array:
         if (not self._config.gated_update) or traces.shape[0] == 0 or value.size == 0:
             return jnp.asarray(1.0, dtype=jnp.float32)
-        surprise = _root_mean_square(value - traces[0])
+        surprise = _root_mean_square(value - traces[fast_index])
         temperature = jnp.asarray(self._config.gate_temperature, dtype=jnp.float32)
         return jax.nn.sigmoid((surprise - threshold) / temperature)
 
@@ -572,10 +582,15 @@ class WorkingMemoryFeaturizer:
         update_rate = (1.0 - decay) * gate
         persist = 1.0 - update_rate
         delta_update = traces + update_rate * (value[None, :] - traces)
+        # Opposite finite endpoints can overflow the difference even though
+        # their convex combination is representable. Weight before adding in
+        # that case; keep the delta form for its equal-input fixed points.
+        weighted_update = persist * traces + update_rate * value[None, :]
+        finite_update = jnp.where(jnp.isfinite(delta_update), delta_update, weighted_update)
         return jnp.where(
             persist == 0.0,
             jnp.broadcast_to(value[None, :], traces.shape),
-            jnp.where(update_rate == 0.0, traces, delta_update),
+            jnp.where(update_rate == 0.0, traces, finite_update),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -610,11 +625,22 @@ class WorkingMemoryFeaturizer:
             )
         if cfg.include_innovations:
             if len(cfg.observation_decay_rates) > 0:
-                blocks.append(obs - state.observation_traces[0])
+                blocks.append(
+                    obs
+                    - state.observation_traces[
+                        _fastest_trace_index(cfg.observation_decay_rates)
+                    ]
+                )
             if len(cfg.action_decay_rates) > 0:
-                blocks.append(act - state.action_traces[0])
+                blocks.append(
+                    act
+                    - state.action_traces[_fastest_trace_index(cfg.action_decay_rates)]
+                )
             if len(cfg.reward_decay_rates) > 0:
-                blocks.append(rew - state.reward_traces[0])
+                blocks.append(
+                    rew
+                    - state.reward_traces[_fastest_trace_index(cfg.reward_decay_rates)]
+                )
         return jnp.concatenate(blocks, axis=0)
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -657,16 +683,21 @@ class WorkingMemoryFeaturizer:
             state.observation_traces,
             safe_obs,
             threshold,
+            _fastest_trace_index(cfg.observation_decay_rates)
+            if cfg.observation_decay_rates
+            else 0,
         )
         action_gate = outer_gate * self._surprise_gate(
             state.action_traces,
             safe_act,
             threshold,
+            _fastest_trace_index(cfg.action_decay_rates) if cfg.action_decay_rates else 0,
         )
         reward_gate = outer_gate * self._surprise_gate(
             state.reward_traces,
             safe_rew,
             threshold,
+            _fastest_trace_index(cfg.reward_decay_rates) if cfg.reward_decay_rates else 0,
         )
 
         candidate = WorkingMemoryState(
@@ -866,7 +897,7 @@ def transform_working_memory_arrays(
     )
     per_step_work = (
         3 * state_scalars
-        + 6 * trace_scalars
+        + 11 * trace_scalars
         + 4 * signal_scalars
         + decay_scalars
         + cfg.feature_dim()

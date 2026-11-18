@@ -28,21 +28,7 @@ from jaxtyping import Bool, Float
 from alberta_framework.core._float32_scalars import validated_float32_scalar
 
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _ACTUAL_FLOAT_TYPES = frozenset(
     {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
 )
@@ -67,14 +53,18 @@ def _preflight_state_resources(feature_dim: int) -> None:
 
 
 def _preflight_update_working_set(feature_dim: int) -> None:
-    # The update retains the source covariance, the rank-one outer product,
-    # the proposed covariance, and the transaction-selected covariance.  The
-    # width terms are x, source weights, Px, gain, proposed weights, selected
-    # weights, and the neutralized gain returned to the caller.  In
-    # particular, the selected result is a distinct logical buffer even when
-    # an execution backend can sometimes donate/alias it.
-    update_scalars = 4 * feature_dim * feature_dim + 7 * feature_dim + 8
-    if 4 * update_scalars > _INT32_MAX:
+    # Logical arrays, independently of backend donation/fusion: five covariance
+    # banks (source, outer, unsymmetrized, symmetrized, selected), plus the
+    # symmetrizer's two gathered values, two half-scaled values, and sum.
+    # Its i/j/min/max int32 index grids and equality boolean mask also count.
+    # Nine float32 vectors retain the existing update terms plus the two
+    # normalized operands used by the overflow-safe prediction dot product.
+    # Twenty-two scalar slots conservatively cover both update and stable-dot
+    # values and predicates, with every slot charged at four bytes.
+    matrix_cells = feature_dim * feature_dim
+    update_bytes = 4 * (10 * matrix_cells + 9 * feature_dim + 22)
+    update_bytes += (4 * 4 + 1) * matrix_cells
+    if update_bytes > _INT32_MAX:
         raise ValueError(
             "reward-model update working set byte count must fit signed int32"
         )
@@ -90,6 +80,19 @@ def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
     return validated_float32_scalar(name, value, **bounds)
 
 
+def _validated_feature_vector(features: Array, *, feature_dim: int) -> Array:
+    """Validate feature identity before narrowing to the model's float32 domain."""
+    raw = jnp.asarray(features)
+    if raw.shape != (feature_dim,):
+        raise ValueError(f"features must have shape ({feature_dim},), got {raw.shape}")
+    if not (
+        jnp.issubdtype(raw.dtype, jnp.floating)
+        or jnp.issubdtype(raw.dtype, jnp.integer)
+    ):
+        raise TypeError("features must be real numeric")
+    return raw.astype(jnp.float32)
+
+
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
     """Skip ``0 * inf`` so a disabled error EMA does not poison the diagnostic."""
     return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
@@ -100,6 +103,63 @@ def _saturating_int32_increment(value: Array) -> Array:
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     counter = jnp.asarray(value, dtype=jnp.int32)
     return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _symmetrize_matrix(matrix: Array) -> Array:
+    """Enforce exact float32 matrix symmetry without intermediate addition overflow."""
+    half = jnp.asarray(0.5, dtype=matrix.dtype)
+    n = matrix.shape[0]
+    i, j = jnp.indices((n, n), dtype=jnp.int32)
+    i_min = jnp.minimum(i, j)
+    j_max = jnp.maximum(i, j)
+    val_a = matrix[i_min, j_max]
+    val_b = matrix[j_max, i_min]
+    # Equal entries already are symmetric; halving tiny normal values can flush to zero.
+    return jnp.where(val_a == val_b, val_a, half * val_a + half * val_b)
+
+
+def _finite_cancelling_dot(left: Array, right: Array) -> Array:
+    """Preserve a representable dot product when direct accumulation overflows."""
+
+    direct = jnp.dot(left, right)
+    left_scale = jnp.max(jnp.abs(left))
+    right_scale = jnp.max(jnp.abs(right))
+    magnitude_bound = left_scale * right_scale * left.size
+    use_fallback = (
+        (~jnp.isfinite(direct) | ~jnp.isfinite(magnitude_bound))
+        & jnp.isfinite(left_scale) & jnp.isfinite(right_scale)
+    )
+
+    def compensated() -> Array:
+        _, left_exponent = jnp.frexp(left_scale)
+        _, right_exponent = jnp.frexp(right_scale)
+        normalized_left = jnp.ldexp(left, -left_exponent)
+        normalized_right = jnp.ldexp(right, -right_exponent)
+
+        def add_product(
+            carry: tuple[Array, Array], operands: tuple[Array, Array]
+        ) -> tuple[tuple[Array, Array], None]:
+            total, correction = carry
+            product = operands[0] * operands[1]
+            next_total = total + product
+            rounding_error = jnp.where(
+                jnp.abs(total) >= jnp.abs(product),
+                (total - next_total) + product,
+                (product - next_total) + total,
+            )
+            next_correction = correction + rounding_error
+            return (next_total, next_correction), None
+
+        (normalized_sum, correction), _ = jax.lax.scan(
+            add_product,
+            (jnp.asarray(0.0, dtype=left.dtype), jnp.asarray(0.0, dtype=left.dtype)),
+            (normalized_left, normalized_right),
+        )
+        normalized_dot = normalized_sum + correction
+        combined_exponent = left_exponent + right_exponent
+        return jnp.ldexp(normalized_dot, combined_exponent)
+
+    return cast(Array, jax.lax.cond(use_fallback, compensated, lambda: direct))
 
 
 @dataclass(frozen=True)
@@ -128,6 +188,9 @@ class RLSRewardModelConfig:
             "forgetting", self.forgetting, positive=True, upper=1.0
         )
         ridge = _validated_config_float("ridge", self.ridge, positive=True)
+        minimum_ridge = float(np.finfo(np.float32).tiny)
+        if ridge < minimum_ridge:
+            raise ValueError(f"ridge must be at least {minimum_ridge} in float32")
         error_decay = _validated_config_float(
             "error_decay", self.error_decay, lower=0.0, upper=1.0, upper_inclusive=False
         )
@@ -238,12 +301,8 @@ class RLSRewardModel:
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(self, state: RLSRewardModelState, features: Array) -> Array:
         """Predict reward from one feature vector."""
-        x = jnp.asarray(features, dtype=jnp.float32)
-        if x.shape != (self._config.feature_dim,):
-            raise ValueError(
-                f"features must have shape ({self._config.feature_dim},), got {x.shape}"
-            )
-        return jnp.dot(state.weights, x)
+        x = _validated_feature_vector(features, feature_dim=self._config.feature_dim)
+        return _finite_cancelling_dot(state.weights, x)
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def update(
@@ -269,11 +328,7 @@ class RLSRewardModel:
         unless the reward function is genuinely nonstationary and the
         feature stream stays exciting.
         """
-        x = jnp.asarray(features, dtype=jnp.float32)
-        if x.shape != (self._config.feature_dim,):
-            raise ValueError(
-                f"features must have shape ({self._config.feature_dim},), got {x.shape}"
-            )
+        x = _validated_feature_vector(features, feature_dim=self._config.feature_dim)
         raw_target = jnp.asarray(reward)
         if raw_target.shape != ():
             raise ValueError("reward must be a scalar")
@@ -283,7 +338,7 @@ class RLSRewardModel:
         ):
             raise TypeError("reward must be real numeric")
         target = raw_target.astype(jnp.float32)
-        prediction = jnp.dot(state.weights, x)
+        prediction = _finite_cancelling_dot(state.weights, x)
         error = target - prediction
         covariance_features = state.covariance @ x
         forgetting = jnp.asarray(self._config.forgetting, dtype=jnp.float32)
@@ -291,6 +346,7 @@ class RLSRewardModel:
         gain = covariance_features / denominator
         next_weights = state.weights + gain * error
         next_covariance = (state.covariance - jnp.outer(gain, covariance_features)) / forgetting
+        next_covariance = _symmetrize_matrix(next_covariance)
 
         error_decay = jnp.asarray(self._config.error_decay, dtype=jnp.float32)
         abs_error = jnp.abs(error)
@@ -312,18 +368,24 @@ class RLSRewardModel:
             if self._config.error_decay == 0.0
             else state.abs_error_ema
         )
-        source_finite = (
+        source_valid = (
             jnp.all(jnp.isfinite(state.weights))
             & jnp.all(jnp.isfinite(state.covariance))
             & jnp.isfinite(checked_error_ema)
+            & (state.step_count >= 0)
         )
         inputs_valid = jnp.all(jnp.isfinite(x)) & jnp.isfinite(jnp.squeeze(target))
+        # Float32 rounding can leave the covariance indefinite; a nonpositive
+        # innovation variance would flip the gain's sign.
+        denominator_valid = jnp.isfinite(denominator) & (denominator > 0.0)
         proposed_finite = (
             jnp.all(jnp.isfinite(next_weights))
             & jnp.all(jnp.isfinite(next_covariance))
             & jnp.isfinite(next_abs_error_ema)
         )
-        update_applied = source_finite & inputs_valid & proposed_finite
+        update_applied = (
+            source_valid & inputs_valid & denominator_valid & proposed_finite
+        )
         committed = jax.lax.cond(
             update_applied,
             lambda: next_state,

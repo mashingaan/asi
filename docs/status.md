@@ -69,7 +69,7 @@ below supplies a second view over the inherited research program.
 | Learned state and representation | Feature construction, utility, routing, lifecycle, temporal-context, and recurrent-state mechanisms | No autonomous representation lifecycle has a whole-life downstream control result |
 | Prediction, memory, and world modeling | Horde/GVF learners, working and experiential memory, one-step/latent/recurrent models, and dreaming | No reference agent shows that these components causally improve retained control under one owner and budget |
 | Continual control and planning | SARSA, actor-critic, average-reward/off-policy control, options, STOMP/OaK, and bounded planning | No promoted matched-resource continual-control result closes adaptation, retention, and planning-benefit gates |
-| Agent composition | The unfrozen [`preview1` transaction/reducer/CAS ledger](../alberta_framework/reference_agent.py), [primitive exact-dispatch Prototype bridge](../alberta_framework/prototype_reference_adapter.py), aggregate [Prototype + SwitchingTwoState/RiverSwim runner](../alberta_framework/reference_life.py), current-schema [quiescent checkpoint codec](../alberta_framework/reference_life_checkpoint.py), [matched control adapters](../alberta_framework/reference_life_controls.py), and [development scorecard](../alberta_framework/benchmarks/reference_life_scorecard.py) are covered by retained L0 tests. The scorecard plan defines a 144-shard fresh-process schedule over 12 consumed development seeds, two environments, six arms, explicit Threefry roots, finite-horizon privileged normalization, fixed reward lattices, and numeric-payload accounting | No completed scorecard result, frozen/portable checkpoint contract, authenticated execution provenance, qualified timing/resource Pareto gate, in-flight or physical replay, process-death/`BaseException`/durable executor guarantee, independent safety, additional/general environment support, options/rebinding/boundary conformance, robot or Forager adapter, selected `reference-dev`, RiverSwim learning/performance benefit, evidence result, or uninterrupted L3 life exists |
+| Agent composition | The unfrozen [`preview1` transaction/reducer/CAS ledger](../alberta_framework/reference_agent.py), [primitive exact-dispatch Prototype bridge](../alberta_framework/prototype_reference_adapter.py), aggregate [Prototype + SwitchingTwoState/RiverSwim runner](../alberta_framework/reference_life.py), current-schema [quiescent checkpoint codec](../alberta_framework/reference_life_checkpoint.py), [matched control adapters](../alberta_framework/reference_life_controls.py), and [development scorecard](../alberta_framework/benchmarks/reference_life_scorecard.py) are covered by retained L0 tests. The scorecard plan defines a 144-shard fresh-process schedule over 12 consumed development seeds, two environments, six arms, explicit Threefry roots, finite-horizon privileged normalization, fixed reward lattices, and numeric-payload accounting | No frozen/portable checkpoint contract, authenticated execution provenance, qualified timing/resource Pareto gate, in-flight or physical replay, process-death/`BaseException`/durable executor guarantee, independent safety, additional/general environment support, options/rebinding/boundary conformance, robot or Forager adapter, selected `reference-dev`, RiverSwim learning/performance benefit, evidence result, or uninterrupted L3 life exists |
 | Multi-agent learning | Recurring coadaptation surfaces, partner-policy fusion, and an IA intervention protocol | A frozen historical coadaptation outcome is not causal amplification; the frozen historical IA outcome is a valid rejection, while live validity must be checked separately |
 | Scale and operations | Fixed-shape JAX state, artifact tooling, robot-compatible imports, and bounded same-runtime exact checkpoint/recovery gates for one deterministic and one keyed stochastic simulator | Long-horizon compute, memory, latency, numerical stability, checkpoint migration, broader environment recovery, and workload scaling are not jointly established |
 | Robotics and real work | The sibling robot track consumes a continual-RL subset and defines an ASIMOV-1 task sequence plus checkpoint, bridge, and validation plumbing | No ASI reference-life binding or matched full-budget adaptation/retention result closes the control-rate, fault/safety, and guarded-hardware gates |
@@ -92,7 +92,11 @@ machinery for SwitchingTwoState and RiverSwim. Its 144 fresh-process shards use
 12 consumed development seeds and six controls: Prototype, frozen/no-learning,
 random, finite-horizon privileged dynamic programming, differential SARSA, and
 discounted SARSA. Shards bind their current source identity, and aggregation requires one
-matching current identity. It has not yet established a completed scorecard result. All
+matching current identity. The [completed hosted result](../outputs/reference_life_scorecard_development/run2-2026-10-09/README.md)
+retains all 144 lives with zero execution/parameter-change failures and an independently
+recomputed aggregate. Its frozen decision is `valid_baseline_failure`: RiverSwim controls
+do not qualify, so candidate selection is not evaluated. The historical single-host
+`run1` record remains unchanged. All
 records are permanently nonpromoting; they do not populate `reference-dev` or
 create performance or scientific evidence.
 
@@ -336,6 +340,38 @@ automatic proof of ASI's broader application target.
 
 ## Active development campaigns
 
+### Reference-life hillclimb
+
+The [original 144-life scorecard](../outputs/reference_life_scorecard_development/run2-2026-10-09/README.md)
+remains `valid_baseline_failure`. The following probes guide a separately planned development retry.
+
+| Lane | Retained result | Comparison to carry forward |
+|---|---|---|
+| RiverSwim controls | Discounted SARSA with Q₀ = 10 reached mean normalized return 0.8910. Differential SARSA with initial average reward 1.0 reached 0.8888. Each cleared its own gate over 20,000 events and 12 seeds. | Run both on the same seeds and normalizers. The retained results use different seed sets. |
+| SwitchingTwoState Prototype | Step 0.20 beat step 0.10 by +0.0926 normalized return on all 12 reused development seeds over 4,000 events. | Compare the steps on fresh development seeds and keep the strongest qualifying SARSA control in the next scorecard. |
+
+See the retained [discounted SARSA calibration](../outputs/reference_life_control_calibration/riverswim-q0-full-2026-11-01/RESULTS.md),
+[differential SARSA calibration](../outputs/reference_life_control_calibration/riverswim-diffsarsa-rbar0-2026-11-01/RESULTS.md),
+and [SwitchingTwoState step probe](../outputs/reference_life_control_calibration/switching-prototype-step020-2026-11-02/RESULTS.md).
+In a [fresh local RiverSwim smoke](../outputs/hillclimb_local/2026-11-07/reference/riverswim-summary.json),
+both optimistic controls reached the high-reward end on all three matched
+seeds over 5,000 events. They beat their defaults by mean raw reward of
++1,493.03 (discounted) and +2,972.79 (differential). The direct comparison
+split 1–2 across seeds, with mean difference +10.95 for discounted SARSA.
+Keep both controls for the full matched calibration. The smoke used raw
+rewards and omitted random and oracle normalizers.
+
+A [fresh local SwitchingTwoState comparison](../outputs/hillclimb_local/2026-11-07/reference/switching-summary.json)
+used three matched seeds over 4,000 events. Step 0.20 led step 0.10 by
+147.33 mean raw reward, the scorecard step 0.05 by 523.67, and differential
+SARSA by 322.67. It won all three seed pairs against each comparator. The
+three Prototype steps used 217 bytes of persistent numeric state versus
+108 bytes for differential SARSA. Random and oracle normalizers were outside
+the local comparison.
+
+The follow-up runs are permanently nonpromoting and the whole-life candidate
+selection remains open.
+
 ### IPMNIST development screening and development confirmation
 
 IPMNIST is the current measured optimization/plasticity subsystem campaign,
@@ -348,6 +384,13 @@ replication, more seeds, or better performance.
 Use the mutable index to identify the current record rather than copying
 rankings or means here. Output documents are append-only chronological records;
 their historical superlatives and run-status language may have been superseded.
+
+The historical diagonal and block covariance screens replay under their original
+source identities. The repaired `diaghead_stable`, `gdiag_stable`, and
+`blockhead_stable` configurations await fresh matched development runs. The block
+variant uses a global innovation denominator and square-root covariance updates,
+with O(G*b^3) arithmetic per step for G blocks of width b. The low-rank experiment
+is archived with an invalid covariance recurrence that requires redesign.
 
 - [current campaign index](research/ipmnist-campaign-index.md);
 - [theory and forward hypotheses](research/ipmnist-theory.md);

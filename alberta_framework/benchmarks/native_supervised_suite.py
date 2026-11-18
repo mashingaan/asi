@@ -377,8 +377,15 @@ def _run_arm(
         next_weights, next_bias = _sgd_step(
             jnp.asarray(weights), jnp.asarray(bias), jnp.asarray(x), jnp.asarray(label)
         )
-        weights = np.asarray(next_weights, dtype=np.float32)
-        bias = np.asarray(next_bias, dtype=np.float32)
+        candidate_weights = np.asarray(next_weights, dtype=np.float32)
+        candidate_bias = np.asarray(next_bias, dtype=np.float32)
+        if not (
+            np.all(np.isfinite(candidate_weights))
+            and np.all(np.isfinite(candidate_bias))
+        ):
+            raise ValueError("SGD update produced non-finite numeric state")
+        weights = candidate_weights
+        bias = candidate_bias
         updates += 1
 
     for task in tasks:
@@ -386,12 +393,23 @@ def _run_arm(
         for x, raw_label in zip(task.inputs, task.labels, strict=True):
             label = int(raw_label)
             if arm_id == "running_centroid":
-                distances = np.sum((sums / np.maximum(counts[:, None], 1) - x) ** 2, axis=1)
-                distances = np.where(counts > 0, distances, np.inf)
-                prediction = int(np.argmin(distances)) if np.any(counts > 0) else 0
+                active = counts > 0
+                if np.any(active):
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        means = sums / np.maximum(counts[:, None], 1)
+                        distances = np.sum((means - x) ** 2, axis=1)
+                    if not np.all(np.isfinite(distances[active])):
+                        raise ValueError("centroid prediction produced non-finite numeric values")
+                    prediction = int(np.argmin(np.where(active, distances, np.inf)))
+                else:
+                    prediction = 0
                 queries += 1
             else:
-                prediction = int(np.argmax(x @ weights + bias))
+                with np.errstate(over="ignore", invalid="ignore"):
+                    logits = x @ weights + bias
+                if not np.all(np.isfinite(logits)):
+                    raise ValueError("linear prediction produced non-finite numeric values")
+                prediction = int(np.argmax(logits))
                 queries += 1
             hit = int(prediction == label)
             correct += hit
@@ -405,16 +423,22 @@ def _run_arm(
                         replay_x, replay_label = replay[(updates + label) % len(replay)]
                         linear_update(replay_x, replay_label)
                         samples += 1
-                    replay.append((x.copy(), label))
-                    if len(replay) > capacity:
+                    # Evict before inserting so the buffer never holds more than
+                    # ``capacity`` copies, which is what ``peak_replay_bytes`` reports.
+                    if len(replay) >= capacity:
                         replay.pop(0)
+                    replay.append((x.copy(), label))
                     inserts += 1
                 elif real_seen > 0:
                     # Match replay SGD's optimizer-call budget without exposing
                     # another observation: repeat the current real example.
                     linear_update(x, label)
             elif arm_id == "running_centroid":
-                sums[label] += x
+                with np.errstate(over="ignore", invalid="ignore"):
+                    candidate_sum = sums[label] + x
+                if not np.all(np.isfinite(candidate_sum)):
+                    raise ValueError("centroid update produced non-finite numeric state")
+                sums[label] = candidate_sum
                 counts[label] += 1
                 updates += 1
             real_seen += 1
@@ -491,6 +515,16 @@ def validate_result(value: object) -> SuiteResult:
     bytes_per_example = value.input_dim * 4 + 4
     for arm in value.arms:
         ArmResult.__post_init__(arm)
+        if len(arm.task_accuracies) != spec.n_tasks:
+            raise ValueError("accuracy record mismatch")
+        total_correct = 0
+        for accuracy in arm.task_accuracies:
+            correct = round(accuracy * value.examples_per_task)
+            if accuracy != correct / value.examples_per_task:
+                raise ValueError("accuracy record mismatch")
+            total_correct += correct
+        if arm.online_accuracy != total_correct / steps:
+            raise ValueError("accuracy record mismatch")
         if type(arm.receipt) is not ResourceReceipt:
             raise ValueError("receipt must be an exact ResourceReceipt")
         ResourceReceipt.__post_init__(arm.receipt)

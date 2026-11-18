@@ -16,6 +16,7 @@ from alberta_framework.core.compositional_features import (
     GENERATION_ROBUST_RECURSIVE,
     OP_PRODUCT,
     OP_RAW,
+    OP_SUM,
     OP_TANH,
     CompositionalFeatureLearner,
     CompositionalFeatureState,
@@ -23,7 +24,9 @@ from alberta_framework.core.compositional_features import (
     _compute_feature_values,
     _imprint_candidate_output_weights,
     run_compositional_arrays,
+    run_compositional_loop,
 )
+from alberta_framework.streams.out_of_class import CompositionalStream
 
 _INT32_MAX = 2**31 - 1
 
@@ -50,6 +53,26 @@ def _assert_valid_active_dag(
             expected_depth = max(depth[parent_a[i]], depth[parent_b[i]]) + 1
             assert depth[i] == expected_depth
             assert depth[i] <= max_depth
+
+
+def _assert_valid_candidate_bank(state: CompositionalFeatureState, max_depth: int) -> None:
+    """Check that every candidate descriptor has its structural depth within budget."""
+    depth = np.asarray(state.depth)
+    n_features = depth.shape[0]
+    candidate_ops = np.asarray(state.candidate_ops)
+    candidate_parent_a = np.asarray(state.candidate_parent_a)
+    candidate_parent_b = np.asarray(state.candidate_parent_b)
+    candidate_depth = np.asarray(state.candidate_depth)
+
+    for j, op in enumerate(candidate_ops):
+        if op == OP_RAW:
+            continue
+        assert 0 <= candidate_parent_a[j] < n_features
+        assert -1 <= candidate_parent_b[j] < n_features
+        parent_b_depth = depth[candidate_parent_b[j]] if candidate_parent_b[j] >= 0 else 0
+        expected_depth = max(depth[candidate_parent_a[j]], parent_b_depth) + 1
+        assert candidate_depth[j] == expected_depth
+        assert candidate_depth[j] <= max_depth
 
 
 class TestCompositionalFeatureLearner:
@@ -102,6 +125,14 @@ class TestCompositionalFeatureLearner:
         for i in range(4, 10):
             assert pa_np[i] < i
             assert pb_np[i] < i
+
+    def test_init_requires_a_typed_scalar_threefry_key(self) -> None:
+        learner = CompositionalFeatureLearner(n_features=4, n_tasks=1)
+
+        with pytest.raises(ValueError, match="typed scalar threefry2x32"):
+            learner.init(feature_dim=2, key=jr.PRNGKey(0))
+        with pytest.raises(ValueError, match="typed scalar threefry2x32"):
+            learner.init(feature_dim=2, key=jr.key(0, impl="rbg"))
 
     def test_forward_pass_topological_order(self) -> None:
         """Build a tiny DAG by hand and verify the forward gives the right values."""
@@ -188,6 +219,36 @@ class TestCompositionalFeatureLearner:
         chex.assert_shape(result.metrics, (7,))
         chex.assert_tree_all_finite(result.metrics)
         assert int(result.state.step_count) == 1
+
+    @pytest.mark.parametrize("use_obgd", [False, True])
+    def test_update_retains_finite_wide_mean_squared_error(self, use_obgd: bool) -> None:
+        learner = CompositionalFeatureLearner(
+            n_features=1,
+            n_tasks=8,
+            candidate_count=0,
+            step_size_output=1.0e-20,
+            step_size_theta=0.0,
+            replacement_interval=0,
+            use_obgd=use_obgd,
+            obgd_kappa=1.0e-20,
+        )
+        state = learner.init(feature_dim=1, key=jr.key(0))
+        observation = jnp.ones((1,), dtype=jnp.float32)
+        target = jnp.full((8,), -7.0e18, dtype=jnp.float32)
+
+        expected_mse = float(np.float64(np.float32(7.0e18)) ** 2)
+        squared_errors = (learner.predict(state, observation) - target) ** 2
+        assert bool(jnp.all(jnp.isfinite(squared_errors)))
+        assert not bool(jnp.isfinite(jnp.sum(squared_errors)))
+        assert np.isfinite(expected_mse)
+
+        result = learner.update(state, observation, target)
+
+        assert bool(result.update_applied)
+        assert int(result.state.step_count) == 1
+        assert bool(jnp.any(result.state.output_weights != state.output_weights))
+        chex.assert_tree_all_finite(result.metrics)
+        assert float(result.metrics[0]) == pytest.approx(expected_mse, rel=1.0e-6)
 
     def test_finite_candidate_selector_probabilities_remain_normalized(self) -> None:
         selector = FiniteCandidateSelector(
@@ -475,6 +536,62 @@ class TestCompositionalFeatureLearner:
         assert int(result.replaced_slot) == -1
         assert int(result.state.ops[2]) == OP_PRODUCT
         assert float(result.state.retention_slow_utilities[2]) > 8.0
+
+    def test_depth_bonus_protects_deep_features_on_the_promotion_path(self) -> None:
+        """``retention_depth_bonus`` must shape which slot a promoted candidate evicts.
+
+        The bonus is documented as an additive replacement-score bonus for
+        deeper active features. With candidates enabled, promotion is the only
+        mechanism that replaces an active slot, so the eviction target must be
+        the lowest bonus-inclusive score, not the lowest raw utility.
+        """
+        max_depth = 4
+        learner = CompositionalFeatureLearner(
+            n_features=5,
+            n_tasks=1,
+            candidate_count=1,
+            step_size_output=0.0,
+            step_size_theta=0.0,
+            utility_decay=0.9,
+            replacement_interval=1,
+            min_feature_age=0,
+            candidate_min_age=0,
+            promotion_margin=1.0,
+            promotion_blend=0.0,
+            max_depth=max_depth,
+            use_obgd=False,
+            retention_depth_bonus=100.0,
+        )
+        # raw0, raw1, slot2 = x0*x1 (depth 1), slot3 = slot2*x0 (depth 2), slot4 = x0+x1 (depth 1)
+        state = learner.init(feature_dim=2, key=jr.key(26)).replace(  # type: ignore[attr-defined]
+            ops=jnp.array([OP_RAW, OP_RAW, OP_PRODUCT, OP_PRODUCT, OP_SUM], dtype=jnp.int32),
+            parent_a=jnp.array([0, 1, 0, 2, 0], dtype=jnp.int32),
+            parent_b=jnp.array([-1, -1, 1, 0, 1], dtype=jnp.int32),
+            depth=jnp.array([0, 0, 1, 2, 1], dtype=jnp.int32),
+            utilities=jnp.array([0.0, 0.0, 1.0, 0.4, 0.5], dtype=jnp.float32),
+            ages=jnp.full((5,), 100, dtype=jnp.int32),
+            candidate_ops=jnp.array([OP_PRODUCT], dtype=jnp.int32),
+            candidate_parent_a=jnp.array([0], dtype=jnp.int32),
+            candidate_parent_b=jnp.array([1], dtype=jnp.int32),
+            candidate_depth=jnp.array([1], dtype=jnp.int32),
+            candidate_utilities=jnp.array([10.0], dtype=jnp.float32),
+            candidate_ages=jnp.array([100], dtype=jnp.int32),
+        )
+        # Zero observation: every utility signal is zero, so utilities only decay.
+        result = learner.update(
+            state, jnp.zeros((2,), dtype=jnp.float32), jnp.array([0.0], dtype=jnp.float32)
+        )
+
+        decayed = np.array([1.0, 0.4, 0.5]) * 0.9
+        bonus = 100.0 * np.array([1, 2, 1]) / max_depth
+        assert int(np.argmin(decayed)) == 1  # raw utility alone would evict slot 3
+        assert int(np.argmin(decayed + bonus)) == 2  # the documented score evicts slot 4
+
+        assert bool(result.update_applied)
+        assert int(result.promoted_candidate) == 0
+        assert int(result.replaced_slot) == 4
+        assert int(result.state.depth[3]) == 2
+        assert int(result.state.ops[3]) == OP_PRODUCT
 
     def test_default_retention_path_still_allows_fast_promotion(self) -> None:
         """Disabled slow retention preserves the historical fast-utility path."""
@@ -873,6 +990,74 @@ class TestCompositionalFeatureLearner:
         assert legacy.to_config()["candidate_selector"] == CANDIDATE_SELECTOR_LEGACY
         assert int(legacy_result.promoted_candidate) == 0
         assert int(selector_result.promoted_candidate) == 1
+
+    def test_over_depth_rebound_candidate_is_regenerated_within_budget(self) -> None:
+        """A candidate rebound through a max-depth promotion gets a fresh valid descriptor."""
+        learner = CompositionalFeatureLearner(
+            n_features=5,
+            n_tasks=1,
+            candidate_count=2,
+            replacement_interval=1,
+            min_feature_age=0,
+            candidate_min_age=0,
+            promotion_margin=0.0,
+            max_depth=2,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(0)).replace(  # type: ignore[attr-defined]
+            ops=jnp.array([OP_RAW, OP_RAW, OP_PRODUCT, OP_PRODUCT, OP_PRODUCT], dtype=jnp.int32),
+            parent_a=jnp.array([0, 1, 0, 0, 2], dtype=jnp.int32),
+            parent_b=jnp.array([-1, -1, 1, 1, 0], dtype=jnp.int32),
+            depth=jnp.array([0, 0, 1, 1, 2], dtype=jnp.int32),
+            utilities=jnp.array([10.0, 10.0, 10.0, 0.0, 5.0], dtype=jnp.float32),
+            ages=jnp.full((5,), 10, dtype=jnp.int32),
+            # Candidate 0 (depth 2) is promoted into slot 3.  Candidate 1 reads
+            # slot 3, so its structural depth becomes 3 > max_depth.
+            candidate_ops=jnp.array([OP_PRODUCT, OP_PRODUCT], dtype=jnp.int32),
+            candidate_parent_a=jnp.array([2, 3], dtype=jnp.int32),
+            candidate_parent_b=jnp.array([0, 1], dtype=jnp.int32),
+            candidate_depth=jnp.array([2, 2], dtype=jnp.int32),
+            candidate_utilities=jnp.array([100.0, 0.0], dtype=jnp.float32),
+            candidate_ages=jnp.array([10, 10], dtype=jnp.int32),
+        )
+        observation = jnp.array([0.5, -0.4], dtype=jnp.float32)
+        target = jnp.array([0.3], dtype=jnp.float32)
+
+        result = learner.update(state, observation, target)
+
+        assert bool(result.update_applied)
+        assert int(result.promoted_candidate) == 0
+        assert int(result.state.depth[3]) == 2
+        trace = result.curation_trace
+        assert np.asarray(trace.candidate_rebound_mask).tolist() == [False, True]
+        _assert_valid_active_dag(result.state, feature_dim=2, max_depth=2)
+        _assert_valid_candidate_bank(result.state, max_depth=2)
+        np.testing.assert_array_equal(
+            np.asarray(trace.candidate_final_depth),
+            np.asarray(result.state.candidate_depth),
+        )
+        assert int(result.state.candidate_ages[1]) == 0
+        assert float(result.state.candidate_utilities[1]) == 0.0
+
+        next_state = result.state
+        for _ in range(3):
+            next_result = learner.update(next_state, observation, target)
+            assert bool(next_result.update_applied)
+            next_state = next_result.state
+            _assert_valid_candidate_bank(next_state, max_depth=2)
+        assert int(next_state.step_count) == 4
+
+    def test_default_curation_on_compositional_stream_keeps_learning(self) -> None:
+        """Default promotion and cascades never commit an over-depth candidate."""
+        stream = CompositionalStream(feature_dim=6, n_tasks=3)
+        learner = CompositionalFeatureLearner(n_features=24, n_tasks=3, candidate_count=8)
+
+        result = run_compositional_loop(learner, stream, 600, jr.key(2))
+
+        applied = np.asarray(result.updates_applied)
+        assert applied.all(), f"first rejected update: {int(np.argmin(applied))}"
+        assert int(result.state.step_count) == 600
+        _assert_valid_active_dag(result.state, feature_dim=6, max_depth=learner.max_depth)
+        _assert_valid_candidate_bank(result.state, max_depth=learner.max_depth)
 
     def test_candidate_refresh_respects_min_age(self) -> None:
         """New candidates must get a real evaluation window before recycling."""
@@ -1398,6 +1583,27 @@ class TestCompositionalFeatureLearner:
         # observation because slots [0, feature_dim) are raw passthroughs.
         np.testing.assert_allclose(np.asarray(features[:3]), np.asarray(observation))
 
+    @pytest.mark.parametrize("observation_width", [1, 3])
+    def test_array_runner_rejects_observation_width_drift(
+        self,
+        observation_width: int,
+    ) -> None:
+        learner = CompositionalFeatureLearner(
+            n_features=3,
+            n_tasks=2,
+            candidate_count=0,
+            replacement_interval=100,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(8))
+        observations = jnp.arange(2 * observation_width, dtype=jnp.float32).reshape(
+            2,
+            observation_width,
+        )
+        targets = jnp.ones((2, 2), dtype=jnp.float32)
+
+        with pytest.raises(ValueError, match="observations must have shape"):
+            run_compositional_arrays(learner, state, observations, targets)
+
     def test_scan_loop_runs(self) -> None:
         learner = CompositionalFeatureLearner(
             n_features=10,
@@ -1419,6 +1625,49 @@ class TestCompositionalFeatureLearner:
         assert int(result.state.step_count) == 50
         # Sanity check the resulting state retains the type.
         assert isinstance(result.state, CompositionalFeatureState)
+
+    def test_array_scan_preserves_initialized_host_clocks(self) -> None:
+        learner = CompositionalFeatureLearner(
+            n_features=4,
+            n_tasks=1,
+            candidate_count=0,
+            replacement_interval=100_000,
+            min_feature_age=100_000,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(0))
+        birth = 1700000000.125
+        uptime = 2**24 + 0.25
+        state = state.replace(birth_timestamp=birth, uptime_s=uptime)
+        observations = jnp.zeros((2, 2), dtype=jnp.float32)
+        targets = jnp.zeros((2, 1), dtype=jnp.float32)
+        result = run_compositional_arrays(learner, state, observations, targets)
+        clocks = result.state
+        assert type(clocks.birth_timestamp) is float
+        assert clocks.birth_timestamp == birth
+        assert type(clocks.uptime_s) is float
+        assert clocks.uptime_s > uptime
+        chex.assert_tree_all_finite(result.metrics)
+
+    def test_loop_scan_preserves_initialized_host_clocks(self) -> None:
+        learner = CompositionalFeatureLearner(
+            n_features=4,
+            n_tasks=1,
+            candidate_count=0,
+            replacement_interval=100_000,
+            min_feature_age=100_000,
+        )
+        stream = CompositionalStream(feature_dim=2, n_tasks=1)
+        state = learner.init(feature_dim=2, key=jr.key(0))
+        birth = 1700000000.125
+        uptime = 2**24 + 0.25
+        state = state.replace(birth_timestamp=birth, uptime_s=uptime)
+        result = run_compositional_loop(learner, stream, 2, jr.key(1), learner_state=state)
+        clocks = result.state
+        assert type(clocks.birth_timestamp) is float
+        assert clocks.birth_timestamp == birth
+        assert type(clocks.uptime_s) is float
+        assert clocks.uptime_s > uptime
+        chex.assert_tree_all_finite(result.metrics)
 
 
 class TestImprintConsolidation:
@@ -1575,3 +1824,53 @@ def test_compositional_init_rejects_hostile_and_derived_parent_resources() -> No
     )
     with pytest.raises(ValueError, match="recursive parent construction byte count"):
         recursive_with_composition.init(30_000, jr.key(0))
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("losses", [(1.0, 1.0, 1.0, 1.0), (1.0, 1.0, 1.0, 0.0)])
+def test_finite_candidate_selector_retains_finite_center(losses, compiled) -> None:
+    selector = FiniteCandidateSelector(n_candidates=4, learning_rate=2e38)
+    update = jax.jit(selector.update) if compiled else selector.update
+    result = update(selector.init(), jnp.asarray(losses, dtype=jnp.float32))
+    raw = -float(np.float32(2e38)) * np.asarray(losses, dtype=np.float64)
+    expected = raw - raw.mean()
+    assert int(result.state.step_count) == 1
+    np.testing.assert_allclose(result.state.log_weights, expected, rtol=1e-6, atol=0.0)
+    np.testing.assert_array_equal(result.state.cumulative_loss, losses)
+    np.testing.assert_array_equal(result.state.action_counts, np.ones(4, dtype=np.int32))
+    probabilities = selector.probabilities(result.state)
+    assert bool(jnp.all(jnp.isfinite(probabilities)))
+    np.testing.assert_allclose(float(probabilities.sum()), 1.0, rtol=1e-6)
+
+
+@pytest.mark.parametrize("width", [2, 4])
+def test_compositional_boundaries_fail_closed_on_wrong_observation_width(width: int) -> None:
+    """The raw-feature prefix pins the width that ``run_compositional_arrays`` enforces."""
+    learner = CompositionalFeatureLearner(n_features=5, n_tasks=2)
+    state = learner.init(3, jr.key(0))
+    observation = jnp.ones(width, dtype=jnp.float32)
+    targets = jnp.ones(2, dtype=jnp.float32)
+
+    result = learner.update(state, observation, targets)
+
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state.output_weights, state.output_weights)
+    chex.assert_trees_all_equal(result.state.output_bias, state.output_bias)
+    chex.assert_trees_all_equal(result.state.theta, state.theta)
+    chex.assert_trees_all_equal(result.state.step_count, state.step_count)
+    chex.assert_trees_all_equal(result.predictions, jnp.zeros(2, dtype=jnp.float32))
+    assert bool(jnp.all(jnp.isnan(learner.constructed_features(state, observation))))
+    assert bool(jnp.all(jnp.isnan(learner.augmented_observation(state, observation)[width:])))
+    assert bool(jnp.all(jnp.isnan(learner.predict(state, observation))))
+
+
+def test_compositional_exact_observation_width_still_updates() -> None:
+    learner = CompositionalFeatureLearner(n_features=5, n_tasks=2)
+    state = learner.init(3, jr.key(0))
+    observation = jnp.ones(3, dtype=jnp.float32)
+    targets = jnp.ones(2, dtype=jnp.float32)
+
+    result = learner.update(state, observation, targets)
+
+    assert bool(result.update_applied)
+    assert bool(jnp.all(jnp.isfinite(learner.predict(result.state, observation))))

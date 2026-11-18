@@ -21,21 +21,7 @@ from alberta_framework.core._float32_scalars import (
 )
 
 _INT32_MAX = 2_147_483_647
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _ACTUAL_FLOAT_TYPES = frozenset(
     {float, Fraction, *(np.dtype(c).type for c in ("e", "f", "d", "g"))}
 )
@@ -57,7 +43,7 @@ def _require_float32_in_unit(name: str, value: object) -> float:
     if type(value) not in _ALLOWED_REAL_TYPES:
         raise ValueError(f"{name} must be a real number")
     stored, numerator, denominator = validated_float32_scalar_with_ratio(
-        name, value
+        name, value, lower=0.0, upper=1.0
     )
     if not math.isfinite(stored):
         raise ValueError(f"{name} must be finite")
@@ -74,6 +60,29 @@ def _require_init_type(value: object) -> str:
     if value not in ("uniform", "normal"):
         raise ValueError("init_type must be 'uniform' or 'normal'")
     return value
+
+
+def _canonical_threefry_key(value: object) -> Array:
+    """Validate one Threefry key and return its typed scalar representation."""
+    try:
+        key = jnp.asarray(value)
+    except Exception as error:
+        raise ValueError("key must be a scalar threefry2x32 key") from error
+    if key.shape == (2,) and key.dtype == jnp.uint32:
+        return cast(Array, jr.wrap_key_data(key, impl="threefry2x32"))
+    try:
+        implementation = str(jr.key_impl(value))  # type: ignore[arg-type]
+        words = jr.key_data(value)  # type: ignore[arg-type]
+    except Exception as error:
+        raise ValueError("key must be a scalar threefry2x32 key") from error
+    if (
+        implementation != "threefry2x32"
+        or words.shape != (2,)
+        or words.dtype != jnp.uint32
+        or key.shape != ()
+    ):
+        raise ValueError("key must be a scalar threefry2x32 key")
+    return key
 
 
 def sparse_init(
@@ -116,6 +125,7 @@ def sparse_init(
     # weights has shape (128, 10), ~90% zeros per row
     ```
     """
+    key = _canonical_threefry_key(key)
     if type(shape) not in (tuple, list) or len(shape) != 2:
         raise ValueError("shape must be a two-element tuple or list (fan_out, fan_in)")
     # Extract without invoking hostile __iter__ hooks beyond the exact tuple/list check
@@ -152,7 +162,14 @@ def sparse_init(
     if num_zeros <= 0:
         return weights
     if num_zeros >= fan_in:
-        return jnp.zeros_like(weights)
+        if sparsity_validated >= 1.0:
+            return jnp.zeros_like(weights)
+        # sparsity < 1 must keep one live incoming weight per row. The
+        # nearest-int count can equal fan_in (0.9 * 5 + 0.5 == 5.0) and
+        # the previous branch then returned an all-zero matrix.
+        num_zeros = fan_in - 1
+        if num_zeros <= 0:
+            return weights
 
     # Exact per-row sparsity without per-row random permutations.  `jr.permutation`
     # lowers to a shuffle kernel that can be very slow to compile in large suites.

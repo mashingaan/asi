@@ -1,20 +1,31 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+from typing import Any
 
 import jax
+import numpy as np
 import pytest
 
 from alberta_framework.benchmarks.ftl_online_agent_development import (
     ACTION_DELTAS,
     ARM_IDS,
+    FROZEN_GOALS,
     FROZEN_SEEDS,
     OFFICIAL_CODE_REVISION,
+    DevelopmentResult,
+    _mpc_action,
     run_development_lane,
     validate_result,
 )
 
 pytestmark = pytest.mark.integration
+
+# Every frozen task starts at the origin, each goal sits two unit moves away,
+# and no action holds position.  The best reachable cost is therefore one per
+# odd step and zero per even step: exactly two per four-step task.
+_OPTIMAL_DEFAULT_RETURN = -2.0 * len(FROZEN_GOALS)
 
 
 def test_end_to_end_lane_has_matched_axes_controls_and_exact_receipts() -> None:
@@ -94,6 +105,41 @@ def test_validator_rejects_promotion_counter_forgery_and_extra_fields() -> None:
         validate_result(dataclasses.replace(result, identity=forged_identity))
 
 
+def _json_payload(result: DevelopmentResult) -> dict[str, Any]:
+    payload: dict[str, Any] = json.loads(json.dumps(dataclasses.asdict(result)))
+    validate_result(payload)
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("field", "alias"),
+    [
+        ("scientific_promotion_allowed", 0),
+        ("scientific_promotion_allowed", 0.0),
+        ("scientific_promotion_allowed", None),
+        ("scientific_promotion_allowed", ""),
+        ("historical_ftl_claim_reused", 0),
+        ("historical_ftl_claim_reused", []),
+    ],
+)
+def test_validator_rejects_non_bool_negative_flags(field: str, alias: object) -> None:
+    result = run_development_lane(seed=FROZEN_SEEDS[0], steps_per_task=1, planning_horizon=1)
+    with pytest.raises(ValueError, match="nonpromoting"):
+        validate_result(dataclasses.replace(result, **{field: alias}))
+    payload = _json_payload(result)
+    payload[field] = alias
+    with pytest.raises(ValueError, match="nonpromoting"):
+        validate_result(payload)
+
+
+def test_validator_rejects_a_float_alias_of_a_frozen_seed() -> None:
+    result = run_development_lane(seed=FROZEN_SEEDS[0], steps_per_task=1, planning_horizon=1)
+    payload = _json_payload(result)
+    payload["seed"] = float(FROZEN_SEEDS[0])
+    with pytest.raises(ValueError, match="frozen development schedule"):
+        validate_result(payload)
+
+
 def test_mechanism_off_is_causal_and_does_not_adopt_updates() -> None:
     result = run_development_lane(seed=FROZEN_SEEDS[2], steps_per_task=3, planning_horizon=1)
     enabled, disabled, _ = result.arms
@@ -105,3 +151,68 @@ def test_mechanism_off_is_causal_and_does_not_adopt_updates() -> None:
 def test_workload_action_registry_is_read_only() -> None:
     with pytest.raises(ValueError):
         ACTION_DELTAS[0, 0] = 7
+
+
+def _grid_predict(observation: np.ndarray, action: int) -> np.ndarray:
+    return np.asarray(observation + ACTION_DELTAS[action], dtype=np.float32)
+
+
+def test_planner_maximizes_the_summed_horizon_return_not_the_terminal_state() -> None:
+    """arXiv:2507.09177v1 Eq. 2 sums the H-step reward over the imagined rollout.
+
+    This deterministic model separates the two objectives.  Action ``0`` is a
+    detour that is far from the goal after one step and exactly on it after two;
+    every other action parks one unit away.  Terminal-state scoring prefers the
+    detour, the summed horizon return prefers parking.
+    """
+
+    def detour_predict(observation: np.ndarray, action: int) -> np.ndarray:
+        if action == 0:
+            far = float(observation[0]) == 0.0
+            return np.asarray((10.0 if far else 0.0, 0.0), dtype=np.float32)
+        return np.asarray((1.0, 0.0), dtype=np.float32)
+
+    observation = np.zeros(2, dtype=np.float32)
+    goal = np.zeros(2, dtype=np.float32)
+    action, queries, candidates = _mpc_action(observation, goal, 2, detour_predict)
+    assert (queries, candidates) == (32, 16)
+    assert action == 1
+
+
+def test_planner_horizon_one_reduces_to_the_single_imagined_step() -> None:
+    """One imagined step makes the summed and terminal objectives identical."""
+    observation = np.zeros(2, dtype=np.float32)
+    for goal_tuple in FROZEN_GOALS:
+        goal = np.asarray(goal_tuple, dtype=np.float32)
+        action, queries, candidates = _mpc_action(observation, goal, 1, _grid_predict)
+        terminal_scores = [
+            -float(np.sum((_grid_predict(observation, candidate) - goal) ** 2))
+            for candidate in range(4)
+        ]
+        assert (queries, candidates) == (4, 4)
+        assert action == int(np.argmax(terminal_scores))
+
+
+def test_privileged_control_bounds_every_arm_at_the_frozen_default_horizon() -> None:
+    """The lane's defaults are its frozen protocol; run them, not a shrunk proxy."""
+    for seed in FROZEN_SEEDS:
+        result = run_development_lane(seed=seed)
+        returns = {arm.arm_id: sum(arm.task_returns) for arm in result.arms}
+        assert result.planning_horizon == 2
+        assert all(
+            arm.receipt.environment_steps == 4 * len(FROZEN_GOALS) for arm in result.arms
+        )
+        privileged = returns["privileged_dynamics_mpc"]
+        assert privileged == pytest.approx(_OPTIMAL_DEFAULT_RETURN)
+        assert privileged >= returns["sparse_ftl_online"]
+        assert privileged >= returns["sparse_ftl_frozen"]
+
+
+def test_deeper_planning_never_degrades_the_privileged_dynamics_control() -> None:
+    """Exact dynamics plus more lookahead cannot lower the control's own return."""
+    privileged_returns = []
+    for horizon in (1, 2, 3):
+        result = run_development_lane(seed=FROZEN_SEEDS[0], planning_horizon=horizon)
+        arm = next(x for x in result.arms if x.arm_id == "privileged_dynamics_mpc")
+        privileged_returns.append(sum(arm.task_returns))
+    assert privileged_returns == pytest.approx([_OPTIMAL_DEFAULT_RETURN] * 3)

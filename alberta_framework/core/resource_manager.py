@@ -100,6 +100,30 @@ def _require_exact_tuple(name: str, value: object) -> tuple[Any, ...]:
     return value
 
 
+def _require_typed_threefry_key(name: str, value: object) -> Array:
+    """Require one scalar typed Threefry key before stochastic dispatch."""
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError(f"{name} must be a typed scalar threefry2x32 key")
+    try:
+        implementation = str(jr.key_impl(value))  # type: ignore[arg-type]
+        words = jr.key_data(value)  # type: ignore[arg-type]
+        shape = tuple(cast(Any, value).shape)
+    except Exception as error:
+        raise TypeError(f"{name} must be a typed scalar threefry2x32 key") from error
+    if (
+        shape != ()
+        or implementation != "threefry2x32"
+        or tuple(words.shape) != (2,)
+        or words.dtype != jnp.uint32
+    ):
+        raise TypeError(f"{name} must be a typed scalar threefry2x32 key")
+    return cast(Array, value)
+
+
 def _decode_sequence(name: str, value: object) -> tuple[Any, ...]:
     if type(value) is not list:
         raise ValueError(f"serialized {name} must be an exact JSON list")
@@ -140,7 +164,7 @@ def _require_serialized_fields(
 def _require_manager_state_budget(name: str, n_contexts: int, n_choices: int) -> None:
     """Preflight persistent state and conservative update/select working sets."""
     state_scalars = 3 * n_contexts * n_choices + 1
-    update_scalars = 3 * state_scalars + 40 * n_choices + 32
+    update_scalars = 3 * state_scalars + 41 * n_choices + 32
     if (
         state_scalars > _INT32_MAX
         or 4 * state_scalars > _INT32_MAX
@@ -190,6 +214,29 @@ def _mask_unused_history(
     recoverable = unused & ~jnp.isfinite(current)
     checked = jnp.where(recoverable, jnp.zeros_like(current), current)
     return history.at[context].set(checked)
+
+
+def _finite_convex_reduction(weights: Array, values: Array) -> Array:
+    """Preserve a finite convex sum when only its float32 reduction overflows."""
+    direct = jnp.sum(weights * values)
+    scale = jnp.max(jnp.abs(values))
+    _, exponent = jnp.frexp(scale)
+    scaled_values = jnp.ldexp(values, -exponent)
+    scaled_sum = jnp.sum(weights * scaled_values)
+    # Normalized float32 weights can sum a few ulps outside one. Clamp only
+    # fallback roundoff to the convex hull before restoring the source scale.
+    bounded_scaled_sum = jnp.clip(
+        scaled_sum,
+        jnp.min(scaled_values),
+        jnp.max(scaled_values),
+    )
+    stable = jnp.ldexp(bounded_scaled_sum, exponent)
+    reduction_only_overflow = (
+        ~jnp.isfinite(direct)
+        & jnp.all(jnp.isfinite(weights))
+        & jnp.all(jnp.isfinite(values))
+    )
+    return jnp.where(reduction_only_overflow, stable, direct)
 
 
 def _validated_cost_weight(value: float) -> float:
@@ -594,9 +641,17 @@ class LearnedResourceManager:
         adjusted = jnp.where(valid_actions, safe_losses + cost_terms, 0.0)
 
         weights = self._weights_jit(state, context)
-        finite_weight_sum = jnp.maximum(jnp.sum(jnp.where(valid_actions, weights, 0.0)), 1e-12)
-        masked_weights = jnp.where(valid_actions, weights / finite_weight_sum, 0.0)
-        baseline = jnp.sum(masked_weights * adjusted)
+        masked = jnp.where(valid_actions, weights, 0.0)
+        max_val = jnp.max(masked)
+        _, exp_val = jnp.frexp(max_val)
+        scaled = jnp.ldexp(masked, -exp_val)
+        scaled_sum = jnp.sum(scaled)
+        positive = (max_val > 0.0) & (scaled_sum > 0.0) & jnp.isfinite(scaled_sum)
+        normalized = scaled / jnp.where(positive, scaled_sum, 1.0)
+        valid_count = jnp.maximum(jnp.sum(valid_actions.astype(jnp.float32)), 1.0)
+        uniform = jnp.where(valid_actions, 1.0 / valid_count, 0.0)
+        masked_weights = jnp.where(positive, normalized, uniform)
+        baseline = _finite_convex_reduction(masked_weights, adjusted)
         advantages = jnp.where(valid_actions, baseline - adjusted, 0.0)
         advantages = jnp.clip(
             advantages,
@@ -609,7 +664,14 @@ class LearnedResourceManager:
             _skip_zero_scale(self._discount, old_context_logits) + self._learning_rate * advantages
         )
         # Remove an arbitrary additive constant for numerical stability.
-        new_context_logits = new_context_logits - jnp.mean(new_context_logits)
+        center = jnp.mean(new_context_logits)
+        # Compute a bounded mean when a finite row's sum overflows.
+        peak = jnp.max(jnp.abs(new_context_logits))
+        _, exponent = jnp.frexp(peak)
+        scaled = jnp.ldexp(new_context_logits, -exponent)
+        bounded_center = jnp.clip(jnp.mean(scaled), jnp.min(scaled), jnp.max(scaled))
+        center = jnp.where(jnp.isfinite(center), center, jnp.ldexp(bounded_center, exponent))
+        new_context_logits = new_context_logits - center
         new_log_weights = state.log_weights.at[context].set(new_context_logits)
 
         old_ema = state.loss_ema[context]
@@ -1056,7 +1118,11 @@ class GeneratorMetaResourceManager:
     ) -> GeneratorMetaResourceDecision:
         """Sample one policy and return the generator knobs it controls."""
         self._require_state_contract(state)
-        return cast(GeneratorMetaResourceDecision, self._select_jit(state, key, context_id))
+        checked_key = _require_typed_threefry_key("key", key)
+        return cast(
+            GeneratorMetaResourceDecision,
+            self._select_jit(state, checked_key, context_id),
+        )
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def _select_jit(
@@ -1073,7 +1139,7 @@ class GeneratorMetaResourceManager:
         selection_valid = (
             context_valid & floating_tree_is_finite(state) & jnp.all(jnp.isfinite(weights))
         )
-        action = jr.categorical(key, jnp.log(weights + 1e-8)).astype(jnp.int32)
+        action = jr.categorical(key, jnp.log(weights)).astype(jnp.int32)
         op_ids = jnp.asarray(self._op_ids, dtype=jnp.int32)
         parent_modes = jnp.asarray(self._parent_modes, dtype=jnp.int32)
         replacement = jnp.asarray(self._replacement_multipliers, dtype=jnp.float32)
@@ -1191,9 +1257,17 @@ class GeneratorMetaResourceManager:
         adjusted = jnp.where(finite, safe_rewards - cost_terms, 0.0)
 
         weights = self._weights_jit(state, context)
-        finite_weight_sum = jnp.maximum(jnp.sum(jnp.where(finite, weights, 0.0)), 1e-12)
-        masked_weights = jnp.where(finite, weights / finite_weight_sum, 0.0)
-        baseline = jnp.sum(masked_weights * adjusted)
+        masked = jnp.where(finite, weights, 0.0)
+        max_val = jnp.max(masked)
+        _, exp_val = jnp.frexp(max_val)
+        scaled = jnp.ldexp(masked, -exp_val)
+        scaled_sum = jnp.sum(scaled)
+        positive = (max_val > 0.0) & (scaled_sum > 0.0) & jnp.isfinite(scaled_sum)
+        normalized = scaled / jnp.where(positive, scaled_sum, 1.0)
+        valid_count = jnp.maximum(jnp.sum(finite.astype(jnp.float32)), 1.0)
+        uniform = jnp.where(finite, 1.0 / valid_count, 0.0)
+        masked_weights = jnp.where(positive, normalized, uniform)
+        baseline = _finite_convex_reduction(masked_weights, adjusted)
         selection_input_valid = jnp.asarray(True, dtype=jnp.bool_)
         if self._update_rule == "exp3":
             if selected_action is None:

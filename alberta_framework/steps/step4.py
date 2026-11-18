@@ -57,21 +57,7 @@ from alberta_framework.steps._smoke_record_validation import require_step_shape
 Step4OptimizerName = Literal["lms", "idbd", "autostep"]
 Step4BounderName = Literal["none", "obgd"]
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _FLOAT32_MIN_NORMAL = float.fromhex("0x1.0p-126")
 
 
@@ -386,8 +372,16 @@ def step4_update(
         next_action,
         prediction_cumulants=prediction_cumulants,
     )
+    # The jitted update narrows the host-only clocks, which one transition
+    # does not advance. Restore their incoming values.
+    updated_state = result.state.replace(
+        learner_state=result.state.learner_state.replace(
+            birth_timestamp=state.learner_state.birth_timestamp,
+            uptime_s=state.learner_state.uptime_s,
+        )
+    )
     return Step4OneStepResult(
-        state=result.state,
+        state=updated_state,
         action=result.action,
         q_values=result.q_values,
         td_error=result.td_error,
@@ -407,6 +401,8 @@ def _require_trusted_array_metadata(name: str, array: object) -> tuple[int, ...]
         shape = tuple(int(dim) for dim in cast(Any, array).shape)
     except (AttributeError, IndexError, TypeError, ValueError) as error:
         raise TypeError(f"{name} must expose trusted shape metadata") from error
+    if getattr(cast(Any, array).dtype, "kind", None) == "c":
+        raise ValueError(f"{name} must have a real dtype")
     return shape
 
 
@@ -458,6 +454,14 @@ def run_step4_scan(
         state,
         (features_array, rewards_array, terminated_array),
     )
+    # These host-only fields are unchanged by learning, but scan narrows
+    # dynamic Python floats to device precision. Restore their incoming values.
+    final_state = final_state.replace(
+        learner_state=final_state.learner_state.replace(
+            birth_timestamp=state.learner_state.birth_timestamp,
+            uptime_s=state.learner_state.uptime_s,
+        )
+    )
     return SARSAArrayResult(
         state=final_state,
         q_values=q_values,
@@ -480,7 +484,7 @@ def run_step4_smoke(
 
     cfg = config or Step4SARSAConfig()
     agent = make_step4_sarsa_agent(cfg)
-    data_key, state_key = jr.split(jr.key(seed))
+    data_key, state_key = jr.split(jr.key(seed, impl="threefry2x32"))
     observations = jr.normal(data_key, (steps + 1, feature_dim), dtype=jnp.float32)
     rewards = jnp.tanh(observations[1:, 0])
     terminated = jnp.zeros(steps, dtype=jnp.float32)

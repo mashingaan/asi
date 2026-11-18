@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import MappingProxyType
 from typing import Any
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -225,3 +226,99 @@ def test_numpy_risk_canonicalizes() -> None:
     assert res["risk_score"] == (5.5,)
     res2 = to_security_gym_action("pass", risk_score=np.int32(5))
     assert res2["risk_score"] == (5.0,)
+
+
+def test_coerce_admits_every_numpy_integer_action_id() -> None:
+    """Gymnasium and ``argmax`` hand callers numpy ids, so the gate must take them."""
+    families = (
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
+        np.longlong,
+        np.ulonglong,
+    )
+    for family in families:
+        coerced = coerce_security_action(family(3))  # type: ignore[arg-type]
+        assert coerced is SecurityAction(3)
+        assert type(coerced) is SecurityAction
+
+    # The documented producer of an action id is a discrete argmax/sample.
+    greedy = np.argmax(np.array([0.1, 0.4, 0.2, 0.9, 0.3, 0.0], dtype=np.float32))
+    assert coerce_security_action(greedy) is SecurityAction(3)  # type: ignore[arg-type]
+
+    # One call, one numpy type: ``risk_score`` already accepted it, so ``action``
+    # must too.
+    assert to_security_gym_action(np.int64(3), np.int64(3)) == {  # type: ignore[arg-type]
+        "action": 3,
+        "risk_score": (3.0,),
+    }
+
+
+def test_coerce_still_rejects_non_integer_lookalikes() -> None:
+    """Widening the integer families must not admit bools, reals, or arrays."""
+    for value in (
+        np.bool_(True),
+        np.float32(3.0),
+        np.float64(3.0),
+        np.array(3),
+        np.array([3]),
+        np.int64(99),
+    ):
+        with pytest.raises(ValueError, match="security action"):
+            coerce_security_action(value)  # type: ignore[arg-type]
+
+    # An exact-type gate keeps hostile subclasses out without touching a hook.
+    with pytest.raises(ValueError, match="security action"):
+        coerce_security_action(_HostileInt(3))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        (float("nan"), 0.0),
+        (0.0, float("inf")),
+        (1e39, 0.0),
+        (True, False),
+        (1 + 1j, 0.0),
+        ("x", "y"),
+        (_HostileFloat(0.5), 0.0),
+        [None, 0.0],
+        "ab",
+        {0: 0.0, 1: 0.0},
+        np.array([np.nan, 0.0], dtype=np.float32),
+        np.array([1.0 + 0.0j, 0.0]),
+        np.array([True, False]),
+        jnp.array([jnp.inf, 0.0], dtype=jnp.float32),
+    ],
+)
+def test_validate_observation_rejects_values_outside_the_float32_schema(
+    observation: Any,
+) -> None:
+    schema = SecurityFeatureSchema(names=("x0", "x1"))
+    with pytest.raises(ValueError, match="observation|must be a finite real number"):
+        schema.validate_observation(observation)
+
+
+def test_validate_observation_rejects_a_matching_length_matrix() -> None:
+    schema = SecurityFeatureSchema(names=("x0", "x1"))
+    with pytest.raises(ValueError, match="one-dimensional"):
+        schema.validate_observation(np.ones((2, 3), dtype=np.float32))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        (0.1, 2),
+        [np.float32(0.1), np.int64(2)],
+        np.array([0.1, 2.0], dtype=np.float32),
+        np.array([0.1, 2.0], dtype=np.float64),
+        jnp.array([0.1, 2.0], dtype=jnp.float32),
+    ],
+)
+def test_validate_observation_admits_finite_real_vectors(observation: Any) -> None:
+    SecurityFeatureSchema(names=("x0", "x1")).validate_observation(observation)

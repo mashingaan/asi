@@ -21,9 +21,12 @@ so noise effects are unmistakable) and ``sparsity=0.5`` round-trips.
 """
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
+from jax import Array
 
 from alberta_framework.core.optimizers import AdaptiveObGDBounding, ObGDBounding
 from alberta_framework.core.upgd import (
@@ -1310,6 +1313,39 @@ class TestUpdateMetrics:
         assert float(passive_delta) > 0.0
         assert float(active_delta) > 0.0
 
+    @pytest.mark.parametrize("readout_input_mode", ["hidden", "hidden_plus_input"])
+    def test_two_timescale_softmax_ce_fast_trunk_gradient_updates_on_first_step(
+        self,
+        readout_input_mode: str,
+    ):
+        common = {
+            "n_heads": 3,
+            "hidden_sizes": (4,),
+            "sparsity": 0.0,
+            "step_size": 0.1,
+            "perturbation_sigma": 0.0,
+            "readout_mode": "two_timescale_simplex",
+            "readout_loss_mode": "softmax_ce",
+            "readout_input_mode": readout_input_mode,
+        }
+        learner = UPGDLearner(**common, readout_fast_trunk_gradient_multiplier=1.0)
+        state = learner.init(feature_dim=3, key=jr.key(2383))
+        observation = jnp.array([1.0, -0.5, 0.25], dtype=jnp.float32)
+        target = jnp.array([0.0, 1.0, 0.0], dtype=jnp.float32)
+
+        result = learner.update(state, observation, target)
+
+        assert any(
+            not bool(jnp.array_equal(before, after))
+            for before, after in zip(
+                state.trunk_params.weights,
+                result.state.trunk_params.weights,
+            )
+        )
+        chex.assert_tree_all_finite(result.state.trunk_params)
+        chex.assert_tree_all_finite(result.predictions)
+        chex.assert_tree_all_finite(result.metrics)
+
     def test_two_timescale_fast_head_uses_shared_bounder(self):
         common = {
             "n_heads": 3,
@@ -1442,6 +1478,101 @@ class TestUpdateMetrics:
 # =============================================================================
 
 
+class TestObGDBoundCountsTheErrorOnce:
+    """UPGD's steps already carry the prediction error; the bound must not re-apply it.
+
+    Published ObGD (Elsayed et al. 2024) bounds with ``kappa * max(|delta|, 1)``
+    times the L1 norm of the error-free gradient. Because UPGD forms
+    ``step = -alpha * dL/dw = alpha * delta * z`` before bounding, feeding both
+    the steps and ``|delta|`` to the bound multiplies the error twice.
+    """
+
+    @pytest.mark.parametrize("delta", [5.0, 2.0, 0.5, 0.1])
+    def test_linear_bounded_update_matches_published_obgd(self, delta: float) -> None:
+        kappa, lr = 2.0, 1.0
+        learner = UPGDLearner(
+            n_heads=1,
+            hidden_sizes=(),
+            step_size=lr,
+            sparsity=0.0,
+            perturbation_sigma=0.0,
+            bounder=ObGDBounding(kappa=kappa),
+            track_unit_utilities=False,
+            track_gradient_history=False,
+        )
+        state = learner.init(10, jr.key(0))
+        x = jnp.ones(10, dtype=jnp.float32)
+        z_l1 = float(jnp.sum(jnp.abs(x)) + 1.0)  # weight and bias gradient, error-free
+        z_sq = float(jnp.sum(x * x) + 1.0)
+        before = float(learner.predict(state, x)[0])
+        target = jnp.array([before + delta], dtype=jnp.float32)
+
+        after = float(learner.predict(learner.update(state, x, target).state, x)[0])
+
+        alpha_eff = lr / max(kappa * max(abs(delta), 1.0) * lr * z_l1, 1.0)
+        assert after - before == pytest.approx(alpha_eff * delta * z_sq, rel=1e-4)
+        # The bounded step never overshoots the target.
+        assert 0.0 < (after - before) / delta <= 1.0
+
+    def test_obgd_subclass_takes_published_error_carrying_bound(self) -> None:
+        """A valid ObGDBounding subclass must take the published error-carrying bound.
+
+        Exact-type dispatch would route a subclass to the pseudo-error 1.0
+        fallback, overshooting the published bound (min(|delta|, 1) / kappa)
+        by up to 1 / |delta| for small errors.
+        """
+
+        class DerivedObGD(ObGDBounding):
+            pass
+
+        kappa, lr, delta = 2.0, 1.0, 0.1
+        learner = UPGDLearner(
+            n_heads=1,
+            hidden_sizes=(),
+            step_size=lr,
+            sparsity=0.0,
+            perturbation_sigma=0.0,
+            bounder=DerivedObGD(kappa=kappa),
+            track_unit_utilities=False,
+            track_gradient_history=False,
+        )
+        state = learner.init(10, jr.key(0))
+        x = jnp.ones(10, dtype=jnp.float32)
+        z_l1 = float(jnp.sum(jnp.abs(x)) + 1.0)
+        z_sq = float(jnp.sum(x * x) + 1.0)
+        before = float(learner.predict(state, x)[0])
+        target = jnp.array([before + delta], dtype=jnp.float32)
+
+        after = float(learner.predict(learner.update(state, x, target).state, x)[0])
+
+        alpha_eff = lr / max(kappa * max(abs(delta), 1.0) * lr * z_l1, 1.0)
+        assert after - before == pytest.approx(alpha_eff * delta * z_sq, rel=1e-4)
+        assert 0.0 < (after - before) / delta <= 1.0
+
+    @pytest.mark.parametrize("delta", [0.0, 0.1, 1.0, 3.0])
+    def test_kappa_bound_of_error_carrying_steps_equals_bounding_the_gradient(
+        self, delta: float
+    ) -> None:
+        from alberta_framework.core.optimizers import _apply_obgd_bound
+
+        kappa = 0.5
+        keys = jr.split(jr.key(3), 3)
+        gradient_steps = tuple(
+            jr.normal(k, shape=shape, dtype=jnp.float32)
+            for k, shape in zip(keys, [(4, 3), (4,), (2, 4)], strict=True)
+        )
+        error = jnp.array(delta, dtype=jnp.float32)
+        error_steps = tuple(error * g for g in gradient_steps)
+
+        bounded, _ = UPGDLearner._obgd_bound_with_kappa(
+            error_steps, error, jnp.array(kappa, dtype=jnp.float32)
+        )
+        published, _ = _apply_obgd_bound(gradient_steps, error, kappa)
+        chex.assert_trees_all_close(
+            bounded, tuple(error * b for b in published), rtol=1e-6, atol=1e-7
+        )
+
+
 class TestUtilityTracking:
     """Utility should reflect |w * grad| accumulation."""
 
@@ -1567,6 +1698,33 @@ class TestUtilityTracking:
             assert float(head_w[0, 0]) == 0.0
         assert int(result.state.unit_ages[0][0]) == 0
         assert float(result.state.unit_utilities[0][0]) == 0.0
+        assert float(result.state.unit_replacement_counts[0]) == 1.0
+
+    def test_unit_ages_saturate_at_int32_max_and_remain_mature(self) -> None:
+        """int32 unit ages must not wrap; wraparound stops recycling."""
+        int32_max = np.iinfo(np.int32).max
+        wrapped = jnp.array(int32_max, dtype=jnp.int32) + jnp.array(1, dtype=jnp.int32)
+        assert int(wrapped) == -int32_max - 1
+
+        learner = UPGDLearner(
+            n_heads=2,
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            step_size=0.0,
+            perturbation_sigma=0.0,
+            unit_replacement_rate=0.25,
+            unit_maturity_threshold=1,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(11))
+        state = state.replace(  # type: ignore[attr-defined]
+            unit_utilities=(jnp.array([0.0, 10.0, 10.0, 10.0], dtype=jnp.float32),),
+            unit_ages=(jnp.full((4,), int32_max, dtype=jnp.int32),),
+        )
+        result = learner.update(state, jnp.zeros(3), jnp.zeros(2))
+        assert int(result.state.unit_ages[0][0]) == 0
+        assert int(result.state.unit_ages[0][1]) == int32_max
+        assert int(result.state.unit_ages[0][2]) == int32_max
+        assert int(result.state.unit_ages[0][3]) == int32_max
         assert float(result.state.unit_replacement_counts[0]) == 1.0
 
     def test_stale_gradient_recycling_with_targeted_fanin_runs(self):
@@ -1757,6 +1915,48 @@ class TestUtilityTracking:
         ]
         assert head_deltas[0] > 0.0
         assert sum(delta > 0.0 for delta in head_deltas[1:]) == 1
+
+    def test_margin_adapter_leaves_masked_heads_and_lone_active_head_untouched(self):
+        """NaN targets mask heads; the margin step needs an active competitor.
+
+        With every wrong logit masked to -inf the argmax fell back to head 0,
+        so an inactive head 0 was pushed down, and a lone active head 0 was
+        pushed up against itself on every step.
+        """
+        learner = UPGDLearner(
+            n_heads=3,
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            step_size=0.0,
+            perturbation_sigma=0.0,
+            readout_margin=1.0,
+            readout_margin_step_size=0.1,
+        )
+        state = learner.init(feature_dim=3, key=jr.key(15))
+        features = jnp.array([1.0, -0.5, 0.25])
+        nan = float("nan")
+        for targets in (
+            jnp.array([1.0, nan, nan]),
+            jnp.array([nan, nan, 1.0]),
+            jnp.array([nan, 1.0, nan]),
+        ):
+            result = learner.update(state, features, targets)
+            chex.assert_trees_all_equal(result.state.head_params, state.head_params)
+
+        # Two active heads still receive the hinge push, and the masked head does not.
+        result = learner.update(state, features, jnp.array([1.0, 0.0, nan]))
+        assert bool(
+            jnp.any(result.state.head_params.biases[0] != state.head_params.biases[0])
+        )
+        assert bool(
+            jnp.any(result.state.head_params.biases[1] != state.head_params.biases[1])
+        )
+        chex.assert_trees_all_equal(
+            result.state.head_params.weights[2], state.head_params.weights[2]
+        )
+        chex.assert_trees_all_equal(
+            result.state.head_params.biases[2], state.head_params.biases[2]
+        )
 
     def test_gradient_alignment_meta_plasticity_changes_head_scales(self):
         learner = UPGDLearner(
@@ -2196,6 +2396,73 @@ class TestCanFitSimpleFunction:
 class TestLoops:
     """Smoke tests for run_upgd_arrays and run_upgd_loop."""
 
+    @pytest.mark.parametrize("stream_runner", [False, True])
+    def test_finishes_device_work_before_stopping_uptime_clock(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        stream_runner: bool,
+    ) -> None:
+        """Reported uptime must cover scan execution, not only its dispatch."""
+        import time
+        from types import SimpleNamespace
+
+        import jax
+
+        import alberta_framework.core.upgd as module
+        from alberta_framework.streams.synthetic import RandomWalkStream
+
+        learner = UPGDLearner(
+            n_heads=1,
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            perturbation_sigma=0.0,
+        )
+        blocked: list[object] = []
+        real_scan = jax.lax.scan
+        real_time = time.time
+        scan_finished = False
+
+        def recording_scan(*args: object, **kwargs: object) -> object:
+            nonlocal scan_finished
+            result = real_scan(*args, **kwargs)
+            scan_finished = True
+            return result
+
+        def recording_block(value: object) -> object:
+            assert scan_finished
+            blocked.append(value)
+            return value
+
+        def clock() -> float:
+            if scan_finished:
+                assert blocked
+            return real_time()
+
+        monkeypatch.setattr(jax.lax, "scan", recording_scan)
+        monkeypatch.setattr(jax, "block_until_ready", recording_block)
+        monkeypatch.setattr(module, "time", SimpleNamespace(time=clock))
+
+        if stream_runner:
+            result = run_upgd_loop(
+                learner,
+                RandomWalkStream(feature_dim=3),
+                num_steps=4,
+                key=jr.key(271),
+            )
+        else:
+            state = learner.init(feature_dim=3, key=jr.key(271))
+            result = run_upgd_arrays(
+                learner,
+                state,
+                jnp.ones((4, 3), dtype=jnp.float32),
+                jnp.zeros((4, 1), dtype=jnp.float32),
+            )
+
+        assert len(blocked) == 1
+        assert isinstance(blocked[0], tuple)
+        assert int(result.state.step_count) == 4
+        chex.assert_shape(result.metrics, (4, 4))
+
     def test_run_upgd_arrays_smoke(self):
         learner = UPGDLearner(
             n_heads=1, hidden_sizes=(8,), sparsity=0.0,
@@ -2219,3 +2486,135 @@ class TestLoops:
         stream = RandomWalkStream(feature_dim=4, drift_rate=0.0, noise_std=0.05)
         result = run_upgd_loop(learner, stream, num_steps=50, key=jr.key(0))
         chex.assert_shape(result.metrics, (50, 4))
+
+    @pytest.mark.parametrize("stream_runner", [False, True])
+    def test_loops_preserve_exact_host_clocks(self, stream_runner: bool) -> None:
+        """lax.scan must not narrow the host-only clocks to float32."""
+        from alberta_framework.streams.synthetic import RandomWalkStream
+
+        birth = 1700000000.125
+        learner = UPGDLearner(
+            n_heads=1, hidden_sizes=(4,), sparsity=0.0, perturbation_sigma=0.0
+        )
+        state = learner.init(feature_dim=3, key=jr.key(0))
+        state = state.replace(birth_timestamp=birth, uptime_s=3.25)
+        if stream_runner:
+            result = run_upgd_loop(
+                learner,
+                RandomWalkStream(feature_dim=3),
+                num_steps=4,
+                key=jr.key(271),
+                learner_state=state,
+            )
+        else:
+            result = run_upgd_arrays(
+                learner,
+                state,
+                jnp.ones((4, 3), dtype=jnp.float32),
+                jnp.zeros((4, 1), dtype=jnp.float32),
+            )
+        assert result.state.birth_timestamp == birth
+        assert type(result.state.birth_timestamp) is float
+        assert type(result.state.uptime_s) is float
+        assert result.state.uptime_s >= 3.25
+
+
+class TestGradientAlignmentScaleInvariance:
+    """Tests that gradient alignment and tuple norms are invariant to magnitude and scale-free."""
+
+    def test_tuple_norm_scale_free(self):
+        v = (jnp.array([3.0, 4.0], dtype=jnp.float32), jnp.array([12.0], dtype=jnp.float32))
+        expected_base = 13.0  # sqrt(9 + 16 + 144) = sqrt(169) = 13.0
+        for exp in (-30, -20, -10, -5, 0, 5, 10, 20, 30):
+            scale = 10.0**exp
+            scaled_v = tuple(x * scale for x in v)
+            norm = UPGDLearner._tuple_norm(scaled_v)
+            np.testing.assert_allclose(float(norm), expected_base * scale, rtol=1e-5)
+
+        # Empty and zero cases
+        assert float(UPGDLearner._tuple_norm(())) == 0.0
+        assert float(UPGDLearner._tuple_norm((jnp.zeros((3,), dtype=jnp.float32),))) == 0.0
+
+    def test_gradient_alignment_scale_invariance(self):
+        t1 = (jnp.array([1.0, -0.5, 0.25], dtype=jnp.float32), jnp.array([2.0], dtype=jnp.float32))
+        for exp in (-30, -20, -10, -5, -4, -2, 0, 2, 4, 5, 10, 20, 30):
+            scale = 10.0**exp
+            scaled1 = tuple(x * scale for x in t1)
+            scaled2 = tuple(x * scale for x in t1)
+            neg_scaled = tuple(-x * scale for x in t1)
+
+            cos_same = float(UPGDLearner._gradient_alignment(scaled1, scaled2))
+            cos_neg = float(UPGDLearner._gradient_alignment(scaled1, neg_scaled))
+
+            np.testing.assert_allclose(cos_same, 1.0, atol=1e-6)
+            np.testing.assert_allclose(cos_neg, -1.0, atol=1e-6)
+
+    def test_gradient_alignment_orthogonal_and_zero(self):
+        t1 = (jnp.array([1.0, 0.0], dtype=jnp.float32),)
+        t2 = (jnp.array([0.0, 1.0], dtype=jnp.float32),)
+        zero = (jnp.zeros(2, dtype=jnp.float32),)
+        empty: tuple[Array, ...] = ()
+
+        assert float(UPGDLearner._gradient_alignment(t1, t2)) == 0.0
+        assert float(UPGDLearner._gradient_alignment(t1, zero)) == 0.0
+        assert float(UPGDLearner._gradient_alignment(zero, t1)) == 0.0
+        assert float(UPGDLearner._gradient_alignment(zero, zero)) == 0.0
+        assert float(UPGDLearner._gradient_alignment(empty, t1)) == 0.0
+
+    def test_gradient_alignment_nonfinite_inputs(self):
+        t_valid = (jnp.array([1.0, 2.0], dtype=jnp.float32),)
+        t_nan = (jnp.array([1.0, jnp.nan], dtype=jnp.float32),)
+        t_inf = (jnp.array([jnp.inf, 2.0], dtype=jnp.float32),)
+
+        assert float(UPGDLearner._gradient_alignment(t_valid, t_nan)) == 0.0
+        assert float(UPGDLearner._gradient_alignment(t_nan, t_valid)) == 0.0
+        assert float(UPGDLearner._gradient_alignment(t_valid, t_inf)) == 0.0
+        assert float(UPGDLearner._gradient_alignment(t_inf, t_valid)) == 0.0
+
+    def test_upgd_meta_plasticity_scale_invariance_end_to_end(self):
+        for exp in (10, 6, 2, 0, -2, -6, -10):
+            scale = 10.0**exp
+            learner = UPGDLearner(
+                n_heads=1,
+                hidden_sizes=(),
+                sparsity=0.0,
+                step_size=0.0,
+                perturbation_sigma=0.0,
+                meta_plasticity_mode="gradient_alignment",
+                meta_plasticity_step_size=0.5,
+                meta_plasticity_min_multiplier=0.1,
+                meta_plasticity_max_multiplier=10.0,
+            )
+            state = learner.init(feature_dim=3, key=jr.key(16))
+            obs = jnp.array([1.0, -0.5, 0.25], dtype=jnp.float32) * scale
+            target1 = jnp.array([1.0], dtype=jnp.float32) * scale
+
+            # Step 1: seeds previous gradients (scales stay at 0.0)
+            state = learner.update(state, obs, target1).state
+            assert float(state.meta_head_weight_log_scale) == 0.0
+            assert float(state.meta_head_bias_log_scale) == 0.0
+
+            # Step 2: identical gradients -> alignment is 1.0 -> log scale increases by 0.5
+            state_same = learner.update(state, obs, target1).state
+            np.testing.assert_allclose(float(state_same.meta_head_weight_log_scale), 0.5, atol=1e-5)
+            np.testing.assert_allclose(float(state_same.meta_head_bias_log_scale), 0.5, atol=1e-5)
+
+            # Step 2 alt: reversed target -> alignment is -1.0 -> log scale decreases by 0.5
+            pred = learner.predict(state, obs)
+            target_rev = 2.0 * pred - target1
+            state_rev = learner.update(state, obs, target_rev).state
+            np.testing.assert_allclose(float(state_rev.meta_head_weight_log_scale), -0.5, atol=1e-5)
+            np.testing.assert_allclose(float(state_rev.meta_head_bias_log_scale), -0.5, atol=1e-5)
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+def test_update_preserves_finite_step_mse_reductions(disable_jit: bool) -> None:
+    learner = UPGDLearner(n_heads=2, hidden_sizes=(4,), sparsity=0.0, perturbation_sigma=0.0)
+    with jax.disable_jit(disable_jit):
+        state = learner.init(feature_dim=2, key=jr.key(0))
+        result = learner.update(
+            state, jnp.zeros(2, dtype=jnp.float32), jnp.full(2, 1.5e19, dtype=jnp.float32)
+        )
+    assert int(result.state.step_count) == 1
+    assert bool(jnp.isfinite(result.state.loss_fast_ema))
+    assert bool(jnp.isfinite(result.state.loss_slow_ema))

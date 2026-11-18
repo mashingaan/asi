@@ -141,6 +141,32 @@ def _validate_state_contract(
             raise TypeError(f"{name}.{field_name} must have dtype int32")
 
 
+def _require_typed_threefry_key(name: str, value: object) -> Array:
+    """Require one scalar typed Threefry key without accepting legacy words."""
+
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array) or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError(f"{name} must be a typed scalar threefry2x32 key")
+    key = cast(Array, value)
+    try:
+        typed = bool(jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key))
+        implementation = str(jr.key_impl(key))
+        words = jr.key_data(key)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a typed scalar threefry2x32 key") from error
+    if (
+        not typed
+        or key.shape != ()
+        or implementation != "threefry2x32"
+        or words.shape != (2,)
+        or words.dtype != jnp.dtype(jnp.uint32)
+    ):
+        raise TypeError(f"{name} must be a typed scalar threefry2x32 key")
+    return key
+
+
 def _normalized_finite_float32_reward(name: str, value: object) -> float:
     """Return one hook-free host real canonicalized to the float32 reward sink."""
     message = f"{name} must be finite, concrete, and representable in float32"
@@ -214,16 +240,65 @@ def _normalized_positive_float32_probability(
     return float(np.float32(normalized)), numerator, denominator
 
 
+def _birth_death_stationary_average_reward(
+    kernel: np.ndarray, rewards: np.ndarray
+) -> float:
+    """Solve a large birth-death chain by exact adjacent-edge balance.
+
+    Every RiverSwim policy and its uniform-random mixture has only adjacent
+    transitions and a positive leftward probability at each nonzero state.
+    Detailed balance gives ``d[i+1] / d[i] = P[i,i+1] / P[i+1,i]``. Keeping
+    unnormalized rational masses makes the work linear in the state count,
+    unlike a dense rational elimination of an otherwise valid large chain.
+    """
+    n = int(kernel.shape[0])
+    upward: list[Fraction] = []
+    downward: list[Fraction] = []
+    for index, row in enumerate(kernel):
+        if np.any(row[: max(index - 1, 0)]) or np.any(row[index + 2 :]):
+            raise ValueError("large exact stationary gain requires a birth-death kernel")
+        left = Fraction(float(row[index - 1])) if index > 0 else Fraction(0)
+        stay = Fraction(float(row[index]))
+        right = Fraction(float(row[index + 1])) if index + 1 < n else Fraction(0)
+        total = left + stay + right
+        if total <= 0 or min(left, stay, right) < 0:
+            raise ValueError("transition rows must carry nonnegative mass")
+        downward.append(left / total)
+        upward.append(right / total)
+
+    weights = [Fraction(1)]
+    for index in range(n - 1):
+        down = downward[index + 1]
+        if down <= 0:
+            raise ValueError("large birth-death kernel must have positive downward edges")
+        weights.append(weights[-1] * upward[index] / down)
+    total_mass = sum(weights, Fraction(0))
+    weighted_reward = sum(
+        (mass * Fraction(float(reward)) for mass, reward in zip(weights, rewards, strict=True)),
+        Fraction(0),
+    )
+    return float(weighted_reward / total_mass)
+
+
 def _stationary_average_reward(
     transition: np.ndarray,
     step_rewards: np.ndarray,
 ) -> float:
     """Average reward of a unichain Markov chain with per-state step rewards.
 
-    Solves ``d @ P = d, sum(d) = 1`` as a least-squares system, which handles
-    periodic chains (where power iteration would oscillate) and chains with
-    transient states. The result is only meaningful for unichain kernels,
-    which every caller in this module guarantees by construction.
+    Solves ``d @ P = d, sum(d) = 1`` exactly in rational arithmetic and rounds
+    the resulting gain to float64 once. The stored kernel entries are float32
+    values, so they convert to :class:`fractions.Fraction` without loss, and
+    the only rounding step is the final correctly rounded division. This keeps
+    the result bit-identical across hosts: a floating-point least-squares
+    solve (LAPACK ``lstsq``) rounds differently depending on the CPU's SIMD
+    kernels, and the RiverSwim oracle gain is hashed into the environment
+    manifest identity, so any host-dependent bit would break cross-machine
+    identity checks.
+
+    The balance equations sum to zero over states, so one of them is
+    redundant; it is replaced by the normalization row, which yields a
+    nonsingular system exactly when the chain is unichain.
 
     Args:
         transition: Row-stochastic kernel, shape ``(n, n)``.
@@ -231,15 +306,71 @@ def _stationary_average_reward(
 
     Returns:
         The long-run average reward ``d @ step_rewards``.
+
+    Raises:
+        ValueError: If the kernel is not square, has a row with no mass, or
+            does not induce a unichain (no unique stationary distribution).
     """
-    n = transition.shape[0]
-    constraints = np.vstack([transition.T - np.eye(n), np.ones((1, n))])
-    targets = np.zeros(n + 1)
-    targets[-1] = 1.0
-    distribution, *_ = np.linalg.lstsq(constraints, targets, rcond=None)
-    distribution = np.clip(distribution, 0.0, None)
-    distribution = distribution / distribution.sum()
-    return float(distribution @ step_rewards)
+    kernel = np.asarray(transition, dtype=np.float64)
+    rewards = np.asarray(step_rewards, dtype=np.float64)
+    if kernel.ndim != 2 or kernel.shape[0] != kernel.shape[1]:
+        raise ValueError("transition kernel must be square")
+    n = int(kernel.shape[0])
+    if rewards.shape != (n,):
+        raise ValueError("step_rewards must have one entry per state")
+
+    if n > _MAX_EXACT_POLICY_STATES:
+        return _birth_death_stationary_average_reward(kernel, rewards)
+
+    rows: list[list[Fraction]] = []
+    for row in kernel:
+        exact_row = [Fraction(float(value)) for value in row]
+        total = sum(exact_row, Fraction(0))
+        if total <= 0 or any(value < 0 for value in exact_row):
+            raise ValueError("transition rows must carry nonnegative mass")
+        rows.append([value / total for value in exact_row])
+
+    # Unknown column d; equation j: sum_i d_i (P[i][j] - [i == j]) == 0 for
+    # j < n - 1, then sum_i d_i == 1. Augmented matrix, last column is the RHS.
+    system: list[list[Fraction]] = [
+        [rows[i][j] - (Fraction(1) if i == j else Fraction(0)) for i in range(n)]
+        + [Fraction(0)]
+        for j in range(n - 1)
+    ]
+    system.append([Fraction(1)] * n + [Fraction(1)])
+
+    for column in range(n):
+        pivot = next(
+            (index for index in range(column, n) if system[index][column] != 0),
+            None,
+        )
+        if pivot is None:
+            raise ValueError("transition kernel is not unichain")
+        system[column], system[pivot] = system[pivot], system[column]
+        pivot_row = system[column]
+        scale = pivot_row[column]
+        pivot_row[:] = [value / scale for value in pivot_row]
+        for index in range(n):
+            if index == column or system[index][column] == 0:
+                continue
+            factor = system[index][column]
+            target = system[index]
+            target[:] = [
+                value - factor * pivot_value
+                for value, pivot_value in zip(target, pivot_row, strict=True)
+            ]
+
+    distribution = [system[index][n] for index in range(n)]
+    if any(mass < 0 for mass in distribution):
+        raise ValueError("transition kernel is not unichain")
+    gain = sum(
+        (
+            mass * Fraction(float(reward))
+            for mass, reward in zip(distribution, rewards, strict=True)
+        ),
+        Fraction(0),
+    )
+    return float(gain)
 
 
 # =============================================================================
@@ -385,6 +516,7 @@ class SwitchingTwoStateMDP:
     def init(self, key: Array) -> SwitchingTwoStateState:
         """Create an initial state with a uniformly random latent state."""
 
+        key = _require_typed_threefry_key("key", key)
         return SwitchingTwoStateState(
             state_index=jr.randint(key, (), 0, _TWO_STATE_N).astype(jnp.int32),
             step_count=jnp.array(0, dtype=jnp.int32),
@@ -450,7 +582,10 @@ class SwitchingTwoStateMDP:
         payoff = self._phase_payoff_np(phase)
         stay_0 = float(payoff[0, 0])
         stay_1 = float(payoff[1, 1])
-        toggle = 0.5 * float(payoff[0, 1] + payoff[1, 0])
+        # Sum in float64: the sum of two float32 values is exact there, and
+        # halving is exact, so this is the documented closed form rather than
+        # its float32-rounded neighbour.
+        toggle = 0.5 * (float(payoff[0, 1]) + float(payoff[1, 0]))
         return max(stay_0, stay_1, toggle)
 
     def uniform_random_average_reward(self, phase: int) -> float:
@@ -461,7 +596,8 @@ class SwitchingTwoStateMDP:
         reward is the plain mean of the payoff matrix.
         """
 
-        return float(self._phase_payoff_np(phase).mean())
+        # Four float32 addends sum exactly in float64 and quartering is exact.
+        return float(np.mean(self._phase_payoff_np(phase), dtype=np.float64))
 
     def _phase_payoff_np(self, phase: int) -> np.ndarray:
         # Exact-type gate first: an arbitrary object's ``__eq__`` could run
@@ -734,6 +870,7 @@ class RiverSwimMDP:
         """
 
         _validate_state_contract("state", state, expected_type=RiverSwimState)
+        key = _require_typed_threefry_key("key", key)
         action_index = jnp.clip(jnp.asarray(action, dtype=jnp.int32), 0, 1)
         reward = self._rewards[state.state_index, action_index]
         next_index = jr.categorical(
@@ -759,11 +896,21 @@ class RiverSwimMDP:
             The long-run average reward of the policy.
         """
 
-        actions = np.asarray(policy, dtype=np.int64)
-        if actions.shape != (self._n_states,):
-            raise ValueError(f"policy must have length {self._n_states}, got shape {actions.shape}")
-        if not np.all((actions == LEFT_ACTION) | (actions == RIGHT_ACTION)):
-            raise ValueError("policy actions must be LEFT_ACTION (0) or RIGHT_ACTION (1)")
+        if len(policy) != self._n_states:
+            raise ValueError(f"policy must have length {self._n_states}")
+        canonical_actions: list[int] = []
+        for action in policy:
+            if type(action) not in _ACTUAL_INT_TYPES:
+                raise ValueError(
+                    "policy actions must be exact integers: LEFT_ACTION (0) or RIGHT_ACTION (1)"
+                )
+            canonical = operator.index(cast(SupportsIndex, action))
+            if canonical not in (LEFT_ACTION, RIGHT_ACTION):
+                raise ValueError(
+                    "policy actions must be exact integers: LEFT_ACTION (0) or RIGHT_ACTION (1)"
+                )
+            canonical_actions.append(canonical)
+        actions = np.asarray(canonical_actions, dtype=np.int64)
         states = np.arange(self._n_states)
         kernel = self._transitions_np[actions, states]
         step_rewards = self._rewards_np[states, actions]
@@ -790,7 +937,7 @@ class RiverSwimMDP:
         """Exact average reward of the uniform-random policy."""
 
         kernel = self._transitions_np.mean(axis=0)
-        step_rewards = self._rewards_np.mean(axis=1)
+        step_rewards = self._rewards_np.mean(axis=1, dtype=np.float64)
         return _stationary_average_reward(kernel, step_rewards)
 
     def _enumerate_optimal(self) -> tuple[tuple[int, ...], float]:

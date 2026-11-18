@@ -62,7 +62,12 @@ from alberta_framework.core.initializers import sparse_init
 from alberta_framework.core.normalizers import _saturating_int32_counter_increment
 from alberta_framework.core.optimizers import Bounder, ObGDBounding
 from alberta_framework.core.types import MLPParams
-from alberta_framework.core.update_safety import zero_if_collapsed_infinity
+from alberta_framework.core.update_safety import (
+    floating_tree_is_finite,
+    neutralize_array,
+    select_transaction,
+    zero_if_collapsed_infinity,
+)
 
 
 def _require_exact_str(name: object, value: object) -> str:
@@ -79,19 +84,7 @@ _INT32_MAX = 2**31 - 1
 _UPGD_LOOP_MAX_STEPS = 10_000
 _UPGD_LOOP_BUDGET = ScanBudget("UPGD learning-loop", _UPGD_LOOP_MAX_STEPS)
 _ACTUAL_INT_TYPES: frozenset[type] = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
+    {int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")}
 )
 _ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
     {
@@ -1960,19 +1953,51 @@ class UPGDLearner:
         error: Array,
         kappa: Array,
     ) -> tuple[tuple[Array, ...], Array]:
-        """Apply ObGD global step bounding with a dynamic kappa."""
+        """Apply ObGD global step bounding to steps that already carry the error.
+
+        Published ObGD (Elsayed et al. 2024) bounds with
+        ``M = alpha * kappa * max(|delta|, 1) * ||z||_1`` where ``z`` is the
+        error-free prediction gradient. UPGD forms its steps as
+        ``alpha * delta * z`` before bounding, so ``sum|steps|`` is
+        ``alpha * |delta| * ||z||_1`` and the published bound in terms of
+        those steps is ``kappa * sum|steps| / min(|delta|, 1)``. Feeding
+        ``|delta|`` back in as a second factor would count the error twice.
+        The scale is written as ``m / max(kappa * total, m)`` with
+        ``m = min(|delta|, 1)`` so it cannot overflow for tiny errors; a zero
+        error carries zero steps, where the bound is moot.
+        """
         error_scalar = jnp.squeeze(error)
         total_step = jnp.array(0.0, dtype=jnp.float32)
         for step in steps:
             total_step = total_step + jnp.sum(jnp.abs(step))
-        delta_bar = jnp.maximum(jnp.abs(error_scalar), 1.0)
-        bound_magnitude = kappa * delta_bar * total_step
-        scale = 1.0 / jnp.maximum(bound_magnitude, 1.0)
+        abs_error = jnp.abs(error_scalar)
+        error_unit = jnp.where(abs_error > 0.0, jnp.minimum(abs_error, 1.0), 1.0)
+        scale = error_unit / jnp.maximum(kappa * total_step, error_unit)
         collapsed = scale == 0
         return (
             tuple(zero_if_collapsed_infinity(scale * step, step, collapsed) for step in steps),
             scale,
         )
+
+    def _bound_error_carrying_steps(
+        self,
+        steps: tuple[Array, ...],
+        error: Array,
+        params: tuple[Array, ...],
+    ) -> tuple[tuple[Array, ...], Array]:
+        """Bound steps that already contain the prediction error.
+
+        ``ObGDBounding`` and its subclasses take the exact published form
+        through :meth:`_obgd_bound_with_kappa`. Any other bounder receives the
+        pseudo-error ``1.0``, the same convention ``MultiHeadMLPLearner`` uses
+        for its error-in-gradient trunk steps, so the error is never applied
+        a second time.
+        """
+        assert self._bounder is not None
+        if isinstance(self._bounder, ObGDBounding):
+            kappa = jnp.asarray(self._bounder.to_config()["kappa"], dtype=jnp.float32)
+            return self._obgd_bound_with_kappa(steps, error, kappa)
+        return self._bounder.bound(steps, jnp.array(1.0, dtype=jnp.float32), params)
 
     @staticmethod
     def _tuple_dot(xs: tuple[Array, ...], ys: tuple[Array, ...]) -> Array:
@@ -1983,24 +2008,65 @@ class UPGDLearner:
         return total
 
     @staticmethod
+    def _unit_tuple(xs: tuple[Array, ...]) -> tuple[tuple[Array, ...], Array]:
+        """Normalize a static tuple of arrays to unit L2 norm via power-of-two rescaling."""
+        if not xs:
+            return (), jnp.array(False)
+        peak = functools.reduce(
+            jnp.maximum,
+            (jnp.max(jnp.abs(x)) if x.size > 0 else jnp.array(0.0, dtype=jnp.float32) for x in xs),
+            jnp.array(0.0, dtype=jnp.float32),
+        )
+        is_valid_peak = jnp.isfinite(peak) & (peak > 0.0)
+        _, exponent = jnp.frexp(peak)
+        safe_exp = jnp.where(is_valid_peak, exponent, jnp.int32(0))
+        xs_scaled = tuple(jnp.ldexp(x, -safe_exp) for x in xs)
+        scaled_sum_sq = functools.reduce(
+            operator.add,
+            (jnp.sum(jnp.square(xr)) for xr in xs_scaled),
+            jnp.array(0.0, dtype=jnp.float32),
+        )
+        scaled_norm = jnp.sqrt(scaled_sum_sq)
+        is_valid = is_valid_peak & jnp.isfinite(scaled_norm) & (scaled_norm > 0.0)
+        safe_norm = jnp.where(is_valid, scaled_norm, jnp.float32(1.0))
+        unit_xs = tuple(jnp.where(is_valid, xr / safe_norm, jnp.zeros_like(xr)) for xr in xs_scaled)
+        return unit_xs, is_valid
+
+    @staticmethod
     def _tuple_norm(xs: tuple[Array, ...]) -> Array:
-        """L2 norm over a static tuple of arrays."""
-        total = jnp.array(0.0, dtype=jnp.float32)
-        for x in xs:
-            total = total + jnp.sum(jnp.square(x))
-        return jnp.sqrt(total + 1e-12)
+        """L2 norm over a static tuple of arrays with power-of-two rescaling."""
+        if not xs:
+            return jnp.array(0.0, dtype=jnp.float32)
+        peak = functools.reduce(
+            jnp.maximum,
+            (jnp.max(jnp.abs(x)) if x.size > 0 else jnp.array(0.0, dtype=jnp.float32) for x in xs),
+            jnp.array(0.0, dtype=jnp.float32),
+        )
+        is_valid_peak = jnp.isfinite(peak) & (peak > 0.0)
+        _, exponent = jnp.frexp(peak)
+        safe_exp = jnp.where(is_valid_peak, exponent, jnp.int32(0))
+        scaled_sum_sq = functools.reduce(
+            operator.add,
+            (jnp.sum(jnp.square(jnp.ldexp(x, -safe_exp))) for x in xs),
+            jnp.array(0.0, dtype=jnp.float32),
+        )
+        scaled_norm = jnp.sqrt(scaled_sum_sq)
+        is_valid = is_valid_peak & jnp.isfinite(scaled_norm) & (scaled_norm > 0.0)
+        raw_norm = jnp.ldexp(scaled_norm, safe_exp)
+        return jnp.where(is_valid, raw_norm, jnp.array(0.0, dtype=jnp.float32))
 
     @staticmethod
     def _gradient_alignment(
         previous: tuple[Array, ...],
         current: tuple[Array, ...],
     ) -> Array:
-        """Cosine alignment of two gradient tuples, zero for empty gradients."""
-        previous_norm = UPGDLearner._tuple_norm(previous)
-        current_norm = UPGDLearner._tuple_norm(current)
+        """Cosine alignment of two gradient tuples, zero for empty or non-finite gradients."""
+        unit_prev, valid_prev = UPGDLearner._unit_tuple(previous)
+        unit_curr, valid_curr = UPGDLearner._unit_tuple(current)
+        dot = UPGDLearner._tuple_dot(unit_prev, unit_curr)
         return jnp.where(
-            (previous_norm > 1e-6) & (current_norm > 1e-6),
-            UPGDLearner._tuple_dot(previous, current) / (previous_norm * current_norm + 1e-12),
+            valid_prev & valid_curr,
+            jnp.clip(dot, -1.0, 1.0),
             jnp.array(0.0, dtype=jnp.float32),
         )
 
@@ -2066,6 +2132,11 @@ class UPGDLearner:
         The loss is ``0.5 * sum_active((pred_i - target_i)^2)`` by default;
         inactive (NaN target) heads contribute zero. Gradients are computed
         for all trunk and head parameters at once via :func:`jax.grad`.
+
+        A step with a non-finite observation, an infinite target, or a
+        non-finite candidate state is rejected atomically: the prior state
+        is returned unchanged and diagnostics are neutralized to zero, so
+        one bad step cannot permanently poison the learner.
 
         Args:
             state: Current UPGD state
@@ -2275,6 +2346,12 @@ class UPGDLearner:
             loss = 0.5 * jnp.sum(sq_masked) / denom
             return loss, (logits_for_loss, hidden_for_loss, loss)
 
+        def trunk_fn(
+            weights: tuple[Array, ...],
+            biases: tuple[Array, ...],
+        ) -> Array:
+            return self._trunk_forward(weights, biases, observation, slope, ln)
+
         if not use_direct_mse_loss:
             (_, (logits, hidden_for_readout, loss_value)), grads = jax.value_and_grad(
                 loss_and_aux_fn,
@@ -2288,13 +2365,6 @@ class UPGDLearner:
             )
             trunk_w_grads, trunk_b_grads, head_w_grads, head_b_grads = grads
         else:
-
-            def trunk_fn(
-                weights: tuple[Array, ...],
-                biases: tuple[Array, ...],
-            ) -> Array:
-                return self._trunk_forward(weights, biases, observation, slope, ln)
-
             raw_hidden, trunk_vjp_fn = jax.vjp(
                 trunk_fn,
                 state.trunk_params.weights,
@@ -2375,6 +2445,12 @@ class UPGDLearner:
             )
             fast_head_b_grads = tuple(fast_logit_grads[i : i + 1] for i in range(self._n_heads))
             if self._readout_fast_trunk_gradient_multiplier > 0.0:
+                if not use_direct_mse_loss:
+                    raw_hidden, trunk_vjp_fn = jax.vjp(
+                        trunk_fn,
+                        state.trunk_params.weights,
+                        state.trunk_params.biases,
+                    )
                 fast_head_cotangent = (
                     fast_head_matrix[:, : raw_hidden.shape[0]].T @ fast_logit_grads
                     if self._readout_input_mode == "hidden_plus_input" and n_trunk > 0
@@ -2402,7 +2478,11 @@ class UPGDLearner:
         )
 
         sq_for_metric = (predictions - safe_targets) ** 2
-        step_mse = jnp.sum(jnp.where(active_mask, sq_for_metric, 0.0)) / n_active
+        active_squared = jnp.where(active_mask, sq_for_metric, 0.0)
+        step_mse = jnp.sum(active_squared) / n_active
+        # Recover reduction overflow only when each active squared error is finite.
+        recover = jnp.isinf(step_mse) & jnp.all(jnp.isfinite(active_squared))
+        step_mse = jnp.where(recover, jnp.sum(active_squared / n_active), step_mse)
         fast_decay = jnp.asarray(self._loss_fast_decay, dtype=jnp.float32)
         slow_decay = jnp.asarray(self._loss_slow_decay, dtype=jnp.float32)
         new_loss_fast_ema = (
@@ -2591,9 +2671,9 @@ class UPGDLearner:
                     all_params.append(state.readout_fast_head_params.weights[i])
                     all_params.append(state.readout_fast_head_params.biases[i])
 
-            # Use a representative error scalar: mean absolute error across
-            # active heads (matches conventions used elsewhere when bounding
-            # outside the per-head error multiplication).
+            # Representative error scalar: mean absolute error across active
+            # heads. The steps below already carry the error, so the bound
+            # must consume it exactly once (see _bound_error_carrying_steps).
             errors_for_bound = jnp.where(active_mask, predictions - safe_targets, 0.0)
             mean_abs_err = jnp.sum(jnp.abs(errors_for_bound)) / n_active
 
@@ -2633,7 +2713,7 @@ class UPGDLearner:
                     effective_kappa,
                 )
             else:
-                bounded_steps, _scale = self._bounder.bound(
+                bounded_steps, _scale = self._bound_error_carrying_steps(
                     tuple(all_steps), mean_abs_err, tuple(all_params)
                 )
             # Unpack
@@ -2693,7 +2773,7 @@ class UPGDLearner:
                         effective_kappa,
                     )
                 else:
-                    bounded_fast_steps, _fast_scale = self._bounder.bound(
+                    bounded_fast_steps, _fast_scale = self._bound_error_carrying_steps(
                         tuple(fast_steps),
                         mean_abs_err,
                         tuple(fast_params),
@@ -2737,9 +2817,14 @@ class UPGDLearner:
                 -jnp.inf,
             )
             wrong_idx = jnp.argmax(wrong_logits).astype(jnp.int32)
+            # With no active competitor every wrong logit is -inf and argmax
+            # falls back to head 0, which may be inactive (NaN target) or the
+            # true head itself; the margin step must then be skipped so masked
+            # heads stay untouched and a lone active head is not self-pushed.
+            has_wrong = jnp.any(jnp.logical_and(active_mask, head_indices != true_idx))
             margin = logits[true_idx] - logits[wrong_idx]
             do_margin = jnp.logical_and(
-                target_mass > 0.0,
+                jnp.logical_and(target_mass > 0.0, has_wrong),
                 margin < jnp.asarray(self._readout_margin, dtype=jnp.float32),
             )
             margin_scale = jnp.asarray(self._readout_margin_step_size, dtype=jnp.float32) / (
@@ -2901,7 +2986,9 @@ class UPGDLearner:
                     _skip_zero_scale(unit_gradient_decay, state.unit_gradient_emas[i])
                     + (1.0 - unit_gradient_decay) * unit_gradient_signal
                 )
-                new_unit_ages.append(state.unit_ages[i] + 1)
+                new_unit_ages.append(
+                    _saturating_int32_counter_increment(state.unit_ages[i])
+                )
             elif len(state.unit_utilities) > 0:
                 new_unit_utilities.append(state.unit_utilities[i])
                 new_unit_long_utilities.append(state.unit_long_utilities[i])
@@ -3376,11 +3463,21 @@ class UPGDLearner:
 
         metrics = jnp.stack([loss_value, mean_utility, min_utility, max_perturbation_magnitude])
 
+        # Fail closed: a non-finite observation, an infinite target, or a
+        # non-finite candidate state must not commit. NaN targets remain
+        # inactive-head markers, so they are allowed here; an infinite
+        # target is not. A rejected step returns the prior state exactly
+        # (key and step counter included) with neutral zero diagnostics,
+        # so a later finite step can still learn.
+        inputs_valid = jnp.all(jnp.isfinite(jnp.asarray(observation))) & jnp.all(
+            jnp.isfinite(targets) | jnp.isnan(targets)
+        )
+        update_applied = inputs_valid & floating_tree_is_finite(new_state)
         return UPGDUpdateResult(  # type: ignore[call-arg]
-            state=new_state,
-            predictions=predictions,
-            errors=errors,
-            metrics=metrics,
+            state=select_transaction(update_applied, new_state, state),
+            predictions=neutralize_array(update_applied, predictions),
+            errors=neutralize_array(update_applied, errors),
+            metrics=neutralize_array(update_applied, metrics),
         )
 
 
@@ -3478,9 +3575,16 @@ def run_upgd_arrays(
         return result.state, result.metrics
 
     t0 = time.time()
-    final_state, metrics = jax.lax.scan(step_fn, state, (checked_obs, checked_targets))
+    scan_result = jax.lax.scan(step_fn, state, (checked_obs, checked_targets))
+    jax.block_until_ready(scan_result)  # type: ignore[no-untyped-call]
+    final_state, metrics = scan_result
     elapsed = time.time() - t0
-    final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]  # noqa: E501
+    # Keep host-only clocks out of the device scan's scalar narrowing: restore
+    # the incoming values, advancing uptime from the true host base.
+    final_state = final_state.replace(  # type: ignore[attr-defined]
+        birth_timestamp=state.birth_timestamp,
+        uptime_s=state.uptime_s + elapsed,
+    )
     return UPGDLearningResult(state=final_state, metrics=metrics)  # type: ignore[call-arg]
 
 
@@ -3536,11 +3640,18 @@ def run_upgd_loop[StreamStateT](
         return (result.state, new_s_state), result.metrics
 
     t0 = time.time()
-    (final_learner, _), metrics = jax.lax.scan(
+    scan_result = jax.lax.scan(
         step_fn, (learner_state, stream_state), jnp.arange(num_steps)
     )
+    jax.block_until_ready(scan_result)  # type: ignore[no-untyped-call]
+    (final_learner, _), metrics = scan_result
     elapsed = time.time() - t0
-    final_learner = final_learner.replace(uptime_s=final_learner.uptime_s + elapsed)  # type: ignore[attr-defined]  # noqa: E501
+    # Keep host-only clocks out of the device scan's scalar narrowing: restore
+    # the incoming values, advancing uptime from the true host base.
+    final_learner = final_learner.replace(  # type: ignore[attr-defined]
+        birth_timestamp=learner_state.birth_timestamp,
+        uptime_s=learner_state.uptime_s + elapsed,
+    )
     return UPGDLearningResult(  # type: ignore[call-arg]
         state=final_learner, metrics=metrics
     )

@@ -27,6 +27,8 @@ from alberta_framework import (
     run_mlp_learning_loop,
     run_mlp_learning_loop_batched,
 )
+from alberta_framework.core.baseline_optimizers import Adam as BaselineAdam
+from alberta_framework.core.baseline_optimizers import RMSprop as BaselineRMSprop
 
 
 class TestMLPLearner:
@@ -249,6 +251,66 @@ class TestMLPLearner:
 class TestRunMLPLearningLoop:
     """Tests for the run_mlp_learning_loop function."""
 
+    @pytest.mark.parametrize("tracking", [False, True])
+    def test_finishes_device_work_before_stopping_uptime_clock(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tracking: bool,
+    ) -> None:
+        """Reported uptime must cover the asynchronous scan, not just dispatch."""
+        from types import SimpleNamespace
+
+        import alberta_framework.core.learners as module
+
+        stream = RandomWalkStream(feature_dim=5)
+        learner = MLPLearner(
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            normalizer=EMANormalizer() if tracking else None,
+        )
+        blocked: list[object] = []
+        real_scan = jax.lax.scan
+        real_time = time.time
+        scan_finished = False
+
+        def recording_scan(*args: object, **kwargs: object) -> object:
+            nonlocal scan_finished
+            result = real_scan(*args, **kwargs)
+            scan_finished = True
+            return result
+
+        def recording_block(value: object) -> object:
+            blocked.append(value)
+            return value
+
+        def clock() -> float:
+            if scan_finished:
+                assert blocked
+            return real_time()
+
+        monkeypatch.setattr(jax.lax, "scan", recording_scan)
+        monkeypatch.setattr(jax, "block_until_ready", recording_block)
+        monkeypatch.setattr(module, "time", SimpleNamespace(time=clock))
+
+        result = run_mlp_learning_loop(
+            learner,
+            stream,
+            num_steps=8,
+            key=jr.key(271),
+            normalizer_tracking=(
+                NormalizerTrackingConfig(interval=4) if tracking else None
+            ),
+        )
+        state, metrics = result[:2]
+
+        assert len(blocked) == 1
+        assert isinstance(blocked[0], tuple)
+        blocked_state, blocked_metrics = blocked[0]
+        assert int(blocked_state.step_count) == 8
+        assert blocked_metrics is metrics
+        assert int(state.step_count) == 8
+        chex.assert_shape(metrics, (8, 4 if tracking else 3))
+
     def test_scan_loop_produces_correct_shapes(self):
         """Scan loop should return metrics with shape (num_steps, 3)."""
         stream = RandomWalkStream(feature_dim=5, drift_rate=0.001)
@@ -302,6 +364,66 @@ class TestRunMLPLearningLoop:
 
 class TestBatchedMLPLearningLoop:
     """Tests for the run_mlp_learning_loop_batched function."""
+
+    @pytest.mark.parametrize("tracking", [False, True])
+    def test_finishes_device_work_before_stopping_uptime_clock(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tracking: bool,
+    ) -> None:
+        """Batched uptime must include completion of the transformed scan."""
+        from types import SimpleNamespace
+
+        import alberta_framework.core.learners as module
+
+        stream = RandomWalkStream(feature_dim=5)
+        learner = MLPLearner(
+            hidden_sizes=(4,),
+            sparsity=0.0,
+            normalizer=EMANormalizer() if tracking else None,
+        )
+        real_vmap = jax.vmap
+        real_time = time.time
+        vmap_finished = False
+        blocked_after_vmap: list[bool] = []
+
+        def recording_vmap(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+            transformed = real_vmap(*args, **kwargs)
+
+            def run(*run_args: object, **run_kwargs: object) -> object:
+                nonlocal vmap_finished
+                result = transformed(*run_args, **run_kwargs)
+                vmap_finished = True
+                return result
+
+            return run
+
+        def recording_block(value: object) -> object:
+            blocked_after_vmap.append(vmap_finished)
+            return value
+
+        def clock() -> float:
+            if vmap_finished:
+                assert any(blocked_after_vmap)
+            return real_time()
+
+        monkeypatch.setattr(jax, "vmap", recording_vmap)
+        monkeypatch.setattr(jax, "block_until_ready", recording_block)
+        monkeypatch.setattr(module, "time", SimpleNamespace(time=clock))
+
+        result = run_mlp_learning_loop_batched(
+            learner,
+            stream,
+            num_steps=8,
+            keys=jr.split(jr.key(272), 2),
+            normalizer_tracking=(
+                NormalizerTrackingConfig(interval=4) if tracking else None
+            ),
+        )
+
+        assert any(blocked_after_vmap)
+        assert result.states.step_count.shape == (2,)
+        chex.assert_shape(result.metrics, (2, 8, 4 if tracking else 3))
 
     def test_batched_returns_correct_shapes(self):
         """Batched loop should return metrics with shape (num_seeds, num_steps, 3)."""
@@ -482,6 +604,24 @@ class TestNormalizedMLPLearner:
         result = learner.update(state, observation, target)
         chex.assert_shape(result.metrics, (4,))
         chex.assert_tree_all_finite(result.metrics)
+
+
+class TestNormalizedMLPPredict:
+    """``predict`` must apply the configured normalizer exactly as ``update`` does."""
+
+    def test_predict_reproduces_the_update_prediction(self) -> None:
+        learner = MLPLearner(
+            hidden_sizes=(8,), sparsity=0.0, step_size=0.01, normalizer=EMANormalizer(decay=0.99)
+        )
+        xs = 100.0 + jr.normal(jr.key(0), (200, 2), dtype=jnp.float32)
+        ys = 0.5 * (xs[:, 0] - 100.0)
+        state = learner.init(2, jr.key(1))
+        for x, y in zip(xs, ys, strict=True):
+            state = learner.update(state, x, jnp.atleast_1d(y)).state
+        x, y = xs[-1], ys[-1]
+        result = learner.update(state, x, jnp.atleast_1d(y))
+        frozen = state.replace(normalizer_state=result.state.normalizer_state)
+        chex.assert_trees_all_close(learner.predict(frozen, x), result.prediction, atol=1e-6)
 
 
 class TestRunMLPNormalizedLearningLoop:
@@ -701,6 +841,60 @@ class TestAGCBounding:
 
         # Some units should be clipped
         assert float(frac) > 0.0
+
+    def test_large_finite_unit_norm_clips_to_finite_budget(self):
+        params = (jnp.ones((1, 8), dtype=jnp.float32),)
+        steps = (jnp.full((1, 8), 7e18, dtype=jnp.float32),)
+
+        (clipped,), fraction = AGCBounding(clip_factor=1.0).bound(
+            steps,
+            jnp.asarray(1.0, dtype=jnp.float32),
+            params,
+        )
+
+        assert bool(jnp.all(jnp.isfinite(clipped)))
+        np.testing.assert_allclose(clipped, params[0], rtol=1e-6)
+        assert float(fraction) == 1.0
+
+    @pytest.mark.parametrize("value", [1e38, 3e38])
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_extreme_finite_steps_clip_to_finite_budget(
+        self, value: float, compiled: bool
+    ) -> None:
+        params = (jnp.ones((1, 8), dtype=jnp.float32),)
+        steps = (jnp.full((1, 8), value, dtype=jnp.float32),)
+        bound = AGCBounding(clip_factor=1.0).bound
+        if compiled:
+            bound = jax.jit(bound)
+
+        (clipped,), fraction = bound(
+            steps,
+            jnp.asarray(1.0, dtype=jnp.float32),
+            params,
+        )
+
+        np.testing.assert_allclose(clipped, params[0], rtol=1e-6)
+        assert float(fraction) == 1.0
+
+    @pytest.mark.parametrize("value", [1e38, 3e38])
+    @pytest.mark.parametrize("compiled", [False, True])
+    def test_extreme_finite_params_do_not_spuriously_clip(
+        self, value: float, compiled: bool
+    ) -> None:
+        params = (jnp.full((1, 8), value, dtype=jnp.float32),)
+        steps = (jnp.ones((1, 8), dtype=jnp.float32),)
+        bound = AGCBounding(clip_factor=1.0).bound
+        if compiled:
+            bound = jax.jit(bound)
+
+        (clipped,), fraction = bound(
+            steps,
+            jnp.asarray(1.0, dtype=jnp.float32),
+            params,
+        )
+
+        chex.assert_trees_all_equal(clipped, steps[0])
+        assert float(fraction) == 0.0
 
     def test_metric_fraction_clipped(self):
         """Metric should report correct fraction of clipped units."""
@@ -1245,6 +1439,59 @@ class TestNeuronUtility:
         # utility should be strictly positive for non-zero gradient
         assert float(jnp.sum(new_state.neuron_utility[0])) > 0.0
 
+    def test_utility_keeps_representable_norm_when_square_sum_overflows(self) -> None:
+        """A finite row norm must not veto an otherwise valid update."""
+        learner = MLPLearner(
+            hidden_sizes=(1,),
+            step_size=0.1,
+            sparsity=0.0,
+            use_layer_norm=False,
+            track_neuron_utility=True,
+            neuron_utility_decay=0.0,
+        )
+        state = learner.init(feature_dim=8, key=jr.key(8))
+        state = state.replace(
+            params=state.params.replace(
+                weights=(
+                    jnp.zeros((1, 8), dtype=jnp.float32),
+                    jnp.ones((1, 1), dtype=jnp.float32),
+                ),
+                biases=(
+                    jnp.zeros((1,), dtype=jnp.float32),
+                    jnp.zeros((1,), dtype=jnp.float32),
+                ),
+            )
+        )
+        observation = jnp.full((8,), 7e18, dtype=jnp.float32)
+        expected_norm = float(np.float64(np.float32(7e18)) * np.sqrt(8.0))
+
+        raw_gradient = jax.grad(
+            lambda weights: learner._forward(
+                (weights, state.params.weights[1]),
+                state.params.biases,
+                observation,
+                learner._leaky_relu_slope,
+                learner._use_layer_norm,
+            )
+        )(state.params.weights[0])
+        assert bool(jnp.all(jnp.isfinite(raw_gradient)))
+        assert bool(jnp.isinf(jnp.linalg.norm(raw_gradient, axis=1)[0]))
+
+        result = learner.update(
+            state,
+            observation,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        assert int(result.state.step_count) == 1
+        assert result.state.neuron_utility is not None
+        np.testing.assert_allclose(
+            np.asarray(result.state.neuron_utility[0]),
+            np.asarray([expected_norm], dtype=np.float32),
+            rtol=1e-6,
+        )
+
     def test_dormant_fraction_zero_after_init(self):
         learner = MLPLearner(hidden_sizes=(16,), sparsity=0.0, track_neuron_utility=True)
         state = learner.init(feature_dim=8, key=jr.key(5))
@@ -1394,6 +1641,80 @@ class TestResetDormantOptimizerState:
         mse_first = sum(sq_errors[:100]) / 100.0
         mse_last = sum(sq_errors[-100:]) / 100.0
         assert mse_last < mse_first
+
+
+class TestResetDormantOutgoingColumns:
+    """Dormant reset must also clear the zeroed outgoing column.
+
+    ``reset_dormant_neurons`` zeroes the outgoing weights of a dormant
+    neuron. The outgoing eligibility-trace column and the outgoing
+    optimizer-state slice must reset with them, mirroring
+    ``continual_backprop._replace_one_unit``. Otherwise the fresh zero
+    weights move along pre-reset trace directions with pre-reset
+    step-sizes, so the fresh unit inherits the dead unit's history.
+    """
+
+    FEATURE_DIM = 3
+    N_HIDDEN = 4
+
+    def _trained_state(self, optimizer, head_optimizer=None):
+        learner = MLPLearner(
+            hidden_sizes=(self.N_HIDDEN,),
+            optimizer=optimizer,
+            head_optimizer=head_optimizer,
+            sparsity=0.0,
+            gamma=0.9,
+            lamda=0.8,
+            track_neuron_utility=True,
+        )
+        state = learner.init(feature_dim=self.FEATURE_DIM, key=jr.key(0))
+        obs = jnp.array([1.0, 0.5, -0.5], dtype=jnp.float32)
+        for _ in range(5):
+            state = learner.update(
+                state, obs, jnp.array(1.0, dtype=jnp.float32)
+            ).state
+        forced = jnp.array([0.0, 5.0, 5.0, 5.0], dtype=jnp.float32)
+        state = state.replace(neuron_utility=(forced,))
+        return learner, state
+
+    def test_outgoing_trace_column_zeroed(self):
+        learner, state = self._trained_state(LMS(step_size=0.1))
+        assert jnp.any(state.traces[2][:, 0] != 0.0)
+        reset = learner.reset_dormant_neurons(state, jr.key(10), threshold=0.01)
+        assert jnp.all(reset.traces[2][:, 0] == 0.0)
+        assert jnp.allclose(reset.traces[2][:, 1:], state.traces[2][:, 1:])
+
+    def test_outgoing_optimizer_column_reinitialized(self):
+        optimizer = IDBD(initial_step_size=0.05, meta_step_size=0.01)
+        learner, state = self._trained_state(optimizer)
+        reset = learner.reset_dormant_neurons(state, jr.key(10), threshold=0.01)
+        fresh = optimizer.init_for_shape((1, self.N_HIDDEN))
+        old_leaves = jax.tree_util.tree_leaves(state.optimizer_states[2])
+        new_leaves = jax.tree_util.tree_leaves(reset.optimizer_states[2])
+        fresh_leaves = jax.tree_util.tree_leaves(fresh)
+        for old, new, ref in zip(old_leaves, new_leaves, fresh_leaves):
+            if new.ndim == 2:
+                assert jnp.allclose(new[:, 0], ref[:, 0])
+                assert jnp.allclose(new[:, 1:], old[:, 1:])
+            else:
+                assert jnp.allclose(new, old)
+
+    def test_outgoing_optimizer_column_uses_head_optimizer(self):
+        head_optimizer = IDBD(initial_step_size=0.05, meta_step_size=0.01)
+        learner, state = self._trained_state(
+            LMS(step_size=0.1), head_optimizer=head_optimizer
+        )
+        reset = learner.reset_dormant_neurons(state, jr.key(10), threshold=0.01)
+        fresh = head_optimizer.init_for_shape((1, self.N_HIDDEN))
+        old_leaves = jax.tree_util.tree_leaves(state.optimizer_states[2])
+        new_leaves = jax.tree_util.tree_leaves(reset.optimizer_states[2])
+        fresh_leaves = jax.tree_util.tree_leaves(fresh)
+        for old, new, ref in zip(old_leaves, new_leaves, fresh_leaves):
+            if new.ndim == 2:
+                assert jnp.allclose(new[:, 0], ref[:, 0])
+                assert jnp.allclose(new[:, 1:], old[:, 1:])
+            else:
+                assert jnp.allclose(new, old)
 
 
 class TestMLPLearnerConstructorScalars:
@@ -1579,3 +1900,54 @@ def test_mlp_dimensions_are_exact_canonical_and_preflighted() -> None:
         learner.init(True, jr.key(0))
     with pytest.raises(ValueError, match="resource"):
         MLPLearner(hidden_sizes=(2**26,)).init(2, jr.key(0))
+
+
+class TestBaselineOptimizerLearning:
+    """Pluggable Adam/RMSprop must descend through the MLP path.
+
+    Regression test for the inverted error contract where
+    ``update_from_gradient_checked`` folded ``-error`` into the returned step
+    while ``MLPLearner`` applied ``param += error * step``, yielding gradient
+    ascent proportional to ``-error**2``.
+    """
+
+    @pytest.mark.parametrize("make_optimizer", [BaselineAdam, BaselineRMSprop])
+    def test_mlp_learns_stationary_linear_target(self, make_optimizer):
+        learner = MLPLearner(
+            hidden_sizes=(8,),
+            optimizer=make_optimizer(step_size=0.01),
+            use_layer_norm=False,
+            sparsity=0.0,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(0))
+        key = jr.key(1)
+        squared_errors = []
+        for _ in range(300):
+            key, sample_key = jr.split(key)
+            observation = jr.uniform(sample_key, (2,), minval=-1.0, maxval=1.0)
+            target = jnp.atleast_1d(3.0 * observation[0] - 2.0 * observation[1])
+            result = learner.update(state, observation, target)
+            assert bool(result.update_applied)
+            state = result.state
+            squared_errors.append(float(result.metrics[0]))
+        first = sum(squared_errors[:50]) / 50.0
+        last = sum(squared_errors[-50:]) / 50.0
+        assert math.isfinite(last)
+        assert last < first
+
+    def test_adam_weight_decay_runs_through_mlp_parameter_path(self):
+        learner = MLPLearner(
+            hidden_sizes=(4,),
+            optimizer=BaselineAdam(step_size=0.01, weight_decay=0.1),
+            use_layer_norm=False,
+            sparsity=0.0,
+        )
+        state = learner.init(feature_dim=2, key=jr.key(0))
+        result = learner.update(
+            state,
+            jnp.asarray([0.25, -0.5], dtype=jnp.float32),
+            jnp.asarray([1.0], dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.state.params)

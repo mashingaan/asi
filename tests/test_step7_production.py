@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import json
 from fractions import Fraction
+from types import SimpleNamespace
 from typing import Any
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 import pytest
 
+from alberta_framework.steps import step7 as step7_module
 from alberta_framework.steps.step6 import Step6DifferentialSARSAConfig
 from alberta_framework.steps.step7 import (
     Step7DynaArrayResult,
@@ -25,7 +28,10 @@ from alberta_framework.steps.step7 import (
     Step7DynaState,
     Step7DynaUpdateResult,
     Step7SmokeResult,
+    _divide_by_one_plus_mean_square,
+    _propagate_predecessor_priorities,
     _score_planning_actions,
+    _select_planning_anchor,
     init_step7_state,
     make_step7_components,
     run_step7_scan,
@@ -632,6 +638,145 @@ class TestScorePlanningActions:
         )
         assert float(score) == pytest.approx(float(expected), rel=1e-6)
 
+    def test_surprise_strategy_keeps_finite_large_transition_score(self) -> None:
+        cfg = Step7DynaConfig(
+            control=Step6DifferentialSARSAConfig(n_actions=N_ACTIONS),
+            world_model=Step8WorldModelConfig(
+                observation_dim=OBS_DIM,
+                n_actions=N_ACTIONS,
+                hidden_sizes=(),
+                use_layer_norm=False,
+            ),
+        )
+        _, model = make_step7_components(cfg)
+        model_state = model.init(jr.key(12))
+        learner_state = model_state.learner_state
+        heads = learner_state.head_params
+        large = jnp.asarray(1e19, dtype=jnp.float32)
+        biases = (jnp.zeros_like(heads.biases[0]),) + tuple(
+            jnp.full_like(bias, large) for bias in heads.biases[1:]
+        )
+        model_state = model_state.replace(
+            learner_state=learner_state.replace(
+                head_params=heads.replace(
+                    weights=tuple(jnp.zeros_like(weight) for weight in heads.weights),
+                    biases=biases,
+                )
+            )
+        )
+        anchor = jnp.zeros((OBS_DIM,), dtype=jnp.float32)
+        residual = model.predict(
+            model_state, anchor, jnp.asarray(0, dtype=jnp.int32)
+        ).next_observation
+
+        assert bool(jnp.all(jnp.isfinite(residual * residual)))
+        assert bool(jnp.isinf(jnp.mean(residual * residual)))
+
+        _, score = _score_planning_actions(
+            model, model_state, anchor, "surprise", N_ACTIONS
+        )
+
+        assert bool(jnp.isfinite(score))
+        assert float(score) == pytest.approx(1e19, rel=1e-6)
+
+
+def test_predecessor_selection_distinguishes_large_finite_distances() -> None:
+    distance_dim = 8
+    farther = jnp.full((distance_dim,), 9e18, dtype=jnp.float32)
+    nearer = jnp.full((distance_dim,), 7e18, dtype=jnp.float32)
+    next_observations = jnp.stack((farther, nearer))
+    zeros = jnp.zeros((2,), dtype=jnp.float32)
+
+    _, index, score = _select_planning_anchor(
+        jnp.zeros((2, distance_dim), dtype=jnp.float32),
+        zeros,
+        next_observations,
+        zeros,
+        zeros,
+        jnp.asarray(2, dtype=jnp.int32),
+        jnp.zeros((distance_dim,), dtype=jnp.float32),
+        jr.key(13),
+        "predecessor",
+    )
+
+    assert int(index) == 1
+    assert float(score) > 0.0
+
+
+def test_predecessor_propagation_retains_large_finite_similarity() -> None:
+    distance_dim = 8
+    farther = jnp.full((distance_dim,), 9e18, dtype=jnp.float32)
+    nearer = jnp.full((distance_dim,), 7e18, dtype=jnp.float32)
+
+    priorities = _propagate_predecessor_priorities(
+        jnp.stack((farther, nearer)),
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.asarray(2, dtype=jnp.int32),
+        jnp.zeros((distance_dim,), dtype=jnp.float32),
+        jnp.asarray(1.0, dtype=jnp.float32),
+        1.0,
+    )
+
+    assert bool(jnp.all(jnp.isfinite(priorities)))
+    assert float(priorities[0]) > 0.0
+    assert float(priorities[1]) > float(priorities[0])
+
+
+def test_prioritized_update_keeps_float32_ceiling_priorities_finite() -> None:
+    cfg = Step7DynaConfig(
+        control=Step6DifferentialSARSAConfig(n_actions=N_ACTIONS),
+        world_model=Step8WorldModelConfig(
+            observation_dim=OBS_DIM,
+            n_actions=N_ACTIONS,
+        ),
+        planning_steps=1,
+        planning_rollout_depth=1,
+        planning_warmup_steps=0,
+        planning_memory_size=8,
+        planning_strategy="prioritized",
+        planning_priority_propagation=1.0,
+    )
+    agent, model = make_step7_components(cfg)
+    magnitude = jnp.asarray(1e38, dtype=jnp.float32)
+    observation = magnitude * jnp.asarray([1.0, -1.0, 1.0, -1.0])
+    state = init_step7_state(
+        agent,
+        model,
+        key=jr.key(14),
+        initial_observation=observation,
+        memory_size=cfg.planning_memory_size,
+    )
+
+    for _ in range(4):
+        observation = -observation
+        result = step7_update(
+            cfg,
+            agent,
+            model,
+            state,
+            jnp.asarray(0.0, dtype=jnp.float32),
+            observation,
+        )
+        chex.assert_tree_all_finite(result.state.memory_priorities)
+        chex.assert_tree_all_finite(result.planning_priorities)
+        state = result.state
+
+
+@pytest.mark.parametrize("magnitude", [1e38, 3e38])
+def test_predecessor_similarity_avoids_ceiling_reciprocal_flush(
+    magnitude: float,
+) -> None:
+    values = jnp.full((2, OBS_DIM), magnitude, dtype=jnp.float32)
+
+    eager = _divide_by_one_plus_mean_square(1.0, values, axis=1)
+    compiled = jax.jit(
+        lambda items: _divide_by_one_plus_mean_square(1.0, items, axis=1)
+    )(values)
+
+    chex.assert_tree_all_finite(eager)
+    chex.assert_tree_all_finite(compiled)
+    chex.assert_trees_all_equal(eager, compiled)
+
 
 def test_step7_dyna_rejects_float32_underflow_for_positive_fields() -> None:
     with pytest.raises(ValueError, match="planning_importance_ratio_clip"):
@@ -771,6 +916,118 @@ def test_step7_dyna_json_roundtrip() -> None:
     assert restored.planning_utility_step_size == config.planning_utility_step_size
 
 
+def test_step7_planning_accepted_tracks_the_core_learner_rollback() -> None:
+    """A planning backup the core learner rolled back must not be reported as accepted."""
+    from alberta_framework.steps.step6 import Step6DifferentialSARSAConfig
+    from alberta_framework.steps.step8 import Step8WorldModelConfig
+
+    # A deliberately divergent linear world model (LMS step 2.0) makes the core
+    # learner reject many imagined transitions on a natural run, without any
+    # state surgery.
+    cfg = Step7DynaConfig(
+        control=Step6DifferentialSARSAConfig(n_actions=2, q_step_size=0.05),
+        world_model=Step8WorldModelConfig(
+            observation_dim=3, n_actions=2, hidden_sizes=(), step_size=2.0, use_layer_norm=False
+        ),
+        planning_steps=1,
+        planning_rollout_depth=1,
+        planning_warmup_steps=0,
+        planning_memory_size=8,
+        planning_strategy="random",
+    )
+    agent, model = make_step7_components(cfg)
+    steps = 32
+    data_key, state_key = jr.split(jr.key(0))
+    observations = jr.normal(data_key, (steps + 1, 3), dtype=jnp.float32)
+    rewards = jnp.tanh(observations[1:, 0])
+    state = init_step7_state(
+        agent, model, key=state_key, initial_observation=observations[0], memory_size=8
+    )
+    reported: list[bool] = []
+    replayed: list[bool] = []
+    for t in range(steps):
+        result = step7_update(cfg, agent, model, state, rewards[t], observations[t + 1])
+        control = result.real_control_result.state
+        # Replay the single imagined transaction through the core agent.
+        key, action_key = jr.split(control.rng_key)
+        action = jr.randint(action_key, (), 0, 2).astype(jnp.int32)
+        key, anchor_key = jr.split(key)
+        anchor_index = int(jr.randint(anchor_key, (), 0, int(result.state.memory_count)))
+        anchor = result.state.memory_observations[anchor_index]
+        prediction = model.predict(result.real_model_result.state, anchor, action)
+        temp = control.replace(last_observation=anchor, last_action=action, rng_key=key)
+        next_action, next_key = agent.select_action(temp, prediction.next_observation)
+        core = agent.update(
+            temp.replace(rng_key=next_key),
+            prediction.reward,
+            prediction.next_observation,
+            next_action=next_action,
+        )
+        reported.append(bool(result.planning_accepted[0]))
+        replayed.append(bool(core.update_applied))
+        state = result.state
+    assert not all(replayed), "the divergent model must produce at least one rollback"
+    assert reported == replayed
+    smoke = run_step7_smoke(cfg, steps=steps, seed=0)
+    assert smoke.planning_acceptance_count == sum(replayed)
+
+
+def test_step7_planning_backup_starts_from_empty_eligibility() -> None:
+    """An imagined backup must leave the real-experience traces untouched.
+
+    With ``trace_decay > 0`` the backup used to run on the live traces: the
+    imagined TD error moved every state-action in the real trace, and the
+    imagined gradient stayed in the trace for the next real update.
+    """
+    cfg = Step7DynaConfig(
+        control=Step6DifferentialSARSAConfig(
+            n_actions=N_ACTIONS,
+            trace_decay=0.9,
+            epsilon_start=1.0,
+            epsilon_end=0.0,
+            epsilon_decay_steps=100,
+        ),
+        world_model=Step8WorldModelConfig(
+            observation_dim=3, n_actions=N_ACTIONS, hidden_sizes=(), use_layer_norm=False
+        ),
+        planning_steps=1,
+        planning_rollout_depth=1,
+        planning_warmup_steps=0,
+        planning_memory_size=8,
+        planning_strategy="random",
+        planning_apply_importance_correction=False,
+    )
+    agent, model = make_step7_components(cfg)
+    steps = 16
+    data_key, state_key = jr.split(jr.key(0))
+    observations = jr.normal(data_key, (steps + 1, 3), dtype=jnp.float32)
+    rewards = jnp.tanh(observations[1:, 0])
+    state = init_step7_state(
+        agent, model, key=state_key, initial_observation=observations[0], memory_size=8
+    )
+    for t in range(steps):
+        result = step7_update(cfg, agent, model, state, rewards[t], observations[t + 1])
+        assert bool(result.planning_accepted[0])
+        real = result.real_control_result.state
+        final = result.state.control_state
+        anchor = result.state.memory_observations[result.planning_anchor_indices[0]]
+        action_mask = jnp.eye(N_ACTIONS, dtype=jnp.float32)[result.planning_actions[0]]
+        step = cfg.control.q_step_size * result.planning_td_errors[0]
+        # A one-step backup at the anchor moves only the imagined action's values.
+        chex.assert_trees_all_close(
+            final.q_weights,
+            real.q_weights + step * action_mask[:, None] * anchor[None, :],
+            atol=1e-6,
+        )
+        chex.assert_trees_all_close(final.q_bias, real.q_bias + step * action_mask, atol=1e-6)
+        chex.assert_trees_all_equal(final.q_trace_weights, real.q_trace_weights)
+        chex.assert_trees_all_equal(final.q_trace_bias, real.q_trace_bias)
+        assert int(final.step_count) == int(real.step_count)
+        chex.assert_trees_all_equal(final.step_words, real.step_words)
+        chex.assert_trees_all_equal(final.epsilon, real.epsilon)
+        state = result.state
+
+
 def _legal_step7_smoke_result(**overrides: object) -> Step7SmokeResult:
     payload: dict[str, object] = {
         "config": Step7DynaConfig(),
@@ -823,3 +1080,79 @@ def test_step7_smoke_result_rejects_leftover_identities() -> None:
     assert '"seed": true' not in dumped
     assert '"finite": 1' not in dumped
     assert '"planning_acceptance_count": true' not in dumped
+
+
+def test_zero_importance_ratio_does_not_multiply_overflowing_planning_delta() -> None:
+    """Finite opposite endpoints can overflow their difference even when rho is zero."""
+    from alberta_framework.core.average_reward import (
+        DifferentialSARSAAgent,
+        DifferentialSARSAConfig,
+    )
+    from alberta_framework.steps.step7 import _apply_planning_importance_correction
+
+    agent = DifferentialSARSAAgent(DifferentialSARSAConfig(n_actions=2))
+    old = agent.init(3, jr.key(0))
+    maximum = jnp.finfo(jnp.float32).max
+    old = old.replace(q_weights=jnp.full_like(old.q_weights, -maximum))
+    planned = old.replace(  # type: ignore[attr-defined]
+        q_weights=jnp.full_like(old.q_weights, maximum),
+        q_bias=jnp.full_like(old.q_bias, maximum),
+        q_trace_weights=jnp.full_like(old.q_trace_weights, maximum),
+        q_trace_bias=jnp.full_like(old.q_trace_bias, maximum),
+        average_reward=jnp.asarray(maximum, dtype=jnp.float32),
+    )
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * (
+        jnp.asarray(maximum, dtype=jnp.float32) - jnp.asarray(-maximum, dtype=jnp.float32)
+    )
+    assert not bool(jnp.isfinite(raw))
+
+    corrected = _apply_planning_importance_correction(
+        old, planned, jnp.asarray(0.0, dtype=jnp.float32)
+    )
+    chex.assert_trees_all_close(corrected.q_weights, old.q_weights)
+    chex.assert_trees_all_close(corrected.q_bias, old.q_bias)
+    chex.assert_trees_all_close(corrected.q_trace_weights, old.q_trace_weights)
+    chex.assert_trees_all_close(corrected.q_trace_bias, old.q_trace_bias)
+    chex.assert_trees_all_close(corrected.average_reward, old.average_reward)
+    chex.assert_tree_all_finite(corrected.q_weights)
+    chex.assert_tree_all_finite(corrected.average_reward)
+
+
+
+@pytest.mark.parametrize("planning_steps", [0, 1])
+def test_dyna_model_scan_preserves_initialized_host_clocks(
+    planning_steps: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter([100.0, 100.25, 100.25, 100.5])
+    monkeypatch.setattr(
+        step7_module,
+        "time",
+        SimpleNamespace(time=lambda: next(clock)),
+    )
+    cfg = _cfg(planning_steps=planning_steps)
+    agent, model = make_step7_components(cfg)
+    initial = init_step7_state(
+        agent, model, key=jr.key(17), initial_observation=jnp.zeros(OBS_DIM),
+        memory_size=cfg.planning_memory_size,
+    )
+    initial = initial.replace(
+        world_model_state=initial.world_model_state.replace(
+            learner_state=initial.world_model_state.learner_state.replace(uptime_s=7.0),
+        ),
+    )
+    rewards = jnp.array([0.5, -0.25], dtype=jnp.float32)
+    observations = jnp.ones((2, OBS_DIM), dtype=jnp.float32)
+    batch = run_step7_scan(cfg, agent, model, initial, rewards, observations)
+    continued = run_step7_scan(cfg, agent, model, batch.state, rewards, observations)
+    expected = initial.world_model_state.learner_state
+    expected_uptime = (7.25, 7.5)
+    for returned, uptime in zip(
+        (batch.state, continued.state), expected_uptime, strict=True
+    ):
+        actual = returned.world_model_state.learner_state
+        assert type(actual.birth_timestamp) is float
+        assert actual.birth_timestamp == expected.birth_timestamp
+        assert type(actual.uptime_s) is float
+        assert actual.uptime_s == uptime
+    assert int(continued.state.step_count) == 4
+    assert int(continued.state.world_model_state.step_count) == 4

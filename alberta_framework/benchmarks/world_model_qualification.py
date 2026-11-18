@@ -110,13 +110,17 @@ class WorldModelSmokeResult:
             raise ValueError("smoke result must contain the four frozen arms")
         if any(type(arm) is not WorldModelSmokeArm for arm in self.arms):
             raise ValueError("arms must contain exact WorldModelSmokeArm values")
-        if tuple(arm.arm_id for arm in self.arms) != (
-            "observation_space",
-            "latent_action_interactions",
-            "latent_no_interactions",
-            "sparse_ftl",
+        for arm in self.arms:
+            WorldModelSmokeArm.__post_init__(arm)
+        if tuple((arm.arm_id, arm.metric_space) for arm in self.arms) != (
+            ("observation_space", "observation_mse"),
+            ("latent_action_interactions", "latent_prediction_mse"),
+            ("latent_no_interactions", "latent_prediction_mse"),
+            ("sparse_ftl", "observation_delta_mse"),
         ):
-            raise ValueError("smoke arms differ from the frozen roster")
+            raise ValueError("smoke arms and metric spaces differ from the frozen roster")
+        if any(arm.environment_steps != steps for arm in self.arms):
+            raise ValueError("every smoke arm must match the outer step count")
         if type(self.development_only) is not bool or self.development_only is not True:
             raise ValueError("smoke result must remain development-only")
         if (type(self.scientific_promotion_allowed) is not bool
@@ -203,8 +207,8 @@ def run_native_world_model_smoke(*, seed: object = 0, steps: object = 8) -> Worl
         latent_off_state = latent_off_result.state
         ftl_state = ftl_result.state
         losses[0].append(float(direct_result.observation_mse))
-        losses[1].append(float(latent_result.prediction_error))
-        losses[2].append(float(latent_off_result.prediction_error))
+        losses[1].append(float(latent_result.surprise))
+        losses[2].append(float(latent_off_result.surprise))
         losses[3].append(float(ftl_result.squared_error))
     final_states = (direct_state, latent_state, latent_off_state, ftl_state)
     # Some learner host-only timestamp leaves canonicalize from float64 to

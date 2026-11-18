@@ -28,10 +28,13 @@ try:
         _BEHAVIOR_MODEL_SEQUENCE_MAX_STEPS,
         BehaviorModel,
         BehaviorModelConfig,
+        BehaviorModelState,
         _behavior_model_update_working_set_bytes,
         _preflight_behavior_model_update_working_set,
         _require_behavior_model_sequence_length,
         _resource_counts,
+        _stable_temperature_log_softmax,
+        _stable_temperature_softmax,
         action_log_likelihoods,
         clipped_importance_ratios,
         epsilon_greedy_probabilities,
@@ -59,6 +62,7 @@ except ImportError:
     behavior_model_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(behavior_model_module)
     BehaviorModel = behavior_model_module.BehaviorModel
+    BehaviorModelState = behavior_model_module.BehaviorModelState
     BehaviorModelConfig = behavior_model_module.BehaviorModelConfig
     action_log_likelihoods = behavior_model_module.action_log_likelihoods
     clipped_importance_ratios = behavior_model_module.clipped_importance_ratios
@@ -76,6 +80,8 @@ except ImportError:
     _BEHAVIOR_MODEL_SEQUENCE_MAX_STEPS = (
         behavior_model_module._BEHAVIOR_MODEL_SEQUENCE_MAX_STEPS
     )
+    _stable_temperature_log_softmax = behavior_model_module._stable_temperature_log_softmax
+    _stable_temperature_softmax = behavior_model_module._stable_temperature_softmax
     _require_behavior_model_sequence_length = (
         behavior_model_module._require_behavior_model_sequence_length
     )
@@ -123,6 +129,95 @@ def test_init_predict_update_finite_and_shapes() -> None:
     assert float(result.loss) > 0.0
 
 
+@pytest.mark.parametrize("shape", ((1, 2), (2, 1)))
+@pytest.mark.parametrize(
+    "entrypoint",
+    (
+        "predict_logits",
+        "predict_probabilities",
+        "action_probability",
+        "action_log_likelihood",
+        "input_loss_gradient",
+        "update",
+        "sample_action",
+        "importance_ratio",
+    ),
+)
+def test_behavior_model_rejects_wrong_shaped_observations(
+    shape: tuple[int, int],
+    entrypoint: str,
+) -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=3, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    observation = jnp.ones(shape, dtype=jnp.float32)
+    action = jnp.array(1, dtype=jnp.int32)
+
+    with pytest.raises(ValueError, match=r"observation must have shape \(2,\)"):
+        if entrypoint in {"predict_logits", "predict_probabilities", "sample_action"}:
+            getattr(model, entrypoint)(state, observation)
+        elif entrypoint == "importance_ratio":
+            model.importance_ratio(
+                state,
+                observation,
+                action,
+                jnp.full((3,), 1.0 / 3.0, dtype=jnp.float32),
+            )
+        else:
+            getattr(model, entrypoint)(state, observation, action)
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    (
+        "predict_logits",
+        "predict_probabilities",
+        "action_probability",
+        "action_log_likelihood",
+        "input_loss_gradient",
+        "update",
+        "sample_action",
+        "importance_ratio",
+    ),
+)
+def test_behavior_model_rejects_complex_observations(entrypoint: str) -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=3, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    observation = jnp.array([1.0 + 5.0j, 0.0], dtype=jnp.complex64)
+    action = jnp.array(1, dtype=jnp.int32)
+
+    with pytest.raises(ValueError, match="observation must be real"):
+        if entrypoint in {"predict_logits", "predict_probabilities", "sample_action"}:
+            getattr(model, entrypoint)(state, observation)
+        elif entrypoint == "importance_ratio":
+            model.importance_ratio(
+                state,
+                observation,
+                action,
+                jnp.full((3,), 1.0 / 3.0, dtype=jnp.float32),
+            )
+        else:
+            getattr(model, entrypoint)(state, observation, action)
+
+
+def test_run_behavior_model_from_arrays_rejects_complex_observations() -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=3, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    observations = jnp.full((2, 2), 1.0 + 5.0j, dtype=jnp.complex64)
+    actions = jnp.zeros((2,), dtype=jnp.int32)
+
+    with pytest.raises(ValueError, match="observation must be real"):
+        run_behavior_model_from_arrays(model, state, observations, actions)
+
+
+def test_integer_observations_still_predict() -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=3, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+
+    logits = model.predict_logits(state, jnp.ones((2,), dtype=jnp.int32))
+
+    chex.assert_shape(logits, (3,))
+
+
 def test_infinite_observation_does_not_poison_weights() -> None:
     """Inf obs makes softmax NaN and logit_error * x = 0*inf on a silent feature."""
     model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
@@ -147,6 +242,32 @@ def test_infinite_observation_does_not_poison_weights() -> None:
     chex.assert_tree_all_finite(recovered.state.weights)
     chex.assert_tree_all_finite(recovered.state.bias)
     assert bool(recovered.update_applied)
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+def test_negative_step_count_rejects_behavior_update_atomically(
+    disable_jit: bool,
+) -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
+    state = model.init(feature_dim=2, key=jax.random.key(0)).replace(
+        step_count=jnp.asarray(-1, dtype=jnp.int32)
+    )
+
+    with jax.disable_jit(disable_jit):
+        result = model.update(
+            state,
+            jnp.asarray([0.5, -0.25], dtype=jnp.float32),
+            jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.state, state)
+    chex.assert_trees_all_equal(result.logits, jnp.zeros_like(result.logits))
+    chex.assert_trees_all_equal(
+        result.probabilities,
+        jnp.zeros_like(result.probabilities),
+    )
+    chex.assert_trees_all_equal(result.loss, jnp.zeros_like(result.loss))
 
 
 def test_zero_diagnostic_decay_does_not_multiply_inf_ema() -> None:
@@ -235,8 +356,8 @@ def test_input_loss_gradient_verdict_is_consistent_eager_jit_and_vmap() -> None:
     chex.assert_trees_all_close(batched_committed[1], builder_state)
 
 
-def test_input_loss_gradient_rejects_finite_gradient_with_overflowed_norm() -> None:
-    """The verdict covers every numeric field, including derived diagnostics."""
+def test_input_loss_gradient_rejects_finite_gradient_with_unrepresentable_norm() -> None:
+    """A true norm above float32 range remains invalid after safe reduction."""
     model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
     state = model.init(feature_dim=2, key=jax.random.key(2))
     maximum = jnp.finfo(jnp.float32).max
@@ -248,16 +369,79 @@ def test_input_loss_gradient_rejects_finite_gradient_with_overflowed_norm() -> N
         bias=jnp.zeros((2,), dtype=jnp.float32),
     )
 
-    result = model.input_loss_gradient(
-        state,
-        jnp.zeros((2,), dtype=jnp.float32),
-        jnp.array(0, dtype=jnp.int32),
+    observation = jnp.zeros((2,), dtype=jnp.float32)
+    action = jnp.array(0, dtype=jnp.int32)
+    probabilities = jax.nn.softmax(state.weights @ observation + state.bias)
+    raw_gradient = state.weights.T @ (
+        probabilities - jax.nn.one_hot(action, 2, dtype=jnp.float32)
     )
+
+    assert bool(jnp.all(jnp.isfinite(raw_gradient)))
+    assert np.linalg.norm(np.asarray(raw_gradient, dtype=np.float64)) > float(maximum)
+
+    result = model.input_loss_gradient(state, observation, action)
 
     assert not bool(result.valid)
     chex.assert_tree_all_finite(result)
     chex.assert_trees_all_close(result.gradient, jnp.zeros((2,), dtype=jnp.float32))
     assert float(result.gradient_norm) == 0.0
+
+
+def test_input_loss_gradient_keeps_representable_norm_when_square_sum_overflows() -> None:
+    """A finite bridge gradient must not be rejected by its norm reduction."""
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, step_size=0.1))
+    state = model.init(feature_dim=8, key=jax.random.key(3)).replace(
+        weights=jnp.stack(
+            [
+                jnp.full((8,), -7e18, dtype=jnp.float32),
+                jnp.full((8,), 7e18, dtype=jnp.float32),
+            ]
+        )
+    )
+    observation = jnp.zeros((8,), dtype=jnp.float32)
+    action = jnp.asarray(0, dtype=jnp.int32)
+    expected_gradient = jnp.full((8,), 7e18, dtype=jnp.float32)
+
+    assert bool(jnp.all(jnp.isfinite(expected_gradient * expected_gradient)))
+    assert bool(jnp.isinf(jnp.linalg.norm(expected_gradient)))
+
+    result = model.input_loss_gradient(state, observation, action)
+
+    assert bool(result.valid)
+    chex.assert_trees_all_close(result.gradient, expected_gradient)
+    assert bool(jnp.isfinite(result.gradient_norm))
+    expected_norm = float(np.float64(np.float32(7e18)) * np.sqrt(8.0))
+    np.testing.assert_allclose(float(result.gradient_norm), expected_norm, rtol=1e-6)
+
+
+def test_gradient_clipping_keeps_finite_update_when_square_sum_overflows() -> None:
+    """Global clipping must scale a representable norm instead of zeroing it."""
+    model = BehaviorModel(
+        BehaviorModelConfig(
+            n_actions=2,
+            step_size=1.0,
+            max_gradient_norm=2.0,
+        )
+    )
+    state = model.init(feature_dim=8, key=jax.random.key(4))
+    observation = jnp.full((8,), 1e19, dtype=jnp.float32)
+    action = jnp.asarray(0, dtype=jnp.int32)
+    raw_weight_gradient = jnp.stack((observation * 0.5, observation * -0.5))
+
+    assert bool(jnp.all(jnp.isfinite(raw_weight_gradient * raw_weight_gradient)))
+    assert bool(jnp.isinf(jnp.sqrt(jnp.sum(raw_weight_gradient * raw_weight_gradient))))
+
+    result = model.update(state, observation, action)
+
+    assert bool(result.update_applied)
+    expected_weights = jnp.stack(
+        (
+            jnp.full((8,), 0.5, dtype=jnp.float32),
+            jnp.full((8,), -0.5, dtype=jnp.float32),
+        )
+    )
+    chex.assert_trees_all_close(result.state.weights, expected_weights, rtol=1e-6)
+    assert int(result.state.step_count) == 1
 
 
 @pytest.mark.parametrize(
@@ -282,6 +466,29 @@ def test_config_rejects_nonfinite_or_invalid_numeric_values(
     kwargs: dict[str, Any] = {"n_actions": 2, field: value}
     with pytest.raises(ValueError):
         BehaviorModelConfig(**kwargs)
+
+
+def test_temperature_rejects_subnormal_float32_before_softmax_division() -> None:
+    """An accepted temperature must remain a usable positive XLA divisor."""
+    smallest_normal = float(np.finfo(np.float32).tiny)
+
+    with pytest.raises(ValueError, match="temperature must be at least"):
+        BehaviorModelConfig(n_actions=2, temperature=float(np.nextafter(np.float32(0), 1)))
+
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, temperature=smallest_normal))
+    state = model.init(feature_dim=1, key=jax.random.key(0))
+    result = model.update(
+        state,
+        jnp.ones((1,), dtype=jnp.float32),
+        jnp.array(0, dtype=jnp.int32),
+    )
+
+    assert bool(result.update_applied)
+    assert int(result.state.step_count) == 1
+    assert bool(jnp.all(jnp.isfinite(result.probabilities)))
+    assert bool(jnp.all(jnp.isfinite(result.state.weights)))
+    assert bool(jnp.all(jnp.isfinite(result.state.bias)))
+    assert bool(jnp.isfinite(result.loss))
 
 
 def test_config_and_init_reject_boolean_or_nonpositive_dimensions() -> None:
@@ -312,6 +519,23 @@ def test_resource_budget_matches_initialized_state_arrays_exactly() -> None:
     assert budget.learned_float32_scalars_touched_per_update == 3 * 5 + 3 + 3
     assert budget.replay_capacity == 0
     assert budget.to_dict()["state_nbytes"] == actual_nbytes
+
+
+@pytest.mark.parametrize(
+    "key",
+    (
+        jax.random.key(0, impl="rbg"),
+        jax.random.PRNGKey(0),
+    ),
+    ids=("rbg", "legacy"),
+)
+def test_init_requires_typed_scalar_threefry_key_for_exact_resource_accounting(
+    key: jax.Array,
+) -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=3))
+
+    with pytest.raises(ValueError, match="typed scalar threefry2x32 key"):
+        model.init(feature_dim=5, key=key)
 
 
 def test_preupdate_input_gradient_matches_autodiff_and_does_not_advance_state() -> None:
@@ -555,6 +779,68 @@ def test_importance_ratio_and_epsilon_greedy_helpers() -> None:
     assert float(ratio) == 1.25
 
 
+@pytest.mark.parametrize(
+    ("target", "message"),
+    [
+        (np.array([2.0, -1.0], dtype=np.float32), "non-negative"),
+        (np.array([0.1, 0.1], dtype=np.float32), "sum to one"),
+        (np.array([np.nan, 1.0], dtype=np.float32), "finite"),
+        (np.array([np.inf, 0.0], dtype=np.float32), "finite"),
+        (np.array([1e300, 0.0], dtype=np.float64), "finite"),
+        (np.array([1.0], dtype=np.float32), "2 actions"),
+        (np.array(1.0, dtype=np.float32), "2 actions"),
+        (np.array([0.5 + 1.0j, 0.5 - 1.0j], dtype=np.complex64), "real floating"),
+        (np.array([1, 0], dtype=np.int32), "real floating"),
+    ],
+    ids=[
+        "negative",
+        "not-normalized",
+        "nan",
+        "inf",
+        "float32-overflow",
+        "too-few-actions",
+        "scalar",
+        "complex",
+        "integer",
+    ],
+)
+def test_importance_ratio_rejects_invalid_target_distribution(
+    target: np.ndarray, message: str
+) -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+
+    with pytest.raises(ValueError, match=message):
+        model.importance_ratio(
+            state,
+            jnp.ones(2, dtype=jnp.float32),
+            jnp.array(0, dtype=jnp.int32),
+            target,
+        )
+
+
+def test_clipped_importance_ratios_rejects_one_invalid_batch_row() -> None:
+    target = jnp.array([[0.5, 0.5], [0.5, 0.2]], dtype=jnp.float32)
+    behavior = jnp.full((2, 2), 0.5, dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="sum to one"):
+        clipped_importance_ratios(target, behavior, jnp.array([0, 1], dtype=jnp.int32))
+
+
+def test_importance_ratio_keeps_rounded_softmax_and_traced_targets() -> None:
+    model = BehaviorModel(BehaviorModelConfig(n_actions=64, ratio_clip=1000.0))
+    state = model.init(feature_dim=2, key=jax.random.key(0))
+    observation = jnp.ones(2, dtype=jnp.float32)
+    action = jnp.array(3, dtype=jnp.int32)
+    target = jax.nn.softmax(jnp.linspace(-5.0, 5.0, 64, dtype=jnp.float32))
+
+    eager = model.importance_ratio(state, observation, action, target)
+    traced = jax.jit(model.importance_ratio)(state, observation, action, target)
+
+    assert float(eager) == pytest.approx(float(target[3]) * 64.0, rel=1e-5)
+    assert float(traced) == float(eager)
+
+
 def test_behavior_model_config_rejects_booleans_and_non_integers() -> None:
     with pytest.raises(ValueError, match="n_actions"):
         BehaviorModelConfig(n_actions=True)  # type: ignore[arg-type]
@@ -633,7 +919,7 @@ def test_behavior_model_preflights_resource_bytes_before_allocation(
 ) -> None:
     model = BehaviorModel(BehaviorModelConfig(n_actions=2))
     persist_last_legal = ((2**31 - 1) - 32) // 8
-    update_last_legal = 48_806_441
+    update_last_legal = 41_297_757
     with pytest.raises(ValueError, match="update working set byte count"):
         model.resource_budget(persist_last_legal)
     with pytest.raises(ValueError, match="state_nbytes"):
@@ -742,7 +1028,7 @@ def test_behavior_model_persist_fits_while_update_working_set_does_not() -> None
 def test_behavior_model_last_fit_and_first_overflow_are_adjacent() -> None:
     last_fit = None
     first_overflow = None
-    for feature_dim in range(89_478_476, 89_478_480):
+    for feature_dim in range(76_695_836, 76_695_840):
         working_set_bytes = _behavior_model_update_working_set_bytes(1, feature_dim)
         _, persist_bytes = _resource_counts(1, feature_dim)
         assert persist_bytes <= _INT32_MAX
@@ -868,3 +1154,301 @@ class TestBehaviorModelSequenceCeiling:
         result = run_behavior_model_from_arrays(model, state, observations, actions)
         chex.assert_shape(result.probabilities, (12, 3))
         assert int(result.state.step_count) == 12
+
+def test_floor_and_renormalize_probabilities_returns_simplex_on_zero_and_extreme_mass() -> None:
+    from alberta_framework.core.behavior_model import floor_and_renormalize_probabilities
+
+    for probs in ([0.0, 0.0, 0.0], [1e38, 1.0, 1.0], [-1.0, -2.0, -3.0], [1e-30, 0.0, 0.0]):
+        out = floor_and_renormalize_probabilities(jnp.asarray(probs, dtype=jnp.float32))
+        np.testing.assert_allclose(float(jnp.sum(out)), 1.0, atol=1e-5)
+        assert np.all(np.asarray(out) >= 1e-6)
+
+
+def _large_scale_two_action_model() -> tuple[BehaviorModel, Any, Any]:
+    """Return a T=0.7 model, an applied-update state, and its observation.
+
+    One finite applied update from ``init`` drives ``|logits / T|`` past the
+    regime where XLA:CPU fuses the temperature product into the softmax
+    max-subtraction (see SlopDotCash/asi#2886). Every call below stays
+    unbatched: ``jit(vmap(...))`` over these rows masks the defect.
+    """
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, temperature=0.7))
+    state = model.init(1, jax.random.key(0))
+    observation = jnp.asarray([6e5], dtype=jnp.float32)
+    action = jnp.asarray(0, dtype=jnp.int32)
+    first = model.update(state, observation, action)
+    assert bool(first.update_applied)
+    return model, first.state, observation
+
+
+def test_compiled_predict_probabilities_stay_finite_after_large_scale_update() -> None:
+    model, state, observation = _large_scale_two_action_model()
+    probabilities = np.asarray(model.predict_probabilities(state, observation))
+    logits = np.asarray(model.predict_logits(state, observation))
+    eager = np.asarray(jax.nn.softmax(logits / 0.7))
+    assert np.all(np.isfinite(eager))
+    assert np.all(np.isfinite(probabilities))
+    np.testing.assert_allclose(float(np.sum(probabilities)), 1.0, atol=1e-6)
+    assert int(np.argmax(probabilities)) == int(np.argmax(eager))
+
+
+def test_compiled_input_loss_gradient_stays_valid_after_large_scale_update() -> None:
+    model, state, observation = _large_scale_two_action_model()
+    result = model.input_loss_gradient(
+        state, observation, jnp.asarray(0, dtype=jnp.int32)
+    )
+    assert bool(result.valid)
+    assert np.all(np.isfinite(np.asarray(result.probabilities)))
+    assert np.isfinite(float(result.loss))
+    assert np.all(np.isfinite(np.asarray(result.gradient)))
+
+
+def test_compiled_follow_up_update_applies_after_large_scale_update() -> None:
+    model, state, observation = _large_scale_two_action_model()
+    second = model.update(state, observation, jnp.asarray(0, dtype=jnp.int32))
+    assert bool(second.update_applied)
+    assert np.all(np.isfinite(np.asarray(second.probabilities)))
+
+
+def test_compiled_sample_action_follows_learned_policy_after_large_scale_update() -> None:
+    model, state, observation = _large_scale_two_action_model()
+    sample = model.sample_action(state, observation)
+    probabilities = np.asarray(sample.probabilities)
+    assert np.all(np.isfinite(probabilities))
+    assert int(sample.action) == int(np.argmax(probabilities)) == 0
+    assert np.isfinite(float(sample.action_probability))
+
+
+def test_compiled_helpers_match_eager_at_issue_onset_scale() -> None:
+    """Helpers must equal eager at the #2886 onset scale, compiled, per row.
+
+    On linux x86_64, JAX 0.11.0, single-threaded XLA:CPU, the plain
+    ``jax.nn.softmax(logits / T)`` expression returns compiled-only
+    ``[nan, nan]`` where eager returns ``[1, 0]`` for these exact rows, so
+    restoring the plain expression inside the helpers fails this test on
+    this host (mutation-checked).  The rows sit past the measured onset
+    ``|logits / T| >= 2**31`` for a non-power-of-two temperature.  Probes
+    stay per-row on purpose: batched ``vmap`` fusions were measured to mask
+    this defect class.
+    """
+    for values, temperature in (
+        ([4e9, 0.0], 0.7),
+        ([8e9, 1e9], 0.7),
+        ([1e10, -1e10], 0.7),
+        ([2.5e9, 0.0], 1.1),
+    ):
+        logits = jnp.asarray(values, dtype=jnp.float32)
+        eager_probabilities = np.asarray(jax.nn.softmax(logits / temperature))
+        eager_logs = np.asarray(jax.nn.log_softmax(logits / temperature))
+        assert np.all(np.isfinite(eager_probabilities)), (values, temperature)
+        compiled_probabilities = np.asarray(
+            jax.jit(lambda x: _stable_temperature_softmax(x, temperature))(logits)
+        )
+        compiled_logs = np.asarray(
+            jax.jit(lambda x: _stable_temperature_log_softmax(x, temperature))(logits)
+        )
+        context = (values, temperature)
+        assert np.all(np.isfinite(compiled_probabilities)), context
+        assert np.all(np.isfinite(compiled_logs)), context
+        np.testing.assert_allclose(
+            compiled_probabilities,
+            eager_probabilities,
+            rtol=1e-6,
+            atol=0,
+            err_msg=str(context),
+        )
+        np.testing.assert_allclose(
+            compiled_logs,
+            eager_logs,
+            rtol=1e-6,
+            atol=0,
+            err_msg=str(context),
+        )
+
+
+def test_compiled_helpers_stay_finite_when_logit_distance_overflows() -> None:
+    """Distance-overflow rows stay finite in both domains under compilation.
+
+    float32 cannot represent the pairwise distance of ``[3e38, -3e38]``, so
+    the plain expression (and the previously reviewed scaled-domain form)
+    evaluates ``-inf - (-inf)``-class intermediates and returns ``[nan,
+    nan]`` where the input is finite.  The halving pre-conditioner does not
+    apply at ``T <= 1``, so the negative tail is clamped to the finite
+    float32 minimum instead: probabilities are unchanged (``exp(floor)``
+    underflows to zero exactly like ``exp(-inf)``), and log-probabilities
+    stay finite so downstream ``probability * log_probability`` entropy
+    products cannot produce ``0 * -inf``.  Where the plain expression is
+    itself non-finite this is a documented deviation from it, not a change
+    of any finite answer.
+    """
+    logits = jnp.asarray([3e38, -3e38], dtype=jnp.float32)
+    temperature = 0.5
+    compiled_probabilities = np.asarray(
+        jax.jit(lambda x: _stable_temperature_softmax(x, temperature))(logits)
+    )
+    compiled_logs = np.asarray(
+        jax.jit(lambda x: _stable_temperature_log_softmax(x, temperature))(logits)
+    )
+    assert np.all(np.isfinite(compiled_probabilities))
+    assert np.all(np.isfinite(compiled_logs))
+    np.testing.assert_allclose(float(np.sum(compiled_probabilities)), 1.0, atol=1e-7)
+    assert int(np.argmax(compiled_probabilities)) == 0
+    assert float(compiled_logs[0]) == pytest.approx(0.0, abs=1e-6)
+    assert float(compiled_logs[1]) >= -3.4029e38
+
+
+def test_opposite_extreme_logits_keep_eager_finiteness_at_moderate_temperature() -> None:
+    """Opposite finite extremes at T=2.0 must match eager, not overflow to -inf.
+
+    Review-executed regression at an earlier head: centering the raw logits
+    without the halving pre-conditioner computed ``-0.4e38 - 3.2e38`` before
+    the scale, which overflows float32, so the log-softmax helper returned
+    ``[0, -inf]`` where eager ``log_softmax(logits / 2)`` returns
+    ``[0, -1.8e38]``, and the committed loss then evaluated ``0 * -inf``.
+    Dropping the halving pre-conditioner reintroduces exactly that
+    mismatch, so this test kills the guard-removal mutant.
+    """
+    logits = jnp.asarray([3.2e38, -0.4e38], dtype=jnp.float32)
+    temperature = 2.0
+    eager_probabilities = np.asarray(jax.nn.softmax(logits / temperature))
+    eager_log_probabilities = np.asarray(jax.nn.log_softmax(logits / temperature))
+    assert np.all(np.isfinite(eager_log_probabilities))
+    probabilities = np.asarray(_stable_temperature_softmax(logits, temperature))
+    log_probabilities = np.asarray(_stable_temperature_log_softmax(logits, temperature))
+    compiled_log_probabilities = np.asarray(
+        jax.jit(lambda x: _stable_temperature_log_softmax(x, temperature))(logits)
+    )
+    assert np.all(np.isfinite(probabilities))
+    assert np.all(np.isfinite(log_probabilities))
+    assert np.all(np.isfinite(compiled_log_probabilities))
+    np.testing.assert_allclose(probabilities, eager_probabilities, rtol=1e-6, atol=0)
+    np.testing.assert_allclose(log_probabilities, eager_log_probabilities, rtol=1e-6, atol=0)
+    np.testing.assert_allclose(
+        compiled_log_probabilities, eager_log_probabilities, rtol=1e-6, atol=0
+    )
+
+
+def test_input_loss_gradient_stays_valid_for_opposite_extreme_logits() -> None:
+    """The executed reviewer repro must stay a valid finite transaction.
+
+    Zero weights and a finite opposite-extreme bias at ``temperature=2.0``
+    produced ``valid=False`` with a non-finite loss at the previously
+    reviewed head, where the base commit returned a finite loss of about
+    ``1.8e38``.
+    """
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2, temperature=2.0))
+    state = BehaviorModelState(
+        weights=jnp.zeros((2, 1), dtype=jnp.float32),
+        bias=jnp.asarray([3.2e38, -0.4e38], dtype=jnp.float32),
+        rng_key=jax.random.key(0),
+        step_count=jnp.asarray(0, dtype=jnp.int32),
+        nll_ema=jnp.asarray(0.0, dtype=jnp.float32),
+        accuracy_ema=jnp.asarray(0.0, dtype=jnp.float32),
+        confidence_ema=jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    observation = jnp.asarray([0.0], dtype=jnp.float32)
+    result = model.input_loss_gradient(
+        state, observation, jnp.asarray(1, dtype=jnp.int32)
+    )
+    assert bool(result.valid)
+    assert np.isfinite(float(result.loss))
+    assert float(result.loss) == pytest.approx(1.8e38, rel=1e-5)
+    assert np.all(np.isfinite(np.asarray(result.probabilities)))
+    assert np.all(np.isfinite(np.asarray(result.gradient)))
+
+
+def test_stable_helpers_track_eager_across_temperature_and_scale_grid() -> None:
+    """Finiteness parity and eager agreement over ordinary and extreme regimes.
+
+    Where eager ``jax.nn.softmax(logits / T)`` is finite the helpers must
+    agree with it; where eager is not finite (float32 range exhausted), the
+    helpers must be non-finite in the same entries rather than inventing a
+    different answer. Probes stay unbatched: batching masks this defect class.
+    """
+    generator = np.random.default_rng(2886)
+    cases: list[tuple[np.ndarray, float]] = []
+    for temperature in (0.3, 0.7, 1.0, 2.0, 2.5):
+        for scale in (1.0, 1e3, 1e6, 1e9):
+            cases.append((generator.normal(size=5).astype(np.float32) * scale, temperature))
+    cases.append((np.asarray([3.2e38, -0.4e38], np.float32), 2.0))
+    cases.append((np.asarray([3e38, -3e38], np.float32), 4.0))
+    cases.append((np.asarray([1e19, -1e19], np.float32), 0.7))
+    # Base itself is non-finite here (float32 cannot represent the pairwise
+    # distance); the helpers deliberately return the finite clamped answer
+    # instead of following base into NaN — see
+    # test_compiled_helpers_stay_finite_when_logit_distance_overflows.
+    cases.append((np.asarray([3e38, -3e38], np.float32), 0.5))
+    cases.append((np.asarray([3.2e38, -0.4e38], np.float32), 0.7))
+    for values, temperature in cases:
+        logits = jnp.asarray(values)
+        eager_probabilities = np.asarray(jax.nn.softmax(logits / temperature))
+        eager_logs = np.asarray(jax.nn.log_softmax(logits / temperature))
+        probabilities = np.asarray(_stable_temperature_softmax(logits, temperature))
+        logs = np.asarray(_stable_temperature_log_softmax(logits, temperature))
+        context = (values.tolist(), temperature)
+        base_finite = bool(np.all(np.isfinite(eager_probabilities))) and bool(
+            np.all(np.isfinite(eager_logs))
+        )
+        if not base_finite:
+            # Documented deviation: the clamped helpers stay finite where the
+            # plain expression is already non-finite; probabilities still sum
+            # to one and keep the eager argmax.
+            assert np.all(np.isfinite(probabilities)), context
+            assert np.all(np.isfinite(logs)), context
+            np.testing.assert_allclose(
+                float(np.sum(probabilities)), 1.0, atol=1e-6, err_msg=str(context)
+            )
+            assert (
+                int(np.argmax(probabilities)) == int(np.argmax(eager_probabilities))
+                or np.isnan(eager_probabilities).all()
+            ), context
+            continue
+        np.testing.assert_allclose(
+            logs, eager_logs, rtol=1e-5, atol=1e-6, err_msg=str(context)
+        )
+        np.testing.assert_allclose(
+            probabilities,
+            eager_probabilities,
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg=str(context),
+        )
+        assert int(np.argmax(probabilities)) == int(np.argmax(eager_probabilities)), context
+
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("magnitude", [2e-20, 2e19, 2e38])
+@pytest.mark.parametrize("sign", [-1.0, 1.0])
+def test_input_gradient_norm_retains_representable_scales(compiled, magnitude, sign):
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2))
+    state = model.init(2, jax.random.key(0))
+    row = jnp.asarray([sign * magnitude, -sign * magnitude], dtype=jnp.float32)
+    state = state.replace(weights=jnp.stack([row, -row]))
+    gradient_fn = model.input_loss_gradient
+    if compiled:
+        gradient_fn = jax.jit(gradient_fn)
+    with jax.disable_jit(not compiled):
+        result = gradient_fn(state, jnp.zeros(2), jnp.asarray(0, dtype=jnp.int32))
+    expected_gradient = -np.asarray(row, dtype=np.float64)
+    expected_norm = float(np.linalg.norm(expected_gradient))
+    assert bool(result.valid)
+    np.testing.assert_allclose(np.asarray(result.gradient), expected_gradient, rtol=2e-6, atol=0)
+    assert float(result.gradient_norm) == pytest.approx(expected_norm, rel=2e-6, abs=0)
+    assert float(result.loss) == pytest.approx(np.log(2.0), rel=2e-6)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_input_gradient_true_norm_overflow_remains_invalid(compiled):
+    model = BehaviorModel(BehaviorModelConfig(n_actions=2))
+    state = model.init(2, jax.random.key(0))
+    row = jnp.full(2, 3e38, dtype=jnp.float32)
+    state = state.replace(weights=jnp.stack([row, -row]))
+    gradient_fn = model.input_loss_gradient
+    if compiled:
+        gradient_fn = jax.jit(gradient_fn)
+    with jax.disable_jit(not compiled):
+        result = gradient_fn(state, jnp.zeros(2), jnp.asarray(0, dtype=jnp.int32))
+    assert not bool(result.valid)
+    np.testing.assert_array_equal(np.asarray(result.gradient), np.zeros(2))
+    assert float(result.gradient_norm) == 0.0

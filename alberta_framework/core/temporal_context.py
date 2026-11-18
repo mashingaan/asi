@@ -45,22 +45,11 @@ _INT32_MAX: int = 2**31 - 1
 # Public last-fit in tests is 3 array steps. Origin scanned the leading
 # observation axis with no reject — hang/OOM, not an INT32 leftover.
 _TEMPORAL_CONTEXT_LOOP_MAX_STEPS = 10_000
+# Phase codes reduce the nonnegative int32 clock digit by digit.
+_PHASE_DIGIT_BITS = 4
+_PHASE_DIGIT_COUNT = 8
 
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _ACTUAL_FLOAT_TYPES = frozenset(
     {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
 )
@@ -178,6 +167,20 @@ def _require_temporal_context_array_steps(observations: object) -> int:
     return _require_temporal_context_loop_steps("observations num_steps", num_steps)
 
 
+def _phase_digit_residues(periods: tuple[float, ...]) -> np.ndarray:
+    """Return ``frac(16**i / p)`` per period and clock digit, rounded to float32."""
+    rows = []
+    for period in periods:
+        exact_period = Fraction(float(np.float32(period)))
+        rows.append(
+            [
+                float((Fraction(1 << (_PHASE_DIGIT_BITS * index)) / exact_period) % 1)
+                for index in range(_PHASE_DIGIT_COUNT)
+            ]
+        )
+    return np.asarray(rows, dtype=np.float32)
+
+
 def _temporal_context_persist_bytes(input_dim: int) -> int:
     """EMA float32 vector plus the signed-int32 step counter."""
 
@@ -226,6 +229,7 @@ def _temporal_context_update_working_set_bytes(
         + 4 * input_dim
         + 4 * input_dim
         + 4 * input_dim
+        + 5 * input_dim  # Equal-input mask and fixed-point selection.
         + 8 * input_dim * int(include_delta)
         + 4 * phase_dim
         + 4 * product_dim
@@ -325,12 +329,25 @@ class TemporalContextConfig:
     def from_config(cls, config: object) -> TemporalContextConfig:
         """Reconstruct from :meth:`to_config` output."""
         payload = _copy_mapping(config, name="TemporalContextConfig")
-        payload.pop("type", None)
-        if "periods" in payload:
-            raw = payload["periods"]
-            if type(raw) not in (list, tuple):
-                raise ValueError("periods must be a list or tuple")
-            payload["periods"] = tuple(raw)
+        expected = {
+            "type",
+            "input_dim",
+            "include_raw",
+            "include_ema",
+            "include_delta",
+            "include_phase_products",
+            "ema_decay",
+            "periods",
+        }
+        if set(payload) != expected:
+            raise ValueError("TemporalContextConfig fields do not match its schema")
+        config_type = payload.pop("type")
+        if type(config_type) is not str or config_type != "TemporalContextConfig":
+            raise ValueError("TemporalContextConfig type is invalid")
+        raw = payload["periods"]
+        if type(raw) not in (list, tuple):
+            raise ValueError("periods must be a list or tuple")
+        payload["periods"] = tuple(raw)
         return cls(**payload)
 
 
@@ -505,7 +522,8 @@ class TemporalContextFeaturizer:
             blocks.append(safe_ema)
         if cfg.include_delta:
             delta = obs - safe_ema
-            blocks.append(jnp.where(coordinate_valid, delta, jnp.zeros_like(delta)))
+            delta_valid = coordinate_valid & jnp.isfinite(delta)
+            blocks.append(jnp.where(delta_valid, delta, jnp.zeros_like(delta)))
         if cfg.periods:
             counter_valid = state.step_count >= jnp.asarray(0, dtype=jnp.int32)
             safe_step_count = jnp.where(
@@ -513,9 +531,17 @@ class TemporalContextFeaturizer:
                 state.step_count,
                 jnp.asarray(0, dtype=jnp.int32),
             )
-            step = safe_step_count.astype(jnp.float32)
-            periods = jnp.asarray(cfg.periods, dtype=jnp.float32)
-            angles = (2.0 * jnp.pi * step) / periods
+            # Reduce the int32 clock modulo each period before forming the
+            # angle: ``2*pi*t/p`` in float32 loses the phase once ``t``
+            # exceeds 2**24. The clock is split into 4-bit digits whose
+            # place-value residues ``frac(16**i / p)`` are exact host-side.
+            shifts = jnp.arange(_PHASE_DIGIT_COUNT, dtype=jnp.int32) * _PHASE_DIGIT_BITS
+            digits = (safe_step_count >> shifts) & ((1 << _PHASE_DIGIT_BITS) - 1)
+            products = digits.astype(jnp.float32)[None, :] * jnp.asarray(
+                _phase_digit_residues(cfg.periods), dtype=jnp.float32
+            )
+            cycles = jnp.sum(products - jnp.floor(products), axis=1)
+            angles = 2.0 * jnp.pi * (cycles - jnp.floor(cycles))
             phase = jnp.ravel(jnp.stack([jnp.sin(angles), jnp.cos(angles)], axis=1))
             blocks.append(phase)
             if cfg.include_phase_products:
@@ -559,6 +585,8 @@ class TemporalContextFeaturizer:
             decay * state.observation_ema,
         )
         proposed_ema = decayed_ema + (1.0 - decay) * obs
+        # Equal inputs are an exact EMA fixed point, including tiny normals.
+        proposed_ema = jnp.where(state.observation_ema == obs, obs, proposed_ema)
         proposed = TemporalContextState(
             observation_ema=proposed_ema,
             step_count=jnp.minimum(

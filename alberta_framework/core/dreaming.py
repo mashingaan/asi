@@ -57,19 +57,7 @@ _INT32_MAX = 2**31 - 1
 _DREAM_ROLLOUT_BUDGET = ScanBudget("dream rollout", maximum_steps=10_000)
 _DREAM_ROLLOUT_MAX_HORIZON = _DREAM_ROLLOUT_BUDGET.maximum_steps
 _ACTUAL_INT_TYPES: frozenset[type] = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
+    {int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")}
 )
 _ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
     {
@@ -209,6 +197,8 @@ class DreamingConfig:
                     "max_discount", self.max_discount, lower=0.0
                 ),
             )
+            if self.min_discount > self.max_discount:
+                raise ValueError("min_discount must not exceed max_discount")
         object.__setattr__(
             self,
             "rollout_horizon",
@@ -251,6 +241,9 @@ class DreamingConfig:
         unknown = set(data) - allowed
         if unknown:
             raise ValueError("DreamingConfig payload has unknown fields")
+        missing = allowed - set(data)
+        if missing:
+            raise ValueError("DreamingConfig payload has missing fields")
         return cls(**data)  # type: ignore[arg-type]
 
 
@@ -357,6 +350,9 @@ class DreamSelectionConfig:
         unknown = set(data) - allowed
         if unknown:
             raise ValueError("DreamSelectionConfig payload has unknown fields")
+        missing = allowed - set(data)
+        if missing:
+            raise ValueError("DreamSelectionConfig payload has missing fields")
         return cls(**data)  # type: ignore[arg-type]
 
 
@@ -465,6 +461,15 @@ class GuardedDreamer:
             prediction.discount,
             self._config.min_discount,
             max_discount,
+        )
+        # A zero model discount is the terminal signal: the world-model
+        # prediction carries no terminated flag, so the min_discount floor
+        # must not resurrect it into a bootstrapping transition. This mirrors
+        # the terminal-discount rule in the rollout path.
+        discount = jnp.where(
+            prediction.discount == 0.0,
+            jnp.zeros_like(discount),
+            discount,
         )
         transition = DreamTransition(
             observation=jnp.asarray(observation, dtype=jnp.float32).reshape(
@@ -615,6 +620,44 @@ def score_dream_candidates(
         + weighted_term(cfg.confidence_weight, confidence_arr)
         - weighted_term(cfg.model_error_weight, error_arr)
     )
+
+    def recover_overflowed_scores(_: None) -> Array:
+        # Preserve ordinary arithmetic exactly. Only recover when finite terms
+        # overflowed before cancelling to a representable weighted sum.
+        weights = jnp.asarray(
+            [
+                cfg.surprise_weight,
+                cfg.utility_weight,
+                cfg.confidence_weight,
+                -cfg.model_error_weight,
+            ],
+            dtype=jnp.float32,
+        )
+        values = jnp.stack(
+            (surprise_arr, utility_arr, confidence_arr, error_arr), axis=0
+        )
+        value_peak = jnp.max(jnp.abs(values), axis=0)
+        weight_peak = jnp.max(jnp.abs(weights))
+        _value_mantissa, value_exponent = jnp.frexp(
+            jnp.where(value_peak > 0.0, value_peak, 1.0)
+        )
+        _weight_mantissa, weight_exponent = jnp.frexp(
+            jnp.where(weight_peak > 0.0, weight_peak, 1.0)
+        )
+        scaled_values = jnp.ldexp(values, -value_exponent[None, :])
+        scaled_weights = jnp.ldexp(weights, -weight_exponent)
+        recovered_scores = jnp.ldexp(
+            jnp.sum(scaled_weights[:, None] * scaled_values, axis=0),
+            value_exponent + weight_exponent,
+        )
+        return jnp.where(jnp.isfinite(raw_scores), raw_scores, recovered_scores)
+
+    raw_scores = jax.lax.cond(
+        jnp.all(jnp.isfinite(raw_scores)),
+        lambda _: raw_scores,
+        recover_overflowed_scores,
+        operand=None,
+    )
     accepted = accepted & jnp.isfinite(raw_scores)
     scores = jnp.where(accepted, raw_scores, -jnp.inf)
     selected_indices = jnp.argsort(-scores)[: cfg.max_items].astype(jnp.int32)
@@ -673,15 +716,32 @@ class RecentObservationBuffer:
         state: RecentObservationBufferState,
         observation: Array,
     ) -> RecentObservationBufferState:
-        """Insert one observation into the ring buffer."""
-        obs = jnp.asarray(observation, dtype=jnp.float32).reshape(
-            (self._observation_dim,)
-        )
+        """Insert one observation into the ring buffer.
+
+        A non-finite observation leaves the buffer unchanged, so a transition
+        the learners rejected can never be sampled as a dream anchor.
+        """
+        raw_observation = jnp.asarray(observation)
+        expected_shape = (self._observation_dim,)
+        if raw_observation.shape != expected_shape:
+            raise ValueError(
+                f"observation must have shape {expected_shape}, got {raw_observation.shape}"
+            )
+        obs = jnp.asarray(raw_observation, dtype=jnp.float32)
+        accepted = jnp.all(jnp.isfinite(obs))
         next_observations = state.observations.at[state.index].set(obs)
         return RecentObservationBufferState(
-            observations=next_observations,
-            size=jnp.minimum(state.size + 1, self._capacity).astype(jnp.int32),
-            index=((state.index + 1) % self._capacity).astype(jnp.int32),
+            observations=jnp.where(accepted, next_observations, state.observations),
+            size=jnp.where(
+                accepted,
+                jnp.minimum(state.size + 1, self._capacity).astype(jnp.int32),
+                state.size,
+            ),
+            index=jnp.where(
+                accepted,
+                ((state.index + 1) % self._capacity).astype(jnp.int32),
+                state.index,
+            ),
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -788,6 +848,9 @@ class DreamRolloutConfig:
         unknown = set(data) - allowed
         if unknown:
             raise ValueError("DreamRolloutConfig payload has unknown fields")
+        missing = allowed - set(data)
+        if missing:
+            raise ValueError("DreamRolloutConfig payload has missing fields")
         return cls(**data)  # type: ignore[arg-type]
 
 
@@ -956,6 +1019,13 @@ def dream_one_step(
         behavior_prediction.action,
         model_key,
     )
+    expected_observation_shape = jnp.asarray(rollout_state.observation).shape
+    actual_observation_shape = jnp.asarray(world_prediction.next_observation).shape
+    if actual_observation_shape != expected_observation_shape:
+        raise ValueError(
+            f"next_observation must have shape {expected_observation_shape}; "
+            f"got {actual_observation_shape}"
+        )
     confidence_ok = world_prediction.confidence >= jnp.asarray(
         cfg.confidence_threshold,
         dtype=jnp.float32,
@@ -1007,12 +1077,22 @@ def dream_one_step(
         ),
         step_count=_saturating_int32_counter_increment(rollout_state.step_count),
     )
+    # A terminated step must not bootstrap: the converters drop the
+    # ``terminated`` flag, so the discount is the only carrier of that
+    # information. Force it to zero here (and again in the converters, for
+    # hand-built transitions) instead of passing a non-zero model discount
+    # through a terminal row.
+    effective_discount = jnp.where(
+        terminated,
+        jnp.array(0.0, dtype=jnp.float32),
+        jnp.asarray(world_prediction.discount, dtype=jnp.float32),
+    )
     transition = ImaginedTransition(
         observation=rollout_state.observation,
         action=behavior_prediction.action,
         reward=jnp.squeeze(jnp.asarray(world_prediction.reward, dtype=jnp.float32)),
         next_observation=world_prediction.next_observation,
-        discount=jnp.squeeze(jnp.asarray(world_prediction.discount, dtype=jnp.float32)),
+        discount=jnp.squeeze(effective_discount),
         terminated=terminated,
         confidence=jnp.squeeze(jnp.asarray(world_prediction.confidence, dtype=jnp.float32)),
         model_error=jnp.squeeze(jnp.asarray(world_prediction.model_error, dtype=jnp.float32)),
@@ -1144,12 +1224,17 @@ def imagined_transition_to_gvf_item(
         if cumulants is None
         else jnp.ravel(jnp.asarray(cumulants, dtype=jnp.float32))
     )
+    effective_discount = jnp.where(
+        jnp.asarray(transition.terminated, dtype=jnp.bool_),
+        jnp.array(0.0, dtype=jnp.float32),
+        jnp.asarray(transition.discount, dtype=jnp.float32),
+    )
     return DreamGVFTrainingItem(
         observations=_neutralize_invalid(transition.observation, transition.valid),
         cumulants=_neutralize_invalid(cumulant_array, transition.valid),
         next_observations=_neutralize_invalid(transition.next_observation, transition.valid),
         discounts=_neutralize_invalid(
-            jnp.reshape(jnp.asarray(transition.discount, dtype=jnp.float32), (1,)),
+            jnp.reshape(effective_discount, (1,)),
             transition.valid,
         ),
         weights=jnp.reshape(jnp.asarray(transition.valid, dtype=jnp.float32), (1,)),
@@ -1167,15 +1252,18 @@ def imagined_rollout_to_gvf_items(
         if cumulants is None
         else jnp.asarray(cumulants, dtype=jnp.float32)
     )
+    effective_discounts = jnp.where(
+        jnp.asarray(transitions.terminated, dtype=jnp.bool_),
+        jnp.array(0.0, dtype=jnp.float32),
+        jnp.asarray(transitions.discount, dtype=jnp.float32),
+    )
     return DreamGVFTrainingItem(
         observations=_neutralize_invalid(transitions.observation, transitions.valid),
         cumulants=_neutralize_invalid(cumulant_array, transitions.valid),
         next_observations=_neutralize_invalid(
             transitions.next_observation, transitions.valid
         ),
-        discounts=_neutralize_invalid(
-            jnp.asarray(transitions.discount, dtype=jnp.float32), transitions.valid
-        ),
+        discounts=_neutralize_invalid(effective_discounts, transitions.valid),
         weights=jnp.asarray(transitions.valid, dtype=jnp.float32),
     )
 
@@ -1184,17 +1272,29 @@ def imagined_rollout_to_sarsa_items(
     rollout: DreamRolloutResult,
     bootstrap_action: Array | None = None,
 ) -> DreamSARSATrainingItem:
-    """Convert a rollout to SARSA-style arrays with shifted next actions."""
+    """Convert a rollout to SARSA-style arrays with shifted next actions.
+
+    Without a bootstrap action, retain the final row only when its discount is zero.
+    The same rule applies to any row followed by a rejected row, whose action
+    is not a usable next action.
+    """
     transitions = rollout.transitions
     actions = transitions.action
+    effective_discounts = jnp.where(
+        jnp.asarray(transitions.terminated, dtype=jnp.bool_),
+        jnp.array(0.0, dtype=jnp.float32),
+        jnp.asarray(transitions.discount, dtype=jnp.float32),
+    )
     if bootstrap_action is None:
         next_actions = jnp.concatenate([actions[1:], jnp.zeros_like(actions[-1:])], axis=0)
-        weights = jnp.asarray(transitions.valid, dtype=jnp.float32)
-        weights = weights.at[-1].set(0.0)
+        final_next_valid = jnp.zeros_like(transitions.valid[-1:])
     else:
         bootstrap = jnp.expand_dims(jnp.asarray(bootstrap_action, dtype=actions.dtype), axis=0)
         next_actions = jnp.concatenate([actions[1:], bootstrap], axis=0)
-        weights = jnp.asarray(transitions.valid, dtype=jnp.float32)
+        final_next_valid = jnp.ones_like(transitions.valid[-1:])
+    next_valid = jnp.concatenate([transitions.valid[1:], final_next_valid], axis=0)
+    # A zero-discount transition has no bootstrap term or next-action dependency.
+    retained = transitions.valid & (next_valid | (effective_discounts == 0.0))
     return DreamSARSATrainingItem(
         observations=_neutralize_invalid(transitions.observation, transitions.valid),
         actions=_neutralize_invalid(actions, transitions.valid),
@@ -1204,11 +1304,9 @@ def imagined_rollout_to_sarsa_items(
         next_observations=_neutralize_invalid(
             transitions.next_observation, transitions.valid
         ),
-        discounts=_neutralize_invalid(
-            jnp.asarray(transitions.discount, dtype=jnp.float32), transitions.valid
-        ),
-        next_actions=_neutralize_invalid(next_actions, transitions.valid),
-        weights=weights,
+        discounts=_neutralize_invalid(effective_discounts, transitions.valid),
+        next_actions=_neutralize_invalid(next_actions, retained),
+        weights=jnp.asarray(retained, dtype=jnp.float32),
     )
 
 

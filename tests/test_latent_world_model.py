@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import warnings
 from types import MappingProxyType
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -99,6 +101,141 @@ def test_latent_world_model_update_and_prediction_shapes() -> None:
     chex.assert_tree_all_finite(result.latent_std_mean)
 
 
+@pytest.mark.parametrize("shape", [(1, 2), (2, 1)])
+def test_latent_world_model_rejects_wrong_rank_observation_vectors(
+    shape: tuple[int, int],
+) -> None:
+    """Per-event APIs must not flatten row or column matrices into vectors."""
+    model = LatentWorldModel(
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            latent_dim=2,
+            hidden_sizes=(),
+            sparsity=0.0,
+        )
+    )
+    state = model.init(jr.key(320))
+    observation = jnp.asarray([[0.25, -0.5]], dtype=jnp.float32).reshape(shape)
+    vector = jnp.asarray([0.25, -0.5], dtype=jnp.float32)
+    action = jnp.asarray(1, dtype=jnp.int32)
+    reward = jnp.asarray(0.5, dtype=jnp.float32)
+    discount = jnp.asarray(0.9, dtype=jnp.float32)
+
+    calls = (
+        lambda: model.encode(state, observation),
+        lambda: model.input_features(state, observation, action),
+        lambda: model.targets(state, observation, reward, discount, vector),
+        lambda: model.targets(state, vector, reward, discount, observation),
+        lambda: model.predict(state, observation, action),
+        lambda: model.update(state, observation, action, reward, discount, vector),
+        lambda: model.update(state, vector, action, reward, discount, observation),
+    )
+    for call in calls:
+        with pytest.raises(ValueError, match=r"must have shape \(2,\)"):
+            call()
+        with pytest.raises(ValueError, match=r"must have shape \(2,\)"):
+            jax.jit(call)()
+
+
+@pytest.mark.parametrize("shape", [(1, 2), (2, 1)])
+def test_latent_world_model_rejects_wrong_rank_latent_vectors(
+    shape: tuple[int, int],
+) -> None:
+    model = LatentWorldModel(
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            latent_dim=2,
+            hidden_sizes=(),
+            sparsity=0.0,
+        )
+    )
+    state = model.init(jr.key(321))
+    latent = jnp.asarray([[0.25, -0.5]], dtype=jnp.float32).reshape(shape)
+    action = jnp.asarray(1, dtype=jnp.int32)
+
+    calls = (
+        lambda: model.input_features_from_latent(latent, action),
+        lambda: model.predict_from_latent(state, latent, action),
+    )
+    for call in calls:
+        with pytest.raises(ValueError, match=r"must have shape \(2,\)"):
+            call()
+        with pytest.raises(ValueError, match=r"must have shape \(2,\)"):
+            jax.jit(call)()
+
+
+@pytest.mark.parametrize(
+    ("operation", "field"),
+    [
+        ("input_features_from_latent", "action"),
+        ("input_features", "action"),
+        ("targets", "reward"),
+        ("targets", "discount"),
+        ("predict_from_latent", "action"),
+        ("predict", "action"),
+        ("update", "action"),
+        ("update", "reward"),
+        ("update", "discount"),
+    ],
+)
+def test_latent_world_model_rejects_size_one_scalar_aliases(
+    operation: str,
+    field: str,
+) -> None:
+    model = LatentWorldModel(
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            latent_dim=2,
+            hidden_sizes=(),
+            sparsity=0.0,
+        )
+    )
+    state = model.init(jr.key(322))
+    values = {
+        "observation": jnp.asarray([0.25, -0.5], dtype=jnp.float32),
+        "latent": jnp.asarray([0.1, -0.2], dtype=jnp.float32),
+        "action": jnp.asarray(1, dtype=jnp.int32),
+        "reward": jnp.asarray(0.5, dtype=jnp.float32),
+        "discount": jnp.asarray(0.9, dtype=jnp.float32),
+        "next_observation": jnp.asarray([0.5, 0.75], dtype=jnp.float32),
+    }
+    values[field] = jnp.ones((1,), dtype=jnp.float32)
+
+    def call() -> object:
+        if operation == "input_features_from_latent":
+            return model.input_features_from_latent(values["latent"], values["action"])
+        if operation == "input_features":
+            return model.input_features(state, values["observation"], values["action"])
+        if operation == "targets":
+            return model.targets(
+                state,
+                values["observation"],
+                values["reward"],
+                values["discount"],
+                values["next_observation"],
+            )
+        if operation == "predict_from_latent":
+            return model.predict_from_latent(state, values["latent"], values["action"])
+        if operation == "predict":
+            return model.predict(state, values["observation"], values["action"])
+        return model.update(
+            state,
+            values["observation"],
+            values["action"],
+            values["reward"],
+            values["discount"],
+            values["next_observation"],
+        )
+
+    with pytest.raises(ValueError, match=field):
+        call()
+    with pytest.raises(ValueError, match=field):
+        jax.jit(call)()
+
+
 def test_latent_default_discounts_do_not_inherit_the_reward_dtype() -> None:
     config = LatentWorldModelConfig(
         observation_dim=2,
@@ -126,6 +263,31 @@ def test_latent_default_discounts_do_not_inherit_the_reward_dtype() -> None:
     )
     chex.assert_trees_all_close(defaulted.discount_errors, explicit.discount_errors)
     chex.assert_trees_all_close(defaulted.discount_predictions, explicit.discount_predictions)
+
+
+def test_latent_learning_loop_rejects_fractional_discrete_action_array() -> None:
+    config = LatentWorldModelConfig(
+        observation_dim=2,
+        n_actions=2,
+        latent_dim=4,
+        hidden_sizes=(),
+    )
+    model = LatentWorldModel(config)
+    state = model.init(jr.key(4))
+    observations = jnp.array([[0.0, 0.0]], dtype=jnp.float32)
+    next_observations = jnp.array([[0.1, 0.0]], dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="actions must have an integer dtype"):
+        run_latent_world_model_learning_loop(
+            model,
+            state,
+            observations,
+            jnp.array([0.5], dtype=jnp.float32),
+            jnp.array([0.0], dtype=jnp.float32),
+            next_observations,
+        )
+
+
 class _FloatSpoof:
     @property
     def __class__(self) -> type[float]:  # type: ignore[override]
@@ -242,6 +404,44 @@ def test_latent_update_saturates_step_count_at_int32_max() -> None:
     assert int(result.state.step_count) == 2**31 - 1
 
 
+@pytest.mark.parametrize("disable_jit", [True, False])
+def test_latent_update_rejects_negative_step_count_atomically(
+    disable_jit: bool,
+) -> None:
+    model = LatentWorldModel(
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            latent_dim=2,
+            hidden_sizes=(),
+        )
+    )
+    state = model.init(jr.key(0)).replace(
+        step_count=jnp.asarray(-1, dtype=jnp.int32)
+    )
+
+    with jax.disable_jit(disable_jit):
+        result = model.update(
+            state,
+            jnp.asarray([0.1, -0.2], dtype=jnp.float32),
+            jnp.asarray(1, dtype=jnp.int32),
+            jnp.asarray(0.5, dtype=jnp.float32),
+            jnp.asarray(0.9, dtype=jnp.float32),
+            jnp.asarray([0.2, -0.1], dtype=jnp.float32),
+        )
+
+    assert not bool(result.update_applied)
+    # MultiHeadMLPState's Python-float lifecycle telemetry is explicitly not
+    # part of its JIT bit contract; compare the complete persistent JAX state.
+    returned_state = result.state.replace(
+        learner_state=result.state.learner_state.replace(
+            birth_timestamp=state.learner_state.birth_timestamp,
+            uptime_s=state.learner_state.uptime_s,
+        )
+    )
+    chex.assert_trees_all_equal(returned_state, state)
+
+
 def test_latent_world_model_scan_loop_and_config_roundtrip() -> None:
     config = LatentWorldModelConfig(
         observation_dim=2,
@@ -281,6 +481,50 @@ def test_latent_world_model_scan_loop_and_config_roundtrip() -> None:
     chex.assert_shape(result.surprises, (3,))
     chex.assert_shape(result.per_head_metrics, (3, 6, 3))
     chex.assert_tree_all_finite(result.prediction_errors)
+
+
+def test_latent_world_model_scan_preserves_initialized_host_clocks() -> None:
+    model = LatentWorldModel(
+        LatentWorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            latent_dim=4,
+            hidden_sizes=(8,),
+        )
+    )
+    initial = model.init(jr.key(17))
+    initial = dataclasses.replace(
+        initial,
+        learner_state=dataclasses.replace(
+            initial.learner_state,
+            birth_timestamp=1700000000.125,
+            uptime_s=12.5,
+        ),
+    )
+    observations = jnp.array([[1.0, 0.0], [0.0, 1.0]], dtype=jnp.float32)
+    next_observations = observations[::-1]
+    actions = jnp.array([0, 1], dtype=jnp.int32)
+    rewards = jnp.array([0.5, -0.25], dtype=jnp.float32)
+    discounts = jnp.array([0.99, 0.0], dtype=jnp.float32)
+    result = run_latent_world_model_learning_loop(
+        model, initial, observations, actions, rewards, next_observations, discounts
+    )
+    continued = run_latent_world_model_learning_loop(
+        model,
+        result.state,
+        observations,
+        actions,
+        rewards,
+        next_observations,
+        discounts,
+    )
+
+    for returned in (result.state, continued.state):
+        assert type(returned.learner_state.birth_timestamp) is float
+        assert returned.learner_state.birth_timestamp == 1700000000.125
+        assert type(returned.learner_state.uptime_s) is float
+        assert returned.learner_state.uptime_s == 12.5
+    assert int(continued.state.step_count) == 4
 
 
 def test_latent_action_interactions_do_not_form_zero_times_inf() -> None:
@@ -434,6 +678,43 @@ def test_trainable_encoder_learning_smoke_loss_decreases() -> None:
     early_loss = float(jnp.mean(result.prediction_errors[:quarter]))
     late_loss = float(jnp.mean(result.prediction_errors[-quarter:]))
     assert late_loss < early_loss
+
+
+@pytest.mark.unit
+def test_trainable_encoder_keeps_finite_wide_gradient_norm() -> None:
+    config = LatentWorldModelConfig(
+        observation_dim=8,
+        n_actions=2,
+        latent_dim=2,
+        hidden_sizes=(),
+        sparsity=0.0,
+        encoder_learning=True,
+        min_latent_std=0.0,
+        encoder_collapse_gate_threshold=1.0,
+    )
+    model = LatentWorldModel(config)
+    state = model.init(jr.key(0)).replace(
+        encoder_matrix=jnp.zeros((8, 2), dtype=jnp.float32),
+        encoder_bias=jnp.zeros((2,), dtype=jnp.float32),
+    )
+    observation = jnp.full((8,), 1.0e20, dtype=jnp.float32)
+    next_observation = jnp.zeros((8,), dtype=jnp.float32)
+
+    result = model.update(
+        state,
+        observation,
+        jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(0.99, dtype=jnp.float32),
+        next_observation,
+    )
+
+    assert bool(result.update_applied)
+    assert bool(result.encoder_update_applied)
+    assert bool(jnp.isfinite(result.encoder_gradient_norm))
+    assert float(result.encoder_gradient_norm) > 0.0
+    assert bool(jnp.all(jnp.isfinite(result.state.encoder_matrix)))
+    assert bool(jnp.any(result.state.encoder_matrix != state.encoder_matrix))
 
 
 @pytest.mark.unit
@@ -749,3 +1030,151 @@ def test_latent_world_model_init_rejects_nonfinite_encoder_draw() -> None:
 
     with pytest.raises(ValueError, match="encoder initialization"):
         model.init(jr.key(0))
+
+
+def test_latent_world_model_observation_scale_normalizes_without_floor() -> None:
+    """Observation scale below 1e-6 normalizes by exact configured scale."""
+    key = jr.key(42)
+    latents = []
+    for scale in (1.0, 1e-6, 1e-9, 1e-20):
+        config = LatentWorldModelConfig(
+            observation_dim=2,
+            latent_dim=4,
+            n_actions=2,
+            observation_scale=(scale, scale),
+        )
+        model = LatentWorldModel(config)
+        state = model.init(key)
+        obs = jnp.asarray([1.5 * scale, -0.75 * scale], dtype=jnp.float32)
+        latents.append(np.asarray(model.encode(state, obs)))
+
+    for i in range(1, len(latents)):
+        np.testing.assert_allclose(latents[i], latents[0], atol=1e-6)
+
+    # Subnormal scale whose float32 reciprocal overflows to inf must be rejected
+    subnormal = float(np.finfo(np.float32).smallest_subnormal)
+    with pytest.raises(ValueError, match="observation_scale"):
+        LatentWorldModelConfig(
+            observation_dim=1,
+            latent_dim=2,
+            n_actions=2,
+            observation_scale=(subnormal,),
+        )
+
+
+@pytest.mark.unit
+def test_absolute_next_latent_is_not_bounded_by_the_delta_clip() -> None:
+    """``max_latent_delta`` bounds a latent delta; it must not truncate absolute latents.
+
+    With ``predict_delta=False`` the training target built by ``targets`` is
+    ``encode(next_observation)`` with no ``max_latent_delta`` bound applied.
+    Clipping the same head to +/-``max_latent_delta`` at prediction time makes
+    the model structurally unable to return what it was trained to produce
+    whenever the encoded latent exceeds that bound, and reports a permanent
+    surprise on a transition the head has learned exactly.
+    """
+    config = LatentWorldModelConfig(
+        observation_dim=3,
+        n_actions=2,
+        latent_dim=4,
+        hidden_sizes=(),
+        step_size=0.2,
+        sparsity=0.0,
+        use_layer_norm=False,
+        encoder_scale=3.0,
+        predict_delta=False,
+        max_latent_delta=0.5,
+    )
+    model = LatentWorldModel(config)
+    state = model.init(jr.key(0))
+    observation = jnp.array([0.1, -0.2, 0.3], dtype=jnp.float32)
+    next_observation = jnp.array([0.9, -0.8, 0.7], dtype=jnp.float32)
+    action = jnp.array(1, dtype=jnp.int32)
+    reward = jnp.asarray(0.0, dtype=jnp.float32)
+    discount = jnp.asarray(0.99, dtype=jnp.float32)
+
+    target = np.asarray(model.encode(state, next_observation))
+    # The fixed tanh encoder must actually place the target outside the clip.
+    assert float(np.max(np.abs(target))) > config.max_latent_delta
+
+    for _ in range(600):
+        result = model.update(state, observation, action, reward, discount, next_observation)
+        state = result.state
+
+    prediction = model.predict(state, observation, action)
+    learned = np.asarray(prediction.raw_predictions)[: config.latent_dim]
+    next_latent = np.asarray(prediction.next_latent)
+
+    # The head really did learn the absolute target, so any gap is a decode bug.
+    np.testing.assert_allclose(learned, target, atol=1e-3)
+    np.testing.assert_allclose(next_latent, learned, atol=1e-6)
+    assert float(result.surprise) == pytest.approx(0.0, abs=1e-5)
+
+
+@pytest.mark.unit
+def test_delta_next_latent_remains_bounded_by_the_delta_clip() -> None:
+    """In delta mode the predicted step stays elementwise within ``max_latent_delta``."""
+    config = LatentWorldModelConfig(
+        observation_dim=3,
+        n_actions=2,
+        latent_dim=4,
+        hidden_sizes=(),
+        step_size=0.2,
+        sparsity=0.0,
+        use_layer_norm=False,
+        encoder_scale=3.0,
+        predict_delta=True,
+        max_latent_delta=0.5,
+    )
+    model = LatentWorldModel(config)
+    state = model.init(jr.key(0))
+    observation = jnp.array([0.1, -0.2, 0.3], dtype=jnp.float32)
+    next_observation = jnp.array([-0.9, 0.8, -0.7], dtype=jnp.float32)
+    action = jnp.array(1, dtype=jnp.int32)
+    reward = jnp.asarray(0.0, dtype=jnp.float32)
+    discount = jnp.asarray(0.99, dtype=jnp.float32)
+    for _ in range(200):
+        state = model.update(
+            state, observation, action, reward, discount, next_observation
+        ).state
+
+    prediction = model.predict(state, observation, action)
+    latent = np.asarray(prediction.latent)
+    raw = np.asarray(prediction.raw_predictions)[: config.latent_dim]
+    step = np.asarray(prediction.next_latent) - latent
+    assert float(np.max(np.abs(raw))) > config.max_latent_delta
+    assert float(np.max(np.abs(step))) <= config.max_latent_delta + 1e-6
+
+
+@pytest.mark.parametrize("disabled", [True, False])
+@pytest.mark.parametrize("value", [1.5e19, -1.5e19, 0.5, 1e-18, 2e19, float("nan")])
+def test_latent_update_surprise_reduction_preserves_finite_errors(
+    disabled: bool, value: float,
+) -> None:
+    import jax
+
+    model = LatentWorldModel(LatentWorldModelConfig(
+        observation_dim=2, n_actions=2, latent_dim=2, hidden_sizes=(),
+        step_size=1e-20, predict_delta=False,
+    ))
+    state = model.init(jr.key(0))
+    heads = state.learner_state.head_params
+    heads = heads.replace(
+        weights=tuple(jnp.zeros_like(w) for w in heads.weights),
+        biases=tuple(jnp.full_like(b, value if i < 2 else 0.0)
+                     for i, b in enumerate(heads.biases)),
+    )
+    state = state.replace(learner_state=state.learner_state.replace(head_params=heads))
+    observation = jnp.zeros(2, dtype=jnp.float32)
+    with jax.disable_jit(disabled):
+        result = model.update(
+            state, observation, jnp.int32(0), jnp.float32(0), jnp.float32(0), observation,
+        )
+    if math.isfinite(value) and abs(value) < 1.8e19:
+        assert bool(result.update_applied)
+        np.testing.assert_allclose(float(result.surprise), value**2, rtol=2e-6, atol=0)
+        assert int(result.state.step_count) == 1
+    else:
+        assert not bool(result.update_applied)
+        assert int(result.state.step_count) == 0
+        assert float(result.surprise) == 0.0

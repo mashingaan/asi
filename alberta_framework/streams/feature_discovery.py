@@ -45,21 +45,7 @@ _INT32_MAX = 2**31 - 1
 # ``streams.gauntlet``, ``core.sarsa``, ``core.average_reward``,
 # ``core.horde_actor_critic``).
 _FEATURE_DISCOVERY_LOOP_MAX_STEPS = 10_000
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 def _finite_real_and_float32(name: str, value: object) -> tuple[Real, int, int, float]:
@@ -485,9 +471,10 @@ def collect_feature_discovery_stream(
 
     Raises:
         ValueError: If ``num_steps`` is out of range, the output resource
-            total would overflow signed int32, or ``num_steps`` exceeds the
+            total would overflow signed int32, ``num_steps`` exceeds the
             documented scan-length ceiling
-            (``_FEATURE_DISCOVERY_LOOP_MAX_STEPS``).
+            (``_FEATURE_DISCOVERY_LOOP_MAX_STEPS``), or a concrete sample
+            overflows float32 under finite stream scales.
     """
     num_steps = _require_int("num_steps", num_steps, minimum=1, maximum=_INT32_MAX)
     if type(stream) not in (NonlinearFeatureDiscoveryStream, InteractionFeatureDiscoveryStream):
@@ -518,7 +505,25 @@ def collect_feature_discovery_stream(
     _, (observations, targets) = jax.lax.scan(
         step_fn, state, jnp.arange(num_steps, dtype=jnp.int32)
     )
+    finite = jnp.all(jnp.isfinite(observations)) & jnp.all(jnp.isfinite(targets))
+    if not isinstance(finite, jax.core.Tracer) and not bool(finite):
+        raise ValueError("collected feature-discovery samples must be finite")
     return observations, targets
+
+
+def _weighted_pair_product(weight: Array, left: Array, right: Array) -> Array:
+    # ``weight * (left * right)`` overflows when the raw pair exceeds float32,
+    # even though the three-factor product is finite and representable.
+    direct = weight * (left * right)
+    weight_mantissa, weight_exponent = jnp.frexp(weight)
+    left_mantissa, left_exponent = jnp.frexp(left)
+    right_mantissa, right_exponent = jnp.frexp(right)
+    stable = jnp.ldexp(
+        weight_mantissa * left_mantissa * right_mantissa,
+        weight_exponent + left_exponent + right_exponent,
+    )
+    use_stable = jnp.isfinite(stable) & ~jnp.isfinite(direct)
+    return jnp.where(use_stable, stable, direct)
 
 
 class InteractionFeatureDiscoveryStream:
@@ -761,7 +766,22 @@ class InteractionFeatureDiscoveryStream:
         interactions = x[state.pair_left] * x[state.pair_right]
         context_idx = (state.step_count // self._context_length) % self._n_contexts
         task_weights = state.context_weights[context_idx]
-        target = task_weights @ interactions + state.linear_weights @ x
+        direct_pair = task_weights @ interactions
+        stable_pair = jnp.sum(
+            _weighted_pair_product(
+                task_weights, x[state.pair_left], x[state.pair_right]
+            ),
+            axis=-1,
+        )
+        # A finite direct dot stays bit-exact. Replace it only when a raw
+        # pair overflowed and the scaled sum is finite.
+        use_stable = (
+            jnp.any(~jnp.isfinite(interactions))
+            & jnp.isfinite(stable_pair)
+            & ~jnp.isfinite(direct_pair)
+        )
+        pair_target = jnp.where(use_stable, stable_pair, direct_pair)
+        target = pair_target + state.linear_weights @ x
         noise = self._noise_std * jr.normal(k_noise, (self._n_tasks,), dtype=jnp.float32)
         target = target + noise
 

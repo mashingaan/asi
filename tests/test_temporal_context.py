@@ -1,6 +1,7 @@
 # mypy: disable-error-code="call-arg,untyped-decorator"
 """Tests for causal temporal/context features."""
 
+from collections.abc import Callable
 from typing import cast
 
 import chex
@@ -28,6 +29,26 @@ def test_temporal_context_shapes_and_roundtrip() -> None:
     chex.assert_shape(features, (13,))
     chex.assert_tree_all_finite(features)
     assert TemporalContextConfig.from_config(config.to_config()) == config
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda payload: payload.pop("type"),
+        lambda payload: payload.__setitem__("type", "WorkingMemoryConfig"),
+        lambda payload: payload.pop("ema_decay"),
+        lambda payload: payload.__setitem__("unexpected", 1),
+    ),
+    ids=("missing-type", "wrong-type", "missing-field", "extra-field"),
+)
+def test_temporal_context_config_loader_requires_exact_serialized_schema(
+    mutation: Callable[[dict[str, object]], object],
+) -> None:
+    payload = TemporalContextConfig(input_dim=3).to_config()
+    mutation(payload)
+
+    with pytest.raises(ValueError, match="TemporalContextConfig"):
+        TemporalContextConfig.from_config(payload)
 
 
 def test_temporal_context_step_is_causal() -> None:
@@ -170,6 +191,34 @@ def test_finite_temporal_context_path_is_bitwise_unchanged() -> None:
         expected_ema
     ).tobytes()
     assert int(next_state.step_count) == 18
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+def test_temporal_context_delta_overflow_fails_closed_in_eager_and_jit(
+    disable_jit: bool,
+) -> None:
+    featurizer = TemporalContextFeaturizer(
+        TemporalContextConfig(
+            input_dim=1,
+            include_raw=False,
+            include_ema=False,
+            include_delta=True,
+            periods=(),
+        )
+    )
+    limit = jnp.asarray(np.finfo(np.float32).max, dtype=jnp.float32)
+    state = TemporalContextState(
+        observation_ema=jnp.asarray([limit], dtype=jnp.float32),
+        step_count=jnp.asarray(0, dtype=jnp.int32),
+    )
+
+    with jax.disable_jit(disable_jit):
+        features = featurizer.features(
+            state,
+            jnp.asarray([-limit], dtype=jnp.float32),
+        )
+
+    chex.assert_trees_all_equal(features, jnp.zeros((1,), dtype=jnp.float32))
 
 
 def test_temporal_context_step_count_saturates_at_int32_max() -> None:
@@ -479,3 +528,38 @@ def test_temporal_context_rejects_spoofed_int_class_and_negative_ratios() -> Non
 
     with pytest.raises(ValueError, match="ema_decay"):
         TemporalContextConfig(input_dim=4, ema_decay=SpoofedIntFloat(0.5))
+
+
+@pytest.mark.parametrize("period", [50.0, 7.0, 0.75, 12.5])
+@pytest.mark.parametrize("step_count", [3, 10_000_000, 30_000_000, 2**31 - 1])
+def test_phase_code_stays_exact_across_the_int32_lifetime(
+    period: float, step_count: int
+) -> None:
+    """The float32 angle ``2*pi*t/p`` loses the phase once ``t`` exceeds 2**24."""
+    config = TemporalContextConfig(
+        input_dim=1, include_ema=False, include_delta=False, periods=(period,)
+    )
+    featurizer = TemporalContextFeaturizer(config)
+    state = featurizer.init().replace(step_count=jnp.asarray(step_count, dtype=jnp.int32))
+
+    features = np.asarray(featurizer.features(state, jnp.zeros(1, dtype=jnp.float32)))
+
+    f32_period = float(np.float32(period))
+    cycles = np.float64(step_count % f32_period) / f32_period
+    expected = np.asarray([np.sin(2.0 * np.pi * cycles), np.cos(2.0 * np.pi * cycles)])
+    np.testing.assert_allclose(features[1:], expected, rtol=0.0, atol=1e-4)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("value", [np.finfo(np.float32).tiny, -np.finfo(np.float32).tiny, 2.0])
+def test_temporal_ema_preserves_equal_input_fixed_point(compiled, value):
+    """Equal normal inputs must not vanish when weighted terms are subnormal."""
+    featurizer = TemporalContextFeaturizer(
+        TemporalContextConfig(input_dim=1, ema_decay=0.5, periods=())
+    )
+    observation = jnp.full((1,), value, dtype=jnp.float32)
+    state = featurizer.init().replace(observation_ema=observation)
+    with jax.disable_jit(not compiled):
+        updated = featurizer.update(state, observation)
+    np.testing.assert_array_equal(np.asarray(updated.observation_ema), np.asarray(observation))
+    assert int(updated.step_count) == 1

@@ -7,6 +7,17 @@ Both share the same linear-critic AC(lambda) semantics, separate eligibility
 traces, and pure single-step APIs compatible with ``jax.jit`` and
 ``jax.lax.scan``.
 
+For a transition from S_t to S_{t+1}, the supplied discount is gamma_{t+1}
+for the bootstrap. The prior accepted transition's discount, gamma_t, decays
+the accumulated actor and critic traces. A terminal reward therefore credits
+the completed episode before its stored traces are cleared.
+
+Both state types persist ``previous_discount``. Checkpoints made before that
+field existed cannot identify a variable-discount cursor and must not be
+silently migrated. Restore with a current ``agent.init()`` template: the generic
+checkpoint loader rejects the old leaf structure. Start a fresh state instead
+of guessing the missing discount from the current configuration.
+
 The Horde-backed critic integration point is the scalar ``value``/TD-error
 path in ``update``: replace the linear critic estimate and critic trace update
 with a GVF value adapter that preserves the actor's advantage signal. That
@@ -51,6 +62,35 @@ _ACTUAL_INT_TYPES = frozenset(
 _ACTUAL_REAL_TYPES = _ACTUAL_INT_TYPES | frozenset(
     {float, *(np.dtype(code).type for code in "efdg")}
 )
+
+
+def _temperature_scaled_logits(logits: Array, temperature: float) -> Array:
+    """Scale logits for softmax without exposing a rounded argmax to fusion.
+
+    XLA may recompute ``logits * (1 / temperature)`` inside both fused
+    subcomputations of a compiled ``jax.nn.softmax``/``jax.nn.log_softmax``.
+    The contracted multiply-then-subtract leaves a rounding residual at the
+    argmax instead of an exact zero; once ``|logits / temperature|`` is large
+    enough that residual drives the exponential to ``inf`` or ``0`` and a
+    finite input yields a NaN policy or a wrong sampled action
+    (SlopDotCash/asi#2886).
+
+    Both shifts below are exact (softmax and log-softmax are shift invariant),
+    and each blocks one of the two recomputations.  When the temperature
+    exceeds one, halving both operands first is equally exact and keeps the
+    pre-scale centering finite for opposite finite extreme logits whose
+    pairwise distance exceeds the float32 maximum — inputs where the plain
+    ``logits / temperature`` expression stays finite and must stay finite.
+    """
+    if temperature > 1.0:
+        # Halving both operands is exact and prevents centering opposite finite
+        # extremes from overflowing before a large temperature brings them in range.
+        logits = logits * 0.5
+        temperature *= 0.5
+    # Both shifts preserve softmax/log-softmax while keeping division in range.
+    centered = logits - jax.lax.stop_gradient(jnp.max(logits))
+    scaled = centered / temperature
+    return scaled - jax.lax.stop_gradient(jnp.max(scaled))
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -100,15 +140,15 @@ def _serialized_mapping(
 
 
 def _require_discrete_state_resources(n_actions: int, feature_dim: int) -> None:
-    state_scalars = 2 * n_actions * feature_dim + 3 * feature_dim + 2 * n_actions + 6
-    state_bytes = 8 * n_actions * feature_dim + 12 * feature_dim + 8 * n_actions + 24
+    state_scalars = 2 * n_actions * feature_dim + 3 * feature_dim + 2 * n_actions + 7
+    state_bytes = 8 * n_actions * feature_dim + 12 * feature_dim + 8 * n_actions + 28
     if state_scalars > _INT32_MAX or state_bytes > _INT32_MAX:
         raise ValueError("derived actor-critic state exceeds the signed-int32 budget")
 
 
 def _actor_critic_persistent_bytes(n_actions: int, feature_dim: int) -> int:
     """Named persist already counted inside ``_require_discrete_state_resources``."""
-    return 8 * n_actions * feature_dim + 12 * feature_dim + 8 * n_actions + 24
+    return 8 * n_actions * feature_dim + 12 * feature_dim + 8 * n_actions + 28
 
 
 def _actor_critic_update_result_extras_bytes(n_actions: int) -> int:
@@ -137,15 +177,15 @@ def _preflight_actor_critic_update_working_set(n_actions: int, feature_dim: int)
 
 
 def _require_continuous_state_resources(action_dim: int, feature_dim: int) -> None:
-    state_scalars = 2 * action_dim * feature_dim + 5 * action_dim + 3 * feature_dim + 5
-    state_bytes = 8 * action_dim * feature_dim + 20 * action_dim + 12 * feature_dim + 20
+    state_scalars = 2 * action_dim * feature_dim + 6 * action_dim + 3 * feature_dim + 6
+    state_bytes = 8 * action_dim * feature_dim + 24 * action_dim + 12 * feature_dim + 24
     if state_scalars > _INT32_MAX or state_bytes > _INT32_MAX:
         raise ValueError("derived continuous actor-critic state exceeds the signed-int32 budget")
 
 
 def _continuous_actor_critic_persistent_bytes(action_dim: int, feature_dim: int) -> int:
     """Named persist already counted inside ``_require_continuous_state_resources``."""
-    return 8 * action_dim * feature_dim + 20 * action_dim + 12 * feature_dim + 20
+    return 8 * action_dim * feature_dim + 24 * action_dim + 12 * feature_dim + 24
 
 
 def _continuous_actor_critic_update_result_extras_bytes(action_dim: int) -> int:
@@ -190,8 +230,8 @@ def _require_discrete_scan_resources(
     # the remaining terms cover every matrix/vector-width gradient, trace,
     # step, policy, selection, and scalar temporary. Charging every temporary
     # as four bytes also upper-bounds int32, uint32, and bool predicates.
-    state_scalars = 2 * n_actions * feature_dim + 3 * feature_dim + 2 * n_actions + 6
-    state_bytes = 8 * n_actions * feature_dim + 12 * feature_dim + 8 * n_actions + 24
+    state_scalars = 2 * n_actions * feature_dim + 3 * feature_dim + 2 * n_actions + 7
+    state_bytes = 8 * n_actions * feature_dim + 12 * feature_dim + 8 * n_actions + 28
     input_scalars = num_steps * (2 * feature_dim + 4)
     input_bytes = num_steps * (8 * feature_dim + 13)
     output_scalars = num_steps * (n_actions + 4)
@@ -219,8 +259,8 @@ def _require_continuous_scan_resources(
     # This is the continuous analogue of _require_discrete_scan_resources:
     # action inputs and action/mean/sigma outputs have action_dim width, while
     # the reusable workspace includes Gaussian-policy gradients and samples.
-    state_scalars = 2 * action_dim * feature_dim + 5 * action_dim + 3 * feature_dim + 5
-    state_bytes = 8 * action_dim * feature_dim + 20 * action_dim + 12 * feature_dim + 20
+    state_scalars = 2 * action_dim * feature_dim + 6 * action_dim + 3 * feature_dim + 6
+    state_bytes = 8 * action_dim * feature_dim + 24 * action_dim + 12 * feature_dim + 24
     input_scalars = num_steps * (2 * feature_dim + action_dim + 3)
     input_bytes = num_steps * (8 * feature_dim + 4 * action_dim + 9)
     output_scalars = num_steps * (3 * action_dim + 3)
@@ -269,6 +309,28 @@ def _trusted_shape(name: str, value: object) -> tuple[int, ...]:
     return tuple(cast(Array, value).shape)
 
 
+def _require_concrete_finite(name: str, array: Array) -> Array:
+    """Reject non-finite values at an eager public boundary.
+
+    ``start`` is the only public path that commits an observation into
+    persistent state without a runtime gate, so a non-finite value accepted
+    there would poison ``last_observation`` and permanently reject every
+    later update through the state-finiteness gate. Traced inputs pass
+    through: under ``jax.jit`` or ``scan`` tracing the runtime update-side
+    finiteness gates remain authoritative.
+    """
+    if not isinstance(array, jax.core.Tracer) and not bool(jnp.all(jnp.isfinite(array))):
+        raise ValueError(f"{name} must contain only finite values")
+    return array
+
+
+def _require_concrete_finite_tree(name: str, tree: object) -> None:
+    """Reject a non-finite result tree at an eager public boundary."""
+    valid = _floating_tree_is_finite(tree)
+    if not isinstance(valid, jax.core.Tracer) and not bool(valid):
+        raise ValueError(f"{name} must contain only finite values")
+
+
 def _checked_terminated(name: str, value: object) -> Array:
     """Validate a ``terminated`` flag array dtype before boolean coercion."""
     actual_type = type(value)
@@ -314,14 +376,16 @@ def _validated_bounder_result(
 
 
 def _require_key(key: object) -> Array:
-    if not isinstance(key, jax.Array):
-        raise ValueError("key must be a Threefry JAX key")
+    """Require one typed scalar Threefry key; reject legacy raw uint32 words."""
+    if not isinstance(key, jax.Array) or tuple(key.shape) != ():
+        raise ValueError("key must be a typed scalar Threefry JAX key")
     try:
+        implementation = str(jr.key_impl(cast(Any, key)))
         data = jr.key_data(cast(Any, key))
     except Exception as error:
-        raise ValueError("key must be a Threefry JAX key") from error
-    if data.shape != (2,) or data.dtype != jnp.uint32:
-        raise ValueError("key must be a Threefry JAX key")
+        raise ValueError("key must be a typed scalar Threefry JAX key") from error
+    if implementation != "threefry2x32" or data.shape != (2,) or data.dtype != jnp.uint32:
+        raise ValueError("key must be a typed scalar Threefry JAX key")
     return key
 
 
@@ -449,6 +513,8 @@ class ActorCriticState:
         last_observation: Previous observation ``s_t``.
         last_action: Previous action ``a_t``.
         rng_key: Random key used for action sampling.
+        previous_discount: Discount into the current state, from the prior
+            accepted transition. Initialized to config.gamma with zero traces.
         step_count: Number of update steps taken.
     """
 
@@ -463,6 +529,7 @@ class ActorCriticState:
     last_observation: Float[Array, " feature_dim"]
     last_action: Int[Array, ""]
     rng_key: Array
+    previous_discount: Float[Array, ""]
     step_count: Int[Array, ""]
 
 
@@ -515,6 +582,21 @@ class ActorCriticArrayResult:
     updates_applied: Bool[Array, " num_steps"]
 
 
+def _finite_cancelled_td(reward: Array, bootstrap: Array, prediction: Array) -> Array:
+    """Keep ``(reward + bootstrap) - prediction`` unless that sum overflows.
+
+    When the reward and the bootstrap are both huge, their sum can leave
+    float32 before the current prediction cancels the bootstrap. The
+    rearranged error ``reward + (bootstrap - prediction)`` can still be
+    finite. A TD error that remains outside float32 stays non-finite so the
+    caller rejects the update.
+    """
+    direct_partial = reward + bootstrap
+    direct_td = direct_partial - prediction
+    recovered_td = reward + (bootstrap - prediction)
+    return jnp.where(jnp.isfinite(direct_partial), direct_td, recovered_td)
+
+
 class ActorCriticAgent:
     """Linear actor-critic agent with a discrete softmax policy.
 
@@ -524,7 +606,7 @@ class ActorCriticAgent:
 
     The implemented objective is the continuing or episodic AC(lambda)
     semi-gradient update. For transition ``S_t, A_t, R_{t+1}, S_{t+1}``, the
-    critic forms ``delta_t = R_{t+1} + gamma_t V(S_{t+1}) - V(S_t)`` and
+    critic forms ``delta_t = R_{t+1} + gamma_{t+1} V(S_{t+1}) - V(S_t)`` and
     updates value parameters along accumulating traces
     ``e^v_t = gamma_t lambda_v e^v_{t-1} + grad V(S_t)``. The actor updates
     linear softmax logits in the policy-gradient direction
@@ -616,6 +698,7 @@ class ActorCriticAgent:
             last_observation=jnp.zeros((feature_dim,), dtype=jnp.float32),
             last_action=jnp.array(-1, dtype=jnp.int32),
             rng_key=key,
+            previous_discount=jnp.array(self._config.gamma, dtype=jnp.float32),
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
@@ -639,7 +722,7 @@ class ActorCriticAgent:
             leaf = getattr(state, name)
             if leaf.shape != (feature_dim,) or leaf.dtype != jnp.float32:
                 raise ValueError(f"state.{name} must have shape ({feature_dim},) and dtype float32")
-        for name in ("critic_bias", "critic_trace_bias"):
+        for name in ("critic_bias", "critic_trace_bias", "previous_discount"):
             leaf = getattr(state, name)
             if leaf.shape != () or leaf.dtype != jnp.float32:
                 raise ValueError(f"state.{name} must be a scalar float32")
@@ -662,7 +745,7 @@ class ActorCriticAgent:
         """Compute softmax action probabilities for one observation."""
         observation = self._observation(state, observation)
         logits = state.actor_weights @ observation + state.actor_bias
-        return jax.nn.softmax(logits / self._config.temperature)
+        return jax.nn.softmax(_temperature_scaled_logits(logits, self._config.temperature))
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def value(self, state: ActorCriticState, observation: Array) -> Float[Array, ""]:
@@ -670,13 +753,16 @@ class ActorCriticAgent:
         observation = self._observation(state, observation)
         return jnp.dot(state.critic_weights, observation) + state.critic_bias
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def select_action(
         self,
         state: ActorCriticState,
         observation: Array,
     ) -> tuple[Int[Array, ""], Array, Float[Array, " n_actions"]]:
         """Sample one action from the current softmax policy.
+
+        A concrete non-finite distribution is rejected: categorical sampling
+        would otherwise return an arbitrary action from it. Traced values
+        pass through to the update-side runtime gates.
 
         Args:
             state: Current agent state.
@@ -685,20 +771,54 @@ class ActorCriticAgent:
         Returns:
             Tuple ``(action, new_rng_key, probabilities)``.
         """
+        result = self._select_action(state, observation)
+        _require_concrete_finite_tree("actor-critic action selection", result)
+        return result  # type: ignore[no-any-return]
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _select_action(
+        self,
+        state: ActorCriticState,
+        observation: Array,
+    ) -> tuple[Int[Array, ""], Array, Float[Array, " n_actions"]]:
+        """Jitted implementation of one softmax action draw."""
         observation = self._observation(state, observation)
         key, sample_key = jr.split(state.rng_key)
         probs = self.policy(state, observation)
-        action = jr.categorical(sample_key, jnp.log(jnp.maximum(probs, 1e-8))).astype(jnp.int32)
+        action = jr.categorical(
+            sample_key,
+            jnp.log(probs),
+            mode="high",
+        ).astype(jnp.int32)
         return action, key, probs
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def start(
         self,
         state: ActorCriticState,
         observation: Array,
     ) -> tuple[ActorCriticState, Int[Array, ""], Float[Array, " n_actions"]]:
-        """Select and store the first action for a new stream or episode."""
-        observation = self._observation(state, observation)
+        """Select and store the first action for a new stream or episode.
+
+        The observation and completed transaction are validated eagerly at
+        this state-committing boundary: a non-finite input would poison
+        ``last_observation``, while finite inputs can still overflow policy
+        arithmetic and publish a non-finite distribution. Traced values pass
+        through to the update-side runtime gates.
+        """
+        observation = _require_concrete_finite(
+            "observation", self._observation(state, observation)
+        )
+        result = self._start(state, observation)
+        _require_concrete_finite_tree("actor-critic start result", result)
+        return result  # type: ignore[no-any-return]
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _start(
+        self,
+        state: ActorCriticState,
+        observation: Array,
+    ) -> tuple[ActorCriticState, Int[Array, ""], Float[Array, " n_actions"]]:
+        """Jitted implementation of one checked episode start."""
         action, key, probs = self.select_action(state, observation)
         new_state = state.replace(  # type: ignore[attr-defined]
             last_observation=observation,
@@ -730,9 +850,10 @@ class ActorCriticAgent:
             terminated: Backward-compatible scalar terminal flag. Non-zero
                 maps to transition discount ``0``; false maps to
                 ``config.gamma``. Ignored when ``discount`` is provided.
-            discount: Optional scalar per-transition discount ``gamma_t``.
+            discount: Optional scalar bootstrap discount ``gamma_{t+1}``.
                 Use this for continuing logs, variable discounts, time-limit
                 truncation semantics, and pre-collected trajectories.
+                Traces decay on the prior accepted transition's discount.
 
         Returns:
             ``ActorCriticUpdateResult`` containing the updated state and metrics.
@@ -758,14 +879,14 @@ class ActorCriticAgent:
         discount = jnp.asarray(discount, dtype=jnp.float32)
         # Terminal 0 * inf V(s') is NaN and would freeze the critic.
         bootstrap = jnp.where(discount == 0.0, jnp.zeros_like(next_value), discount * next_value)
-        td_error = reward + bootstrap - value
+        td_error = _finite_cancelled_td(reward, bootstrap, value)
 
         one_hot = jax.nn.one_hot(action, cfg.n_actions, dtype=jnp.float32)
         actor_grad_bias = (one_hot - old_policy) / cfg.temperature
         actor_grad_weights = actor_grad_bias[:, None] * prev_obs[None, :]
 
-        actor_decay = discount * cfg.actor_lamda
-        critic_decay = discount * cfg.critic_lamda
+        actor_decay = state.previous_discount * cfg.actor_lamda
+        critic_decay = state.previous_discount * cfg.critic_lamda
         actor_trace_weights = (
             jnp.where(
                 actor_decay == 0.0,
@@ -853,6 +974,7 @@ class ActorCriticAgent:
             actor_trace_bias=stored_actor_trace_bias,
             critic_trace_weights=stored_critic_trace_weights,
             critic_trace_bias=stored_critic_trace_bias,
+            previous_discount=discount,
             step_count=jnp.minimum(state.step_count, _INT32_MAX - 1) + 1,
         )
         # Reject the complete transition if its inputs or proposed persistent
@@ -864,6 +986,8 @@ class ActorCriticAgent:
             & jnp.isfinite(discount)
             & (discount >= 0.0)
             & (discount <= 1.0)
+            & (state.previous_discount >= 0.0)
+            & (state.previous_discount <= 1.0)
             & (action >= 0)
             & (action < cfg.n_actions)
             & jnp.all(jnp.isfinite(old_policy))
@@ -909,7 +1033,7 @@ class ActorCriticAgent:
             action=jnp.where(
                 params_ok,
                 next_action,
-                jnp.asarray(0, dtype=jnp.int32),
+                state.last_action,
             ),
             policy=jnp.where(params_ok, next_policy, jnp.zeros_like(next_policy)),
             value=jnp.where(params_ok, value, zero),
@@ -1038,8 +1162,12 @@ def run_actor_critic_from_arrays(
             lambda: carry,
         )
         return next_carry, (
+            # The action for this row was selected (or supplied) even when
+            # the learning update is rejected; only an invalid action
+            # itself falls back to 0. Reporting 0 for a valid action would
+            # falsify the recorded trajectory.
             jnp.where(
-                update_applied,
+                fixed_action_valid,
                 current_action,
                 jnp.asarray(0, dtype=jnp.int32),
             ),
@@ -1225,8 +1353,18 @@ class ContinuousActorCriticState:
         critic_trace_weights: Trace for critic weights.
         critic_trace_bias: Trace for critic bias.
         last_observation: Previous observation ``s_t``.
-        last_action: Previous (continuous) action vector ``a_t``.
+        last_action: Previous (continuous) action vector ``a_t`` as executed,
+            i.e. after any ``[action_low, action_high]`` clipping.
+        last_sample: The Gaussian sample that produced ``last_action``, before
+            clipping. The policy-gradient score is evaluated here: the actor
+            distribution is ``N(mu, sigma^2)``, so scoring the clipped action
+            breaks ``E[grad log pi] = 0`` and drifts the mean away from any
+            active bound under a reward that carries no policy information.
+            Equals ``last_action`` when no bound is active or when a caller
+            supplies a fixed action.
         rng_key: Random key used for action sampling.
+        previous_discount: Discount into the current state, from the prior
+            accepted transition. Initialized to config.gamma with zero traces.
         step_count: Number of update steps taken.
     """
 
@@ -1242,7 +1380,9 @@ class ContinuousActorCriticState:
     critic_trace_bias: Float[Array, ""]
     last_observation: Float[Array, " feature_dim"]
     last_action: Float[Array, " action_dim"]
+    last_sample: Float[Array, " action_dim"]
     rng_key: Array
+    previous_discount: Float[Array, ""]
     step_count: Int[Array, ""]
 
 
@@ -1404,7 +1544,9 @@ class ContinuousActorCriticAgent:
             critic_trace_bias=jnp.array(0.0, dtype=jnp.float32),
             last_observation=jnp.zeros((feature_dim,), dtype=jnp.float32),
             last_action=jnp.zeros((cfg.action_dim,), dtype=jnp.float32),
+            last_sample=jnp.zeros((cfg.action_dim,), dtype=jnp.float32),
             rng_key=key,
+            previous_discount=jnp.array(cfg.gamma, dtype=jnp.float32),
             step_count=jnp.array(0, dtype=jnp.int32),
         )
 
@@ -1426,6 +1568,7 @@ class ContinuousActorCriticAgent:
             "mean_trace_bias",
             "log_sigma_trace",
             "last_action",
+            "last_sample",
         ):
             leaf = getattr(state, name)
             if leaf.shape != (action_dim,) or leaf.dtype != jnp.float32:
@@ -1434,7 +1577,7 @@ class ContinuousActorCriticAgent:
             leaf = getattr(state, name)
             if leaf.shape != (feature_dim,) or leaf.dtype != jnp.float32:
                 raise ValueError(f"state.{name} must have shape ({feature_dim},) and dtype float32")
-        for name in ("critic_bias", "critic_trace_bias"):
+        for name in ("critic_bias", "critic_trace_bias", "previous_discount"):
             leaf = getattr(state, name)
             if leaf.shape != () or leaf.dtype != jnp.float32:
                 raise ValueError(f"state.{name} must be a scalar float32")
@@ -1476,7 +1619,6 @@ class ContinuousActorCriticAgent:
         high = jnp.inf if cfg.action_high is None else cfg.action_high
         return jnp.clip(action, low, high)
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def select_action(
         self,
         state: ContinuousActorCriticState,
@@ -1489,6 +1631,10 @@ class ContinuousActorCriticAgent:
     ]:
         """Sample one action from the current Gaussian policy.
 
+        A concrete non-finite policy is rejected: action clipping would
+        otherwise hide an infinite mean or sample behind a finite action.
+        Traced values pass through to the update-side runtime gates.
+
         Args:
             state: Current agent state.
             observation: Input feature vector.
@@ -1497,15 +1643,38 @@ class ContinuousActorCriticAgent:
             Tuple ``(action, new_rng_key, mean, sigma)`` where ``action`` is
             optionally clipped to the configured action bounds.
         """
+        action, sample, key, mean, sigma = self._sample_action(state, observation)
+        _require_concrete_finite_tree(
+            "continuous actor-critic action selection", (action, sample, mean, sigma)
+        )
+        return action, key, mean, sigma
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _sample_action(
+        self,
+        state: ContinuousActorCriticState,
+        observation: Array,
+    ) -> tuple[
+        Float[Array, " action_dim"],
+        Float[Array, " action_dim"],
+        Array,
+        Float[Array, " action_dim"],
+        Float[Array, " action_dim"],
+    ]:
+        """Sample ``(clipped_action, gaussian_sample, new_rng_key, mean, sigma)``.
+
+        The executed action is the clipped sample; the unclipped sample is
+        what the policy actually drew and therefore what its score must be
+        evaluated at.
+        """
         observation = self._observation(state, observation)
         key, sample_key = jr.split(state.rng_key)
         mean, sigma = self.policy_params(state, observation)
         noise = jr.normal(sample_key, shape=mean.shape, dtype=jnp.float32)
-        raw_action = mean + sigma * noise
-        action = self._maybe_clip_action(raw_action)
-        return action, key, mean, sigma
+        sample = mean + sigma * noise
+        action = self._maybe_clip_action(sample)
+        return action, sample, key, mean, sigma
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def start(
         self,
         state: ContinuousActorCriticState,
@@ -1516,12 +1685,38 @@ class ContinuousActorCriticAgent:
         Float[Array, " action_dim"],
         Float[Array, " action_dim"],
     ]:
-        """Select and store the first action for a new stream or episode."""
-        observation = self._observation(state, observation)
-        action, key, mean, sigma = self.select_action(state, observation)
+        """Select and store the first action for a new stream or episode.
+
+        The observation and completed transaction are validated eagerly at
+        this state-committing boundary, matching the discrete agent's start
+        contract: finite inputs can still overflow the Gaussian mean and hide
+        a non-finite raw sample behind a clipped action. Traced values pass
+        through to the update-side runtime gates.
+        """
+        observation = _require_concrete_finite(
+            "observation", self._observation(state, observation)
+        )
+        result = self._start(state, observation)
+        _require_concrete_finite_tree("continuous actor-critic start result", result)
+        return result  # type: ignore[no-any-return]
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _start(
+        self,
+        state: ContinuousActorCriticState,
+        observation: Array,
+    ) -> tuple[
+        ContinuousActorCriticState,
+        Float[Array, " action_dim"],
+        Float[Array, " action_dim"],
+        Float[Array, " action_dim"],
+    ]:
+        """Jitted implementation of one checked episode start."""
+        action, sample, key, mean, sigma = self._sample_action(state, observation)
         new_state = state.replace(  # type: ignore[attr-defined]
             last_observation=observation,
             last_action=action,
+            last_sample=sample,
             rng_key=key,
         )
         return new_state, action, mean, sigma
@@ -1549,7 +1744,8 @@ class ContinuousActorCriticAgent:
             terminated: Backward-compatible scalar terminal flag. Non-zero
                 maps to transition discount ``0``; false maps to
                 ``config.gamma``. Ignored when ``discount`` is provided.
-            discount: Optional scalar per-transition discount ``gamma_t``.
+            discount: Optional scalar bootstrap discount ``gamma_{t+1}``.
+                Traces decay on the prior accepted transition's discount.
 
         Returns:
             ``ContinuousActorCriticUpdateResult`` containing the updated state.
@@ -1562,7 +1758,9 @@ class ContinuousActorCriticAgent:
             discount = _array("discount", discount, (), jnp.float32)
         cfg = self._config
         prev_obs = state.last_observation
-        action = state.last_action
+        # Score the Gaussian sample, not the clipped action that was executed:
+        # the policy is N(mu, sigma^2) and clip(a) is not a draw from it.
+        sample = state.last_sample
 
         prev_mean, prev_sigma = self.policy_params(state, prev_obs)
         value = self.value(state, prev_obs)
@@ -1575,19 +1773,22 @@ class ContinuousActorCriticAgent:
         discount = jnp.asarray(discount, dtype=jnp.float32)
         # Terminal 0 * inf V(s') is NaN and would freeze the critic.
         bootstrap = jnp.where(discount == 0.0, jnp.zeros_like(next_value), discount * next_value)
-        td_error = reward + bootstrap - value
+        td_error = _finite_cancelled_td(reward, bootstrap, value)
 
-        sigma_sq = prev_sigma * prev_sigma + 1e-8
-        diff = action - prev_mean
+        diff = sample - prev_mean
         # Gaussian score function (per-dimension):
         #   grad log pi w.r.t. mean   = diff / sigma^2
         #   grad log pi w.r.t. log_sigma = diff^2 / sigma^2 - 1
-        mean_grad_bias = diff / sigma_sq
+        # Standardize first: squaring sigma can underflow/overflow even when
+        # both scores are representable. A fixed variance floor would change
+        # the policy gradient and can reverse the log-sigma update's sign.
+        standardized_diff = diff / prev_sigma
+        mean_grad_bias = standardized_diff / prev_sigma
         mean_grad_weights = mean_grad_bias[:, None] * prev_obs[None, :]
-        log_sigma_grad = (diff * diff) / sigma_sq - 1.0
+        log_sigma_grad = standardized_diff * standardized_diff - 1.0
 
-        actor_decay = discount * cfg.actor_lamda
-        critic_decay = discount * cfg.critic_lamda
+        actor_decay = state.previous_discount * cfg.actor_lamda
+        critic_decay = state.previous_discount * cfg.critic_lamda
         mean_trace_weights = (
             jnp.where(
                 actor_decay == 0.0,
@@ -1694,6 +1895,7 @@ class ContinuousActorCriticAgent:
             log_sigma_trace=stored_log_sigma_trace,
             critic_trace_weights=stored_critic_trace_weights,
             critic_trace_bias=stored_critic_trace_bias,
+            previous_discount=discount,
             step_count=jnp.minimum(state.step_count, _INT32_MAX - 1) + 1,
         )
         inputs_valid = (
@@ -1703,6 +1905,8 @@ class ContinuousActorCriticAgent:
             & jnp.isfinite(discount)
             & (discount >= 0.0)
             & (discount <= 1.0)
+            & (state.previous_discount >= 0.0)
+            & (state.previous_discount <= 1.0)
             & jnp.all(jnp.isfinite(prev_mean))
             & jnp.all(jnp.isfinite(prev_sigma))
             & jnp.isfinite(value)
@@ -1720,10 +1924,13 @@ class ContinuousActorCriticAgent:
             lambda: state,
         )
         safe_observation = jnp.where(candidate_ok, observation, state.last_observation)
-        next_action, key, next_mean, next_sigma = self.select_action(held, safe_observation)
+        next_action, next_sample, key, next_mean, next_sigma = self._sample_action(
+            held, safe_observation
+        )
         proposed_final_state = held.replace(
             last_observation=observation,
             last_action=next_action,
+            last_sample=next_sample,
             rng_key=key,
         )
         bound_metric = actor_metric / 2.0 + critic_metric / 2.0
@@ -1731,6 +1938,7 @@ class ContinuousActorCriticAgent:
             candidate_ok
             & _floating_tree_is_finite(proposed_final_state)
             & jnp.all(jnp.isfinite(next_action))
+            & jnp.all(jnp.isfinite(next_sample))
             & jnp.all(jnp.isfinite(next_mean))
             & jnp.all(jnp.isfinite(next_sigma))
             & jnp.isfinite(bound_metric)
@@ -1744,7 +1952,7 @@ class ContinuousActorCriticAgent:
 
         return ContinuousActorCriticUpdateResult(  # type: ignore[call-arg]
             state=new_state,
-            action=jnp.where(params_ok, next_action, jnp.zeros_like(next_action)),
+            action=jnp.where(params_ok, next_action, state.last_action),
             mean=jnp.where(params_ok, next_mean, jnp.zeros_like(next_mean)),
             sigma=jnp.where(params_ok, next_sigma, jnp.zeros_like(next_sigma)),
             value=jnp.where(params_ok, value, zero),
@@ -1846,6 +2054,7 @@ def run_continuous_actor_critic_from_arrays(
             started_state = carry.replace(  # type: ignore[attr-defined]
                 last_observation=obs,
                 last_action=fixed_action.astype(jnp.float32),
+                last_sample=fixed_action.astype(jnp.float32),
             )
             current_action = fixed_action.astype(jnp.float32)
             current_mean, current_sigma = agent.policy_params(started_state, obs)
@@ -1863,7 +2072,15 @@ def run_continuous_actor_critic_from_arrays(
             lambda: carry,
         )
         return next_carry, (
-            jnp.where(result.update_applied, current_action, jnp.zeros_like(current_action)),
+            # The action for this row was selected (or supplied) even when
+            # the learning update is rejected; only a non-finite action
+            # itself falls back to zeros. Reporting zeros for a valid
+            # action would falsify the recorded trajectory.
+            jnp.where(
+                jnp.all(jnp.isfinite(current_action)),
+                current_action,
+                jnp.zeros_like(current_action),
+            ),
             jnp.where(result.update_applied, current_mean, jnp.zeros_like(current_mean)),
             jnp.where(result.update_applied, current_sigma, jnp.zeros_like(current_sigma)),
             result.value,

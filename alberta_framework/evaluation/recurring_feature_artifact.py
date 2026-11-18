@@ -33,12 +33,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from statistics import NormalDist
 from typing import NoReturn
 
 import jax
 import numpy as np
 
+from alberta_framework._bounded_containers import require_json_text_nesting
 from alberta_framework.recurring_feature_gate import (
     CRITICAL_TASKS,
     DEVELOPMENT_SEEDS,
@@ -57,6 +57,7 @@ from alberta_framework.recurring_feature_gate import (
 )
 
 SCHEMA_VERSION = "alberta.recurring_feature_evidence.v1"
+_MAX_JSON_NESTING_DEPTH = 64
 PROTOCOL_VERSION = "recurring-pair-feature-active-bank-aba.v1"
 DIGEST_ALGORITHM = "sha256"
 DIGEST_SCOPE = "$.scientific_payload"
@@ -64,6 +65,10 @@ CANONICALIZATION = "utf8-json-sort-keys-compact-no-nan"
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 BOOTSTRAP_SEED = 2_026_073_002
+# Exact, separately-rounded AS241 value for inv_cdf(0.975).  Do not obtain
+# this through statistics.NormalDist: its C accelerator may contract Horner
+# multiply-adds on FMA-capable hosts and return the adjacent lower float.
+_WILSON_95_Z_SCORE = float.fromhex("0x1.f5c0331eeff82p+0")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_PATHS = (
@@ -430,7 +435,7 @@ def wilson_score_interval(successes: int, sample_size: int) -> dict[str, object]
     if sample_size < 1 or not 0 <= successes <= sample_size:
         raise ValueError("invalid Wilson interval counts")
     proportion = successes / sample_size
-    z_score = NormalDist().inv_cdf(0.5 + BOOTSTRAP_CONFIDENCE_LEVEL / 2.0)
+    z_score = _WILSON_95_Z_SCORE
     z_squared = z_score**2
     denominator = 1.0 + z_squared / sample_size
     center = (proportion + z_squared / (2.0 * sample_size)) / denominator
@@ -877,12 +882,21 @@ def _reject_duplicate_keys(
 def load_recurring_feature_artifact(path: Path) -> dict[str, object]:
     """Load strict JSON and require a top-level object."""
 
-    parsed = json.loads(
-        path.read_text(encoding="utf-8"),
-        parse_constant=_reject_nonstandard_json_constant,
-        parse_float=_parse_finite_json_float,
-        object_pairs_hook=_reject_duplicate_keys,
+    text = path.read_text(encoding="utf-8")
+    require_json_text_nesting(
+        text,
+        max_depth=_MAX_JSON_NESTING_DEPTH,
+        name="evidence artifact",
     )
+    try:
+        parsed = json.loads(
+            text,
+            parse_constant=_reject_nonstandard_json_constant,
+            parse_float=_parse_finite_json_float,
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except RecursionError as exc:
+        raise ValueError("evidence artifact exceeds the JSON nesting limit") from exc
     if not isinstance(parsed, dict):
         raise ValueError("evidence artifact must be a JSON object")
     return parsed
@@ -904,7 +918,10 @@ def _mapping(
 def _finite_number(value: object) -> float | None:
     if type(value) is bool or (type(value) is not int and type(value) is not float):
         return None
-    numeric = float(value)
+    try:
+        numeric = float(value)
+    except OverflowError:
+        return None
     return numeric if math.isfinite(numeric) else None
 
 

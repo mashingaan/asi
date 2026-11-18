@@ -34,6 +34,8 @@ assert meta["epoch"] == 1
 """
 
 import json
+import os
+import stat as stat_module
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -43,7 +45,11 @@ import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
 
-from alberta_framework._bounded_containers import require_bounded_container_tree
+from alberta_framework._bounded_containers import (
+    require_bounded_container_tree,
+    require_json_text_nesting,
+)
+from alberta_framework._strict_json import load_strict_json_object_from_text
 
 # Stamped into checkpoint metadata on save, but deliberately NOT validated on
 # load: compatibility is enforced structurally instead, by restoring into the
@@ -59,6 +65,10 @@ _EMPTY_ARRAYS_KEY = "_empty_array_leaves"
 # on a 10_000-deep metadata nest and cannot reject it as ValueError.
 _JSON_MAX_DEPTH = 32
 _JSON_MAX_NODES = 4096
+# Orbax JsonRestore json.loads the on-disk metadata file with no nest
+# preflight. Origin RecursionErrors a 16_000-deep object nest.
+_JSON_MAX_BYTES = 16 * 1024 * 1024
+_ON_DISK_METADATA_NAME = "metadata"
 
 
 def _is_empty_array(value: object) -> bool:
@@ -134,6 +144,45 @@ def _restore_empty_arrays(template: Any, restored: Any, manifest: object) -> Any
     )
 
 
+def _validate_restore_template(path: Path, template: Any) -> None:
+    """Reject shape or explicit array-dtype conversion before Orbax restore."""
+
+    saved_tree = ocp.StandardCheckpointHandler().metadata(path / "state").tree
+    saved_leaves = jax.tree.leaves(saved_tree)
+    # Orbax records the saved tree in its serialized form, where NamedTuple
+    # fields are keyed and ordered by name. Serialize the template the same
+    # way so leaves pair by key path rather than by NamedTuple field order.
+    template_leaves = jax.tree.leaves(ocp.tree.serialize_tree(template))
+    if len(saved_leaves) != len(template_leaves):
+        raise ValueError("checkpoint state leaf count does not match the restore template")
+
+    for index, (saved, expected) in enumerate(
+        zip(saved_leaves, template_leaves, strict=True)
+    ):
+        if hasattr(expected, "shape") and hasattr(expected, "dtype"):
+            if jnp.issubdtype(expected.dtype, jax.dtypes.prng_key):
+                key_data = jax.random.key_data(expected)
+                expected_shape = tuple(key_data.shape)
+                expected_dtype = str(key_data.dtype)
+            else:
+                expected_shape = tuple(expected.shape)
+                expected_dtype = str(expected.dtype)
+        else:
+            expected_array = np.asarray(expected)
+            expected_shape = expected_array.shape
+            expected_dtype = None
+        saved_shape = tuple(saved.shape)
+        saved_dtype = str(saved.dtype)
+        if saved_shape != expected_shape or (
+            expected_dtype is not None and saved_dtype != expected_dtype
+        ):
+            raise ValueError(
+                f"checkpoint state leaf {index} has shape {saved_shape} and dtype "
+                f"{saved_dtype}; restore template requires shape {expected_shape} and "
+                f"dtype {expected_dtype or 'its scalar type'}"
+            )
+
+
 def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
     if not issubclass(type(payload), Mapping):
         raise ValueError(f"{name} must be a mapping")
@@ -148,9 +197,9 @@ def _copy_mapping(payload: object, *, name: str) -> dict[str, Any]:
 
 def _require_path(value: object, *, name: str = "checkpoint path") -> Path:
     if type(value) is str:
-        return Path(value)
+        return Path(value).absolute()
     if isinstance(value, Path) and type(value).__module__.startswith("pathlib"):
-        return Path(value)
+        return Path(value).absolute()
     raise ValueError(f"{name} must be an exact str or Path")
 
 
@@ -160,6 +209,120 @@ def _json_children(value: object) -> Iterable[object] | None:
     if type(value) is dict:
         return cast(dict[object, object], value).values()
     return None
+
+
+def _on_disk_metadata_path(path: Path) -> Path:
+    return path / _ON_DISK_METADATA_NAME / _ON_DISK_METADATA_NAME
+
+
+def _preflight_on_disk_metadata(path: Path) -> None:
+    """Reject ambiguous or deep metadata JSON before Orbax ``json.loads``."""
+
+    meta_path = _on_disk_metadata_path(path)
+    try:
+        path_metadata = os.lstat(meta_path)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise ValueError("checkpoint metadata must be a readable regular file") from error
+    if not stat_module.S_ISREG(path_metadata.st_mode):
+        raise ValueError("checkpoint metadata must be a regular file")
+
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            meta_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened_metadata = os.fstat(descriptor)
+        if (
+            not stat_module.S_ISREG(opened_metadata.st_mode)
+            or opened_metadata.st_dev != path_metadata.st_dev
+            or opened_metadata.st_ino != path_metadata.st_ino
+        ):
+            raise ValueError("checkpoint metadata must remain the same regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            raw = stream.read(_JSON_MAX_BYTES + 1)
+    except OSError as error:
+        raise ValueError("checkpoint metadata must be a readable regular file") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(raw) > _JSON_MAX_BYTES:
+        raise ValueError("checkpoint metadata exceeds the JSON byte limit")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("checkpoint metadata must be valid UTF-8") from error
+    try:
+        require_json_text_nesting(
+            text,
+            max_depth=_JSON_MAX_DEPTH,
+            name="checkpoint metadata",
+        )
+    except ValueError as exc:
+        if "nesting limit" not in str(exc):
+            raise
+        raise ValueError("checkpoint metadata exceeds the JSON nesting limit") from exc
+    try:
+        load_strict_json_object_from_text(text, label="checkpoint metadata")
+    except ValueError as exc:
+        message = str(exc)
+        if message in {
+            "non-finite JSON number is forbidden",
+            "non-standard JSON numeric constant is forbidden",
+        }:
+            raise ValueError("checkpoint metadata must be JSON-safe and finite") from exc
+        if message.endswith("payload must contain one JSON object"):
+            raise ValueError("checkpoint metadata must be a mapping") from exc
+        raise
+
+
+def _preflight_on_disk_state(path: Path) -> None:
+    """Reject symlinks and special files at or below ``<checkpoint>/state``.
+
+    Only the ``state`` subtree is walked; ``path`` itself, its parents and the
+    metadata file are not. The walk runs before Orbax opens the files, so it
+    covers a static artifact (for example an unpacked archive), not a writer
+    that swaps entries during the load. A missing ``state`` directory raises
+    ``FileNotFoundError``, as a missing checkpoint does.
+    """
+
+    state_path = path / "state"
+    pending = [state_path]
+    while pending:
+        directory = pending.pop()
+        try:
+            directory_stat = directory.lstat()
+        except FileNotFoundError as error:
+            raise FileNotFoundError(f"checkpoint state not found: {directory}") from error
+        except OSError as error:
+            raise ValueError(f"checkpoint state path is not readable: {directory}") from error
+        if stat_module.S_ISLNK(directory_stat.st_mode) or not stat_module.S_ISDIR(
+            directory_stat.st_mode
+        ):
+            raise ValueError(f"checkpoint state path must be a regular directory: {directory}")
+
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except OSError as error:
+                        raise ValueError(
+                            f"checkpoint state entry is not readable: {entry.path}"
+                        ) from error
+                    if stat_module.S_ISDIR(entry_stat.st_mode):
+                        pending.append(Path(entry.path))
+                    elif not stat_module.S_ISREG(entry_stat.st_mode):
+                        raise ValueError(
+                            "checkpoint state entry must be a regular file or directory: "
+                            f"{entry.path}"
+                        )
+        except OSError as error:
+            raise ValueError(
+                f"checkpoint state directory is not readable: {directory}"
+            ) from error
 
 
 def _require_json_safe_metadata(metadata: dict[str, Any]) -> None:
@@ -178,11 +341,13 @@ def _require_json_safe_metadata(metadata: dict[str, Any]) -> None:
             raise
         raise ValueError("checkpoint metadata exceeds the JSON nesting limit") from exc
     try:
-        json.dumps(metadata, allow_nan=False)
+        serialized = json.dumps(metadata, allow_nan=False)
     except RecursionError as exc:
         raise ValueError("checkpoint metadata exceeds the JSON nesting limit") from exc
     except (TypeError, ValueError) as exc:
         raise ValueError("checkpoint metadata must be JSON-safe and finite") from exc
+    if len(serialized.encode("utf-8")) > _JSON_MAX_BYTES:
+        raise ValueError("checkpoint metadata exceeds the JSON byte limit")
 
 
 def save_checkpoint(
@@ -214,6 +379,10 @@ def save_checkpoint(
     empty_array_manifest = _empty_array_manifest(state)
     if empty_array_manifest is not None:
         meta_to_save[_EMPTY_ARRAYS_KEY] = empty_array_manifest
+    # Re-check the exact dict Orbax writes: the version key and manifest
+    # add bytes, so user metadata just under the limit could otherwise
+    # still produce a checkpoint the load preflight refuses.
+    _require_json_safe_metadata(meta_to_save)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     with ocp.Checkpointer(ocp.CompositeCheckpointHandler()) as ckptr:
@@ -255,8 +424,11 @@ def load_checkpoint(
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
+    _preflight_on_disk_state(path)
+    _preflight_on_disk_metadata(path)
     try:
         compatible_template = _orbax_compatible_tree(state_template)
+        _validate_restore_template(path, compatible_template)
         with ocp.Checkpointer(ocp.CompositeCheckpointHandler()) as ckptr:
             loaded = ckptr.restore(
                 str(path),
@@ -303,6 +475,7 @@ def load_checkpoint_metadata(path: str | Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
+    _preflight_on_disk_metadata(path)
     with ocp.Checkpointer(ocp.CompositeCheckpointHandler()) as ckptr:
         loaded = ckptr.restore(
             str(path),

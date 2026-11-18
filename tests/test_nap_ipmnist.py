@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -20,6 +21,8 @@ from alberta_framework.benchmarks.nap_ipmnist import (
     PLASTICINE_COMMIT,
     NaPCatalogEntry,
     NaPResult,
+    _normalize,
+    _run_arm,
     main,
     qualification_gates,
     run_comparator,
@@ -207,6 +210,48 @@ def test_schedule_is_frozen_and_seed_specific() -> None:
     assert not first.task_ids_visible_to_learner
 
 
+def test_seeded_comparator_ignores_ambient_prng_default() -> None:
+    """A frozen arm seed must bind one trajectory across JAX defaults."""
+
+    profile = PROFILES["contract-smoke"]
+    images, labels = _fixture()
+    tasks = tuple(
+        (
+            images[: profile.examples_per_task].copy(),
+            labels[: profile.examples_per_task].copy(),
+        )
+        for _ in range(profile.n_tasks)
+    )
+
+    def trajectory() -> tuple[tuple[float, ...], str]:
+        arm = _run_arm("sgd_current_control", tasks, profile, FROZEN_SEEDS[0])
+        return arm.task_loss, arm.final_state_sha256
+
+    with jax.default_prng_impl("threefry2x32"):
+        expected = trajectory()
+    with jax.default_prng_impl("rbg"):
+        actual = trajectory()
+
+    assert actual == expected
+
+
+def test_comparator_is_independent_of_ambient_prng_default() -> None:
+    """The public comparator, scheduler included, must bind one result per seed."""
+
+    def outcome() -> tuple[str, tuple[tuple[tuple[float, ...], str], ...]]:
+        result = _result(FROZEN_SEEDS[0])
+        return result.schedule_sha256, tuple(
+            (arm.task_loss, arm.final_state_sha256) for arm in result.arms
+        )
+
+    with jax.default_prng_impl("threefry2x32"):
+        expected = outcome()
+    with jax.default_prng_impl("rbg"):
+        actual = outcome()
+
+    assert actual == expected
+
+
 def test_result_binds_the_complete_immutable_profile() -> None:
     result = _result()
     assert result.profile == PROFILES[result.profile_id]
@@ -241,6 +286,70 @@ def test_catalog_and_execution_cli_are_bounded(
     assert payload["paper_parity_claimed"] is False
 
 
+def _float64_layer_norm(values: np.ndarray) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64)
+    centered = array - array.mean(axis=-1, keepdims=True)
+    variance = np.mean(centered * centered, axis=-1, keepdims=True)
+    return (centered / np.sqrt(variance + 1e-5)).astype(np.float32)
+
+
+def test_normalize_keeps_the_direct_layer_norm_for_modest_preactivations() -> None:
+    values = jnp.asarray([[1.0, 2.0, 3.0], [0.0, 4.0, 4.0]], dtype=jnp.float32)
+    mean = jnp.mean(values, axis=-1, keepdims=True)
+    centered = values - mean
+    variance = jnp.mean(jnp.square(centered), axis=-1, keepdims=True)
+    expected = centered * jax.lax.rsqrt(variance + 1e-5)
+    observed = _normalize(values)
+    np.testing.assert_array_equal(np.asarray(observed), np.asarray(expected))
+
+
+@pytest.mark.parametrize("sign", [np.float32(1.0), np.float32(-1.0)])
+def test_normalize_keeps_a_finite_direction_when_a_component_square_overflows(
+    sign: np.float32,
+) -> None:
+    """Width 64 is the bounded-development NaP hidden width."""
+    values = np.zeros((64,), dtype=np.float32)
+    values[0] = sign * np.float32(2.0e19)
+    mean = np.mean(values, dtype=np.float32)
+    with np.errstate(over="ignore"):
+        raw_square = np.float32(values[0] - mean) * np.float32(values[0] - mean)
+    assert not np.isfinite(raw_square)
+    expected = _float64_layer_norm(values)
+    assert np.all(np.isfinite(expected))
+    assert not np.all(expected == 0.0)
+    assert np.sign(expected[0]) == np.sign(sign)
+
+    observed = _normalize(jnp.asarray(values))
+    compiled = jax.jit(_normalize)(jnp.asarray(values))
+    np.testing.assert_allclose(np.asarray(observed), expected, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(np.asarray(compiled), expected, rtol=1e-5, atol=1e-5)
+
+
+def test_normalize_leaves_a_nonfinite_preactivation_unrepaired() -> None:
+    values = jnp.asarray([jnp.inf, 0.0, 0.0], dtype=jnp.float32)
+    observed = _normalize(values)
+    assert not bool(jnp.all(jnp.isfinite(observed)))
+
+
+def test_normalize_retains_relative_values_at_float32_extremes() -> None:
+    values = np.array([[3e38, 1.5e38, -2e38], [1.0, 0.0, 3.0]], dtype=np.float32)
+    actual = jax.jit(_normalize)(jnp.asarray(values))
+    np.testing.assert_allclose(np.asarray(actual), _float64_layer_norm(values), rtol=1e-6)
+
+
+def test_normalize_keeps_gradient_when_a_component_square_overflows() -> None:
+    values = np.array([2e19, 1e19, -1e19], dtype=np.float32)
+    weights = np.array([1.0, -0.5, 0.75], dtype=np.float32)
+    centered = values.astype(np.float64) - values.astype(np.float64).mean()
+    std = np.sqrt(np.mean(centered**2) + 1e-5)
+    direction = centered / std
+    expected = (weights - weights.mean() - direction * np.mean(weights * direction)) / std
+    gradient = jax.jit(jax.grad(lambda row: _normalize(row) @ jnp.asarray(weights)))
+    np.testing.assert_allclose(
+        np.asarray(gradient(jnp.asarray(values))) * 1e19, expected * 1e19, rtol=5e-6, atol=1e-7
+    )
+
+
 def test_costly_paper_lanes_are_unconditionally_closed() -> None:
     gates = qualification_gates()
     assert gates["execution_authorized"] is False
@@ -252,3 +361,54 @@ def test_costly_paper_lanes_are_unconditionally_closed() -> None:
     assert isinstance(sequential_ale, Mapping)
     assert random_label_cifar["qualified"] is False
     assert sequential_ale["qualified"] is False
+
+
+def _npy_header_bytes(shape: tuple[int, ...], dtype: object) -> bytes:
+    from io import BytesIO
+
+    buffer = BytesIO()
+    np.lib.format.write_array_header_2_0(
+        buffer,
+        {
+            "descr": np.lib.format.dtype_to_descr(np.dtype(dtype)),
+            "fortran_order": False,
+            "shape": shape,
+        },
+    )
+    return buffer.getvalue()
+
+
+def test_cli_rejects_oversize_npy_header_before_materialize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zipfile
+
+    dataset = tmp_path / "oversize.npz"
+    with zipfile.ZipFile(dataset, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("images.npy", _npy_header_bytes((80_000, INPUT_DIM), np.float32))
+        archive.writestr("labels.npy", _npy_header_bytes((80_000,), np.int32))
+
+    def _forbidden_load(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("np.load must not run after an oversize npy header")
+
+    monkeypatch.setattr(np, "load", _forbidden_load)
+    with pytest.raises(ValueError, match="unbounded"):
+        main(("--dataset", str(dataset), "--seed", str(FROZEN_SEEDS[0])))
+
+
+def test_cli_rejects_compressed_oversize_members_before_materialize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = tmp_path / "compressed-oversize.npz"
+    images = np.zeros((80_000, INPUT_DIM), dtype=np.float32)
+    labels = np.zeros((80_000,), dtype=np.int32)
+    np.savez_compressed(dataset, images=images, labels=labels)
+    del images, labels
+
+    def _forbidden_load(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("np.load must not run after an oversize compressed NPZ")
+
+    monkeypatch.setattr(np, "load", _forbidden_load)
+    with pytest.raises(ValueError, match="unbounded"):
+        main(("--dataset", str(dataset), "--seed", str(FROZEN_SEEDS[0])))
+

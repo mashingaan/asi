@@ -151,8 +151,70 @@ def test_readiness_rejects_nonrepresentable_squared_norms() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("gradient", "batch_gradients", "name"),
+    [
+        ([1e-170, 2e-170], [[1.0, 2.0]], "full_validation_gradient"),
+        ([1.0, 2.0], [[1e-170, 2e-170], [3e-170, 1e-170]], "expected batch gradient"),
+        ([1e-170, 2e-170], [[1e-170, 2e-170]], "full_validation_gradient"),
+        ([1e-160, 2e-160], [[1.0, 2.0]], "full_validation_gradient"),
+    ],
+)
+def test_readiness_rejects_gradients_whose_squared_norm_underflows(
+    gradient: list[float], batch_gradients: list[list[float]], name: str
+) -> None:
+    with pytest.raises(ValueError, match=f"{name} squared norm must not underflow"):
+        estimate_optimization_readiness(
+            loss=1.0,
+            full_validation_gradient=np.asarray(gradient),
+            batch_gradients=np.asarray(batch_gradients),
+        )
+
+
+def test_readiness_keeps_a_small_row_beside_a_representable_batch_mean() -> None:
+    readiness = estimate_optimization_readiness(
+        loss=1.0,
+        full_validation_gradient=np.asarray([1.0, 2.0]),
+        batch_gradients=np.asarray([[1e-170, 2e-170], [1.0, 3.0], [0.0, 0.0]]),
+    )
+    assert readiness.expected_batch_gradient_squared_norm == pytest.approx(10.0 / 3.0)
+
+
+def test_batch_gradient_mean_survives_large_but_representable_row_norms() -> None:
+    """A representable batch mean must not be fabricated from an overflowed sum.
+
+    Summing 128 rows whose individual squared norms are near the float64 ceiling
+    overflows, and dividing infinity by the batch count keeps it infinite.  The
+    reliability ratio then silently collapses to ``0.0`` while every gated
+    output stays finite, so the receipt reports zero readiness for a real
+    gradient.
+    """
+    row_norm = 6.5e153
+    batch_gradients = np.tile(np.full(4, row_norm), (128, 1))
+    with np.errstate(over="ignore"):
+        unscaled_mean = float(np.mean(np.square(batch_gradients).sum(axis=1)))
+    assert not np.isfinite(unscaled_mean)
+
+    readiness = estimate_optimization_readiness(
+        loss=1.0,
+        full_validation_gradient=np.ones(4),
+        batch_gradients=batch_gradients,
+    )
+    expected = 4.0 * row_norm * row_norm
+    assert np.isfinite(readiness.expected_batch_gradient_squared_norm)
+    assert readiness.expected_batch_gradient_squared_norm == pytest.approx(expected, rel=1e-12)
+    assert readiness.gradient_reliability > 0.0
+    assert readiness.optimization_readiness > 0.0
+
+
 def test_energy_rank_is_scale_stable() -> None:
     assert energy_rank(np.diag([9e307, 1e307]), threshold=0.99) == 2
+
+
+def test_energy_rank_scales_before_singular_value_overflow() -> None:
+    matrix = np.full((2, 2), np.finfo(np.float64).max)
+
+    assert energy_rank(matrix, threshold=0.99) == 1
 
 
 def test_protocol_is_prospective_and_nonpromoting() -> None:
@@ -307,6 +369,17 @@ def test_resource_receipt_enforces_live_cross_field_identities(
     assert isinstance(nested, dict)
     nested[field] = value
     with pytest.raises(ValueError, match=match):
+        validate_development_result(payload)
+
+
+def test_peak_working_set_covers_persistent_state() -> None:
+    payload = _result_payload()
+    resources = payload["resources"]
+    assert isinstance(resources, dict)
+    peak_working_set_bytes = resources["peak_working_set_bytes"]
+    assert isinstance(peak_working_set_bytes, int)
+    resources["persistent_bytes"] = peak_working_set_bytes + 1
+    with pytest.raises(ValueError, match="peak_working_set_bytes.*persistent_bytes"):
         validate_development_result(payload)
 
 

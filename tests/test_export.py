@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -18,8 +20,11 @@ from alberta_framework.utils.export import (
     export_to_json,
     generate_latex_table,
     generate_markdown_table,
+    generate_significance_table,
+    results_to_dataframe,
     save_experiment_report,
 )
+from alberta_framework.utils.statistics import SignificanceResult
 
 pytestmark = pytest.mark.unit
 
@@ -59,7 +64,7 @@ def _timeseries_result() -> AggregatedResults:
         ],
         dtype=np.float64,
     )
-    final_values = series[:, -1]
+    final_values = np.mean(series, axis=1)
     return AggregatedResults(
         config_name="trace",
         seeds=[17, 29],
@@ -424,6 +429,30 @@ def test_preflight_rejects_metric_surface_mismatch(mode: str, tmp_path: Path) ->
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("mode", ["summary_csv", "timeseries_csv", "json"])
+def test_preflight_rejects_summary_values_that_contradict_raw_traces(
+    mode: str,
+    tmp_path: Path,
+) -> None:
+    result = _timeseries_result()
+    forged_values = np.asarray([1000.0, 2000.0], dtype=np.float64)
+    forged_summary = MetricSummary(
+        mean=float(np.mean(forged_values)),
+        std=float(np.std(forged_values, ddof=1)),
+        min=float(np.min(forged_values)),
+        max=float(np.max(forged_values)),
+        n_seeds=2,
+        values=forged_values,
+    )
+    forged = result._replace(summary={_METRIC: forged_summary})
+    destination = tmp_path / f"contradictory-{mode}"
+
+    with pytest.raises(ValueError, match="raw metric trace"):
+        _export_mode(mode, {"trace": forged}, destination)
+
+    assert not destination.exists()
+
+
 @pytest.mark.parametrize("case", ["empty_results", "zero_step_axis", "missing_metric"])
 def test_report_preflight_rejects_before_output_directory_mutation(
     case: str,
@@ -449,6 +478,33 @@ def test_report_preflight_rejects_before_output_directory_mutation(
         save_experiment_report(results, existing, "invalid", metric=_METRIC)
     assert sentinel.read_text(encoding="utf-8") == "existing artifact\n"
     assert list(existing.iterdir()) == [sentinel]
+
+
+def test_report_preserves_higher_is_better_table_direction(tmp_path: Path) -> None:
+    weak = _constant_result("weak", 0.2)
+    strong = _constant_result("strong", 0.9)
+    results = {
+        name: result._replace(
+            metric_arrays={"accuracy": result.metric_arrays[_METRIC]},
+            summary={"accuracy": result.summary[_METRIC]},
+        )
+        for name, result in (("weak", weak), ("strong", strong))
+    }
+
+    artifacts = save_experiment_report(
+        results,
+        tmp_path,
+        "accuracy_comparison",
+        metric="accuracy",
+        lower_is_better=False,
+    )
+
+    assert "| weak | 0.2000 ± 0.0000 |" in artifacts["markdown_table"].read_text()
+    assert "| strong | **0.9000** ± 0.0000 |" in artifacts["markdown_table"].read_text()
+    assert r"weak & 0.2000 $\pm$ 0.0000" in artifacts["latex_table"].read_text()
+    assert r"strong & \textbf{0.9000} $\pm$ 0.0000" in artifacts[
+        "latex_table"
+    ].read_text()
 
 
 @pytest.mark.parametrize("mode", ["summary_csv", "timeseries_csv", "json"])
@@ -559,6 +615,179 @@ def test_display_only_tables_keep_four_decimal_presentation() -> None:
     assert "**0.1235** ± 0.0000" in markdown
 
 
+def _named_significance(name_a: str, name_b: str) -> dict[tuple[str, str], SignificanceResult]:
+    return {
+        (name_a, name_b): SignificanceResult(
+            test_name="paired_t_test",
+            statistic=1.0,
+            p_value=0.5,
+            significant=False,
+            alpha=0.05,
+            effect_size=0.1,
+            method_a=name_a,
+            method_b=name_b,
+        )
+    }
+
+
+@pytest.mark.parametrize(
+    ("name", "display"),
+    [
+        ("A&B", r"A\&B"),
+        ("100% baseline", r"100\% baseline"),
+        ("cost $1", r"cost \$1"),
+        ("candidate#1", r"candidate\#1"),
+        ("candidate_v1", r"candidate\_v1"),
+        ("{candidate}", r"\{candidate\}"),
+        ("candidate~control", r"candidate\textasciitilde{}control"),
+        ("candidate^2", r"candidate\textasciicircum{}2"),
+        (r"candidate\control", r"candidate\textbackslash{}control"),
+        ("candidate\ncontrol", "candidate control"),
+        ("candidate\rcontrol", "candidate control"),
+        ("candidate\r\ncontrol", "candidate control"),
+        ("candidate\n\ncontrol", "candidate  control"),
+        ("candidate\r\n\r\ncontrol", "candidate  control"),
+        ("candidate&\r\ncontrol_1", r"candidate\& control\_1"),
+        (
+            r"\{A&B_100%}^~$#",
+            r"\textbackslash{}\{A\&B\_100\%\}"
+            r"\textasciicircum{}\textasciitilde{}\$\#",
+        ),
+    ],
+)
+def test_latex_tables_escape_method_name_text(name: str, display: str) -> None:
+    summary = generate_latex_table({name: _constant_result(name)})
+    significance = generate_significance_table(
+        _named_significance(name, "control " + name),
+        format="latex",
+    )
+
+    assert rf"{display} & \textbf{{1.0000}} $\pm$ 0.0000 & 1 \\" in summary.splitlines()
+    assert (
+        rf"{display} & control {display} & 1.000 & 0.5000 & 0.100 & No \\"
+        in significance.splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "display"),
+    [
+        ("candidate | control", r"candidate \| control"),
+        (r"candidate\control", r"candidate\\control"),
+        (r"candidate\|control", r"candidate\\\|control"),
+        ("candidate\ncontrol", "candidate<br>control"),
+        ("candidate\rcontrol", "candidate<br>control"),
+        ("candidate\r\ncontrol", "candidate<br>control"),
+        ("candidate\\|\r\ncontrol", r"candidate\\\|<br>control"),
+    ],
+)
+def test_markdown_tables_keep_method_name_in_one_cell(name: str, display: str) -> None:
+    summary = generate_markdown_table({name: _constant_result(name)})
+    significance = generate_significance_table(
+        _named_significance(name, "control " + name),
+        format="markdown",
+    )
+
+    assert f"| {display} | **1.0000** ± 0.0000 | 1 |" in summary.splitlines()
+    assert (
+        f"| {display} | control {display} | 1.000 | 0.5000 | 0.100 | No |"
+        in significance.splitlines()
+    )
+    assert len(summary.splitlines()) == 3
+    assert len(significance.splitlines()) == 3
+
+
+@pytest.mark.parametrize(
+    ("name", "latex_display"),
+    [
+        ("candidate", "candidate"),
+        ("candidate_v1", r"candidate\_v1"),
+        ("baseline-v2 (frozen)", "baseline-v2 (frozen)"),
+    ],
+)
+def test_method_name_escaping_preserves_ordinary_table_rows(
+    name: str,
+    latex_display: str,
+) -> None:
+    results = {name: _constant_result(name)}
+    significance = _named_significance(name, "control")
+
+    assert (
+        rf"{latex_display} & \textbf{{1.0000}} $\pm$ 0.0000 & 1 \\"
+        in generate_latex_table(results).splitlines()
+    )
+    assert (
+        f"| {name} | **1.0000** ± 0.0000 | 1 |"
+        in generate_markdown_table(results).splitlines()
+    )
+    assert (
+        rf"{latex_display} & control & 1.000 & 0.5000 & 0.100 & No \\"
+        in generate_significance_table(significance, format="latex").splitlines()
+    )
+    assert (
+        f"| {name} | control | 1.000 | 0.5000 | 0.100 | No |"
+        in generate_significance_table(significance, format="markdown").splitlines()
+    )
+
+
+def test_method_name_escaping_preserves_latex_caption_and_label_interface() -> None:
+    name = "A&B"
+    caption = r"\textbf{Comparison} with 95\% confidence"
+    label = "tab:comparison_v1"
+
+    table = generate_latex_table(
+        {name: _constant_result(name)},
+        caption=caption,
+        label=label,
+    )
+
+    assert r"\caption{" + caption + "}" in table
+    assert r"\label{" + label + "}" in table
+
+
+def test_report_escapes_method_names_without_changing_record_identity(tmp_path: Path) -> None:
+    name = "A&B\\control | 100%\r\ncandidate"
+    results = {name: _constant_result(name, 2.0), "control": _constant_result("control")}
+    comparison = SignificanceResult(
+        test_name="paired_t_test",
+        statistic=1.0,
+        p_value=0.01,
+        significant=True,
+        alpha=0.05,
+        effect_size=0.1,
+        method_a=name,
+        method_b="control",
+    )
+    artifacts = save_experiment_report(
+        results,
+        tmp_path,
+        "comparison",
+        significance_results={(name, "control"): comparison},
+    )
+
+    latex_display = r"A\&B\textbackslash{}control | 100\% candidate"
+    markdown_display = r"A&B\\control \| 100%<br>candidate"
+    assert (
+        rf"{latex_display} & 2.0000 $\pm$ 0.0000$^{{*}}$ & 1 \\"
+        in artifacts["latex_table"].read_text(encoding="utf-8").splitlines()
+    )
+    assert (
+        f"| {markdown_display} | 2.0000 ± 0.0000 * | 1 |"
+        in artifacts["markdown_table"].read_text(encoding="utf-8").splitlines()
+    )
+    assert latex_display + " & control & " in artifacts["significance_latex"].read_text(
+        encoding="utf-8"
+    )
+    assert "| " + markdown_display + " | control | " in artifacts["significance_md"].read_text(
+        encoding="utf-8"
+    )
+    assert set(json.loads(artifacts["json"].read_text(encoding="utf-8"))) == {name, "control"}
+    with artifacts["summary_csv"].open(encoding="utf-8", newline="") as handle:
+        assert [row["config"] for row in csv.DictReader(handle)] == [name, "control"]
+    assert results[name].config_name == name
+    assert comparison.method_a == name
+
+
 @pytest.mark.parametrize("value", [True, False, np.bool_(True), np.bool_(False)])
 @pytest.mark.parametrize("field", ["mean", "std", "min", "max"])
 def test_export_rejects_boolean_summary_statistics(
@@ -581,3 +810,197 @@ def test_export_rejects_boolean_summary_statistics(
 
     with pytest.raises(ValueError, match="refusing to export boolean as numeric measurement"):
         generate_markdown_table(results)
+
+
+class TestCrossConfigFinalWindow:
+    """Metric-ranked exports must not compare means over different horizons."""
+
+    @staticmethod
+    def _aggregate(name: str, n_steps: int, settled: float):
+        from alberta_framework.core.optimizers import LMSState
+        from alberta_framework.core.types import LearnerState
+        from alberta_framework.utils import experiments as ex
+
+        state = LearnerState(
+            weights=jnp.zeros(1),
+            bias=jnp.zeros(()),
+            optimizer_state=LMSState(step_size=jnp.asarray(0.1)),
+            step_count=jnp.asarray(0),
+        )
+        trace = [5.0] * (n_steps - n_steps // 2) + [settled] * (n_steps // 2)
+        runs = [
+            ex.SingleRunResult(
+                config_name=name,
+                seed=seed,
+                metrics_history=[{"squared_error": float(v)} for v in trace],
+                final_state=state,
+            )
+            for seed in (0, 1, 2, 3)
+        ]
+        return ex.aggregate_metrics(runs)
+
+    def _unequal_results(self):
+        return {
+            "short": self._aggregate("short", 20, 0.10),
+            "long": self._aggregate("long", 500, 0.11),
+        }
+
+    def test_tables_fail_closed_on_unequal_final_windows(self) -> None:
+        results = self._unequal_results()
+        with pytest.raises(ValueError, match="final steps"):
+            generate_markdown_table(results, metric="squared_error")
+        with pytest.raises(ValueError, match="final steps"):
+            generate_latex_table(results, metric="squared_error")
+        with pytest.raises(ValueError, match="final steps"):
+            results_to_dataframe(results, metric="squared_error")
+
+    def test_plot_bars_fails_closed_on_unequal_final_windows(self) -> None:
+        pytest.importorskip("matplotlib")
+        from alberta_framework.utils.visualization import plot_final_performance_bars
+
+        with pytest.raises(ValueError, match="final steps"):
+            plot_final_performance_bars(self._unequal_results(), metric="squared_error")
+
+    def test_equal_windows_still_export(self) -> None:
+        results = {
+            "short": self._aggregate("short", 40, 0.10),
+            "long": self._aggregate("long", 60, 0.11),
+        }
+        with pytest.raises(ValueError, match="final steps"):
+            generate_markdown_table(results, metric="squared_error")
+        equal = {
+            "short": self._aggregate("short", 200, 0.10),
+            "long": self._aggregate("long", 500, 0.11),
+        }
+        table = generate_markdown_table(equal, metric="squared_error")
+        assert "short" in table and "long" in table
+
+
+@pytest.mark.parametrize("scale", [1e308, 1e-200])
+def test_exports_validate_finite_scaled_summary(tmp_path: Path, scale: float) -> None:
+    values = np.asarray([scale, scale / 2], dtype=np.float64)
+    scaled = values / scale
+    summary = MetricSummary(
+        mean=float(np.mean(scaled) * scale),
+        std=float(np.std(scaled, ddof=1) * scale),
+        min=float(values.min()),
+        max=float(values.max()),
+        n_seeds=2,
+        values=values,
+    )
+    result = AggregatedResults(
+        config_name="finite", seeds=[17, 29],
+        metric_arrays={_METRIC: values.reshape(2, 1)},
+        summary={_METRIC: summary},
+    )
+    results = {"finite": result}
+    export_to_json(results, tmp_path / "finite.json")
+    export_to_csv(results, tmp_path / "finite.csv")
+    payload = json.loads((tmp_path / "finite.json").read_text())
+    assert payload["finite"]["summary"][_METRIC]["std"] == summary.std
+    assert payload["finite"]["summary"][_METRIC]["values"] == values.tolist()
+    invalid = summary._replace(std=summary.std / 2)
+    bad = result._replace(summary={_METRIC: invalid})
+    with pytest.raises(ValueError, match="statistics do not match values"):
+        export_to_json({"finite": bad}, tmp_path / "bad.json")
+    assert not (tmp_path / "bad.json").exists()
+
+
+@pytest.mark.parametrize("trace_seed", range(8))
+def test_json_export_accepts_real_aggregate_metrics_output(trace_seed: int, tmp_path: Path) -> None:
+    # aggregate_metrics reduces with _scaled_mean/_scaled_std; the export check
+    # must accept its exact output, not only np.mean/np.std of the same trace.
+    from alberta_framework.core.optimizers import LMSState
+    from alberta_framework.core.types import LearnerState
+    from alberta_framework.utils import experiments as ex
+
+    state = LearnerState(
+        weights=jnp.zeros(1),
+        bias=jnp.zeros(()),
+        optimizer_state=LMSState(step_size=jnp.asarray(0.1)),
+        step_count=jnp.asarray(0),
+    )
+    rng = np.random.default_rng(trace_seed)
+    runs = [
+        ex.SingleRunResult(
+            config_name="c",
+            seed=seed,
+            metrics_history=[{_METRIC: float(v)} for v in rng.random(150)],
+            final_state=state,
+        )
+        for seed in range(4)
+    ]
+    output = tmp_path / "results.json"
+
+    export_to_json({"c": ex.aggregate_metrics(runs)}, output)
+
+    assert output.is_file()
+
+
+@pytest.mark.parametrize(
+    ("experiment", "caption"),
+    [
+        ("trial_1", r"trial\_1"),
+        ("trial%1", r"trial\%1"),
+        ("trial{1}", r"trial\{1\}"),
+        ("trial1", "trial1"),
+        ("t_" * 100, r"t\_" * 100),
+    ],
+)
+def test_report_caption_treats_experiment_name_as_text(
+    tmp_path: Path, experiment: str, caption: str
+) -> None:
+    paths = save_experiment_report({"learner": _constant_result("learner")}, tmp_path, experiment)
+    latex = paths["latex_table"].read_text()
+    assert r"\caption{" + caption + " Results}" in latex
+    if experiment in {"trial_1", "trial1", "t_" * 100}:
+        assert r"\label{tab:" + experiment + "}" in latex
+    else:
+        assert (
+            r"\label{tab:experiment-" + hashlib.sha256(experiment.encode("utf-8")).hexdigest() + "}"
+            in latex
+        )
+    assert json.loads(paths["json"].read_text())["learner"]["summary"][_METRIC]["mean"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("metric", "markdown_label", "latex_label"),
+    [
+        ("accuracy", "accuracy", "accuracy"),
+        ("reward", "reward", "reward"),
+        ("score_rate|heldout", r"score_rate\|heldout", r"score\_rate|heldout"),
+        ("squared_error", "Error", "Error"),
+        ("x_" * 128, "x_" * 128, r"x\_" * 128),
+    ],
+)
+def test_report_tables_name_the_selected_metric(
+    tmp_path: Path, metric: str, markdown_label: str, latex_label: str
+) -> None:
+    original = _constant_result("learner", 0.75)
+    result = original._replace(
+        metric_arrays={metric: original.metric_arrays[_METRIC]},
+        summary={metric: original.summary[_METRIC]},
+    )
+    paths = save_experiment_report({"learner": result}, tmp_path, "trial1", metric=metric)
+    assert paths["markdown_table"].read_text().splitlines()[0] == (
+        f"| Method | {markdown_label} (mean \u00b1 std) | Seeds |"
+    )
+    assert "Method & " + latex_label + " & Seeds" in paths["latex_table"].read_text()
+    saved = json.loads(paths["json"].read_text())["learner"]["summary"]
+    assert set(saved) == {metric}
+    assert saved[metric]["mean"] == 0.75
+
+
+def test_selected_metric_default_preserves_explicit_display_labels() -> None:
+    original = _constant_result("learner", 0.75)
+    result = original._replace(
+        metric_arrays={"accuracy": original.metric_arrays[_METRIC]},
+        summary={"accuracy": original.summary[_METRIC]},
+    )
+    raw_latex = r"\textbf{Accuracy}"
+    latex = generate_latex_table({"learner": result}, metric="accuracy", metric_label=raw_latex)
+    assert "Method & " + raw_latex + " & Seeds" in latex
+    markdown = generate_markdown_table(
+        {"learner": result}, metric="accuracy", metric_label="Custom accuracy"
+    )
+    assert markdown.splitlines()[0] == "| Method | Custom accuracy (mean \u00b1 std) | Seeds |"

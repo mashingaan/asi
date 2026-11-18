@@ -16,7 +16,11 @@ forgetting_rate=0.1``), and round-trip tests use arbitrary nondefault
 values so serialization bugs cannot hide behind defaults.
 """
 
+import math
+from typing import Any
+
 import chex
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -32,6 +36,69 @@ from alberta_framework.core.baseline_optimizers import (
     RMSpropParamState,
     RMSpropState,
 )
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize(
+    ("optimizer", "state_field", "metric_names"),
+    [
+        (Adam(beta1=0.0, beta2=0.0), "v", ("mean_v",)),
+        (RMSprop(decay=0.0), "v", ("mean_v",)),
+        (
+            NADALINE(decay=0.0),
+            "feature_second_moment",
+            ("mean_second_moment", "mean_denom"),
+        ),
+    ],
+)
+def test_finite_wide_moment_mean_does_not_reject_update(
+    compiled: bool,
+    optimizer: Any,
+    state_field: str,
+    metric_names: tuple[str, ...],
+) -> None:
+    """Finite per-feature moments must not overflow only while averaging."""
+    state = optimizer.init(2)
+    error = jnp.asarray(1.0, dtype=jnp.float32)
+    observation = jnp.full((2,), 1.5e19, dtype=jnp.float32)
+    update = jax.jit(optimizer.update) if compiled else optimizer.update
+
+    result = update(state, error, observation)
+
+    expected_moment = float(jnp.float32(1.5e19) ** 2)
+    assert bool(result.update_applied)
+    chex.assert_tree_all_finite(result)
+    chex.assert_trees_all_close(
+        getattr(result.new_state, state_field),
+        jnp.full((2,), expected_moment, dtype=jnp.float32),
+        rtol=1e-6,
+    )
+    for metric_name in metric_names:
+        assert float(result.metrics[metric_name]) == pytest.approx(
+            expected_moment, rel=1e-6
+        )
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_adam_finite_cancelling_first_moment_mean_is_order_independent(
+    compiled: bool,
+) -> None:
+    """A finite signed mean must not depend on overflowing reduction order."""
+    optimizer = Adam(step_size=0.001, beta1=0.5, beta2=0.0, eps=1e30)
+    state = optimizer.init(4).replace(
+        m=jnp.asarray([3e38, 3e38, 3e38, -3e38], dtype=jnp.float32)
+    )
+    update = jax.jit(optimizer.update) if compiled else optimizer.update
+
+    result = update(
+        state,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.zeros((4,), dtype=jnp.float32),
+    )
+
+    assert bool(result.update_applied)
+    chex.assert_tree_all_finite(result)
+    assert float(result.metrics["mean_m"]) == pytest.approx(7.5e37, rel=1e-6)
 
 # =============================================================================
 # AdaGain
@@ -108,6 +175,25 @@ class TestAdaGain:
         assert bool(result.update_applied)
         chex.assert_trees_all_close(result.new_state.gradient_trace, error * observation)
         assert float(result.new_state.bias_gradient_trace) == pytest.approx(1.0)
+
+    def test_disabled_adaptation_preserves_representable_extreme_step(self) -> None:
+        """A disabled meta/trace path must not reject a finite scaled update."""
+        optimizer = AdaGain(
+            initial_step_size=1.0e-8,
+            meta_step_size=0.0,
+            forgetting_rate=0.0,
+        )
+        state = optimizer.init(feature_dim=1)
+        error = jnp.asarray(2.0, dtype=jnp.float32)
+        observation = jnp.asarray([2.0e38], dtype=jnp.float32)
+        expected = state.step_sizes * error * observation
+
+        assert bool(jnp.all(jnp.isfinite(expected)))
+        result = optimizer.update(state, error, observation)
+
+        assert bool(result.update_applied)
+        chex.assert_trees_all_equal(result.weight_delta, expected)
+        chex.assert_trees_all_equal(result.new_state.gradient_trace, state.gradient_trace)
 
 
 # =============================================================================
@@ -186,6 +272,29 @@ class TestAdam:
         chex.assert_shape(state.t, ())
         chex.assert_trees_all_close(state.m, jnp.zeros((3, 4)))
         chex.assert_trees_all_close(state.v, jnp.zeros((3, 4)))
+
+    def test_parameter_update_rejects_broadcastable_gradient_shape(self) -> None:
+        """A missing leading axis must fail instead of broadcasting across rows."""
+        optimizer = Adam()
+        state = optimizer.init_for_shape((2, 2))
+
+        with pytest.raises(ValueError, match="gradient shape must match optimizer state"):
+            optimizer.update_from_gradient_checked(
+                state,
+                jnp.ones((2,), dtype=jnp.float32),
+            )
+
+    def test_parameter_update_rejects_broadcastable_parameter_shape(self) -> None:
+        """AdamW decay must not broadcast one parameter row across the matrix."""
+        optimizer = Adam(weight_decay=0.1)
+        state = optimizer.init_for_shape((2, 2))
+
+        with pytest.raises(ValueError, match="param shape must match optimizer state"):
+            optimizer.update_from_gradient_checked(
+                state,
+                jnp.ones((2, 2), dtype=jnp.float32),
+                param=jnp.ones((2,), dtype=jnp.float32),
+            )
 
     def test_bias_correction_at_t1(self):
         """At t=1, bias-corrected first moment should equal the gradient.
@@ -409,6 +518,17 @@ class TestRMSprop:
         chex.assert_shape(state.v, (3, 4))
         chex.assert_trees_all_close(state.v, jnp.zeros((3, 4)))
 
+    def test_parameter_update_rejects_broadcastable_gradient_shape(self) -> None:
+        """A missing leading axis must fail instead of broadcasting across rows."""
+        optimizer = RMSprop()
+        state = optimizer.init_for_shape((2, 2))
+
+        with pytest.raises(ValueError, match="gradient shape must match optimizer state"):
+            optimizer.update_from_gradient_checked(
+                state,
+                jnp.ones((2,), dtype=jnp.float32),
+            )
+
     def test_zero_decay_does_not_multiply_inf_second_moment(self):
         """decay=0 times an infinite squared-gradient EMA is NaN."""
         optimizer = RMSprop(step_size=0.01, decay=0.0)
@@ -461,6 +581,61 @@ class TestRMSprop:
         assert not bool(result.update_applied)
         chex.assert_trees_all_equal(result.new_state, state)
         chex.assert_trees_all_equal(result.step, jnp.zeros(3, dtype=jnp.float32))
+
+    def test_unit_decay_does_not_multiply_inf_squared_gradient(self):
+        """decay=1 freezes the EMA, so an overflowing square must not enter it."""
+        optimizer = RMSprop(step_size=0.01, decay=1.0)
+        state = optimizer.init(feature_dim=3)
+        observation = jnp.full(3, 1e30, dtype=jnp.float32)
+        error = jnp.asarray(1.0, dtype=jnp.float32)
+        raw = (1.0 - state.decay) * (-error * observation) ** 2
+        assert not bool(jnp.all(jnp.isfinite(raw)))
+
+        result = optimizer.update(state, error, observation)
+
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.new_state)
+        chex.assert_tree_all_finite(result.weight_delta)
+        chex.assert_tree_all_finite(result.bias_delta)
+        chex.assert_trees_all_equal(result.new_state.v, state.v)
+        chex.assert_trees_all_equal(result.new_state.bias_v, state.bias_v)
+
+    def test_unit_decay_still_applies_an_ordinary_update(self):
+        """A frozen EMA keeps producing the ordinary normalized descent step."""
+        optimizer = RMSprop(step_size=0.01, decay=1.0)
+        state = optimizer.init(feature_dim=2).replace(
+            v=jnp.full(2, 4.0, dtype=jnp.float32),
+        )
+
+        result = optimizer.update(
+            state,
+            jnp.asarray(0.5, dtype=jnp.float32),
+            jnp.ones(2, dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(result.new_state.v, state.v)
+        expected = 0.01 * 0.5 / (2.0 + float(state.eps))
+        chex.assert_trees_all_close(
+            result.weight_delta,
+            jnp.full(2, expected, dtype=jnp.float32),
+            rtol=1e-6,
+        )
+
+    def test_unit_decay_does_not_poison_the_per_parameter_moment(self):
+        """The checked MLP path shares the frozen-EMA guard."""
+        optimizer = RMSprop(step_size=0.01, decay=1.0)
+        state = optimizer.init_for_shape((2, 3))
+
+        result = optimizer.update_from_gradient_checked(
+            state,
+            jnp.full((2, 3), 1e30, dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.step)
+        chex.assert_tree_all_finite(result.new_state)
+        chex.assert_trees_all_equal(result.new_state.v, state.v)
 
 
 # =============================================================================
@@ -577,3 +752,179 @@ class TestNADALINE:
         chex.assert_tree_all_finite(result.new_state)
         chex.assert_tree_all_finite(result.weight_delta)
         chex.assert_tree_all_finite(result.bias_delta)
+
+    def test_unit_decay_does_not_multiply_inf_squared_feature(self):
+        """decay=1 freezes E[x^2], so an overflowing square must not enter it."""
+        optimizer = NADALINE(step_size=0.01, decay=1.0)
+        state = optimizer.init(feature_dim=3).replace(
+            feature_second_moment=jnp.full(3, 4.0, dtype=jnp.float32),
+        )
+        observation = jnp.full(3, 1e30, dtype=jnp.float32)
+        raw = (1.0 - state.decay) * observation**2
+        assert not bool(jnp.all(jnp.isfinite(raw)))
+
+        result = optimizer.update(
+            state,
+            jnp.asarray(0.5, dtype=jnp.float32),
+            observation,
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_tree_all_finite(result.new_state)
+        chex.assert_tree_all_finite(result.weight_delta)
+        chex.assert_tree_all_finite(result.bias_delta)
+        chex.assert_trees_all_equal(
+            result.new_state.feature_second_moment,
+            state.feature_second_moment,
+        )
+
+    def test_unit_decay_still_normalizes_by_the_frozen_moment(self):
+        """A frozen E[x^2] keeps producing the ordinary normalized step."""
+        optimizer = NADALINE(step_size=0.01, decay=1.0)
+        state = optimizer.init(feature_dim=2).replace(
+            feature_second_moment=jnp.full(2, 4.0, dtype=jnp.float32),
+        )
+
+        result = optimizer.update(
+            state,
+            jnp.asarray(0.5, dtype=jnp.float32),
+            jnp.full(2, 2.0, dtype=jnp.float32),
+        )
+
+        assert bool(result.update_applied)
+        chex.assert_trees_all_close(
+            result.new_state.feature_second_moment,
+            state.feature_second_moment,
+        )
+        chex.assert_trees_all_close(
+            result.weight_delta,
+            jnp.full(2, 0.01 * 0.5 * 2.0 / 4.0, dtype=jnp.float32),
+            rtol=1e-6,
+        )
+
+
+class TestGradientPathErrorContract:
+    """Baseline optimizers advertise complete error-supplied additive deltas.
+
+    Applying these deltas must match a loss-gradient update, including the
+    momentum trajectory at zero residual. Legacy optimizers remain factored.
+    """
+
+    def test_adam_first_step_applies_descent_delta(self):
+        optimizer = Adam(step_size=0.1)
+        state = optimizer.init_for_shape((1,))
+        gradient = jnp.array([1.0])
+        error = jnp.array(0.5)
+        result = optimizer.update_from_gradient_checked(state, gradient, error=error)
+        assert bool(result.update_applied)
+        applied = float(result.step[0])
+        # t=1: bias-corrected m_hat = g, v_hat = g^2 for loss gradient
+        # g = -error*gradient, so the descent delta applied to the parameter
+        # is alpha * error*gradient / (|error*gradient| + eps).
+        g = float(error) * float(gradient[0])
+        expected = 0.1 * g / (abs(g) + 1e-8)
+        assert applied == pytest.approx(expected, rel=1e-5)
+
+    def test_rmsprop_first_step_applies_descent_delta(self):
+        optimizer = RMSprop(step_size=0.1, decay=0.99)
+        state = optimizer.init_for_shape((1,))
+        gradient = jnp.array([1.0])
+        error = jnp.array(0.5)
+        result = optimizer.update_from_gradient_checked(state, gradient, error=error)
+        assert bool(result.update_applied)
+        applied = float(result.step[0])
+        # t=1: v = (1-decay) * (error*gradient)^2, and the descent delta is
+        # alpha * error*gradient / (sqrt(v) + eps).
+        g = float(error) * float(gradient[0])
+        expected = 0.1 * g / (math.sqrt((1.0 - 0.99) * g * g) + 1e-8)
+        assert applied == pytest.approx(expected, rel=1e-4)
+
+    @pytest.mark.parametrize("make_optimizer", [Adam, RMSprop])
+    def test_scalar_regression_converges_to_target(self, make_optimizer):
+        optimizer = make_optimizer(step_size=0.1)
+        state = optimizer.init_for_shape(())
+        w = jnp.asarray(0.0, dtype=jnp.float32)
+        for _ in range(200):
+            error = jnp.asarray(1.0, dtype=jnp.float32) - w
+            result = optimizer.update_from_gradient_checked(
+                state, jnp.asarray(1.0, dtype=jnp.float32), error=error
+            )
+            assert bool(result.update_applied)
+            state = result.new_state
+            w = w + result.step
+        assert float(w) == pytest.approx(1.0, abs=0.05)
+
+    @pytest.mark.parametrize("make_optimizer", [Adam, RMSprop])
+    def test_zero_error_step_is_finite_and_committed(self, make_optimizer):
+        optimizer = make_optimizer(step_size=0.1)
+        state = optimizer.init_for_shape((2,))
+        gradient = jnp.array([1.0, -1.0])
+        seeded = optimizer.update_from_gradient_checked(
+            state, gradient, error=jnp.asarray(0.5, dtype=jnp.float32)
+        )
+        result = optimizer.update_from_gradient_checked(
+            seeded.new_state, gradient, error=jnp.asarray(0.0, dtype=jnp.float32)
+        )
+        assert bool(result.update_applied)
+        assert bool(jnp.all(jnp.isfinite(result.step)))
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("sign", [-1.0, 1.0])
+@pytest.mark.parametrize("mode", ["linear", "loss_gradient", "prediction_gradient"])
+def test_rmsprop_finite_weighted_square_overflow(compiled, sign, mode):
+    """A representable weighted moment must not reject a large finite gradient."""
+    import jax
+
+    optimizer = RMSprop(decay=0.99)
+    magnitude = 2e19
+    error = jnp.asarray(sign * magnitude, dtype=jnp.float32)
+    if mode == "linear":
+        state = optimizer.init(1)
+        update = optimizer.update
+        if compiled:
+            update = jax.jit(update)
+        result = update(state, error, jnp.ones(1, dtype=jnp.float32))
+        observed = result.weight_delta
+        assert bool(result.update_applied)
+        assert float(result.new_state.bias_v) == pytest.approx(
+            (1.0 - float(state.decay)) * magnitude**2, rel=2e-6
+        )
+        expected_sign = sign
+        assert float(result.bias_delta) * expected_sign > 0.0
+    else:
+        state = optimizer.init_for_shape((1,))
+        update = optimizer.update_from_gradient_checked
+        if compiled:
+            update = jax.jit(update)
+        gradient = jnp.asarray([sign * magnitude], dtype=jnp.float32)
+        if mode == "prediction_gradient":
+            result = update(state, jnp.ones(1, dtype=jnp.float32), error)
+        else:
+            result = update(state, gradient)
+        observed = result.step
+        assert bool(result.update_applied)
+        expected_sign = sign
+    expected_v = (1.0 - float(state.decay)) * magnitude**2
+    assert float(result.new_state.v[0]) == pytest.approx(expected_v, rel=2e-6)
+    expected_step = float(state.step_size) * magnitude / (
+        math.sqrt(expected_v) + float(state.eps)
+    )
+    assert float(observed[0]) == pytest.approx(expected_sign * expected_step, rel=2e-6)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("value", [2e20, float("inf"), float("nan")])
+def test_rmsprop_unrepresentable_weighted_square_still_rejected(compiled, value):
+    """Genuinely invalid moments and inputs retain the transaction guard."""
+    import jax
+
+    optimizer = RMSprop(decay=0.99)
+    state = optimizer.init_for_shape((1,))
+    update = optimizer.update_from_gradient_checked
+    if compiled:
+        update = jax.jit(update)
+    result = update(state, jnp.asarray([value], dtype=jnp.float32))
+    assert not bool(result.update_applied)
+    chex.assert_trees_all_equal(result.new_state, state)
+    chex.assert_trees_all_equal(result.step, jnp.zeros(1, dtype=jnp.float32))

@@ -67,21 +67,7 @@ _COMPOSITIONAL_LOOP_MAX_STEPS = 10_000
 _COMPOSITIONAL_LOOP_BUDGET = ScanBudget(
     "compositional-feature learning-loop", _COMPOSITIONAL_LOOP_MAX_STEPS
 )
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _ACTUAL_REAL_TYPES = frozenset(
     (*_ACTUAL_INT_TYPES, float, np.float16, np.float32, np.float64, np.longdouble)
 )
@@ -130,6 +116,24 @@ def _require_choice(name: str, value: object, choices: frozenset[str]) -> str:
     return value
 
 
+def _require_typed_threefry_key(name: str, value: object) -> Array:
+    """Reject legacy or non-Threefry keys before random operations."""
+    if not isinstance(value, jax.Array) or tuple(value.shape) != ():
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key")
+    try:
+        implementation = str(jr.key_impl(value))
+        words = jr.key_data(value)
+    except Exception as error:
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key") from error
+    if (
+        implementation != "threefry2x32"
+        or tuple(words.shape) != (2,)
+        or words.dtype != jnp.uint32
+    ):
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key")
+    return value
+
+
 def _validated_float32_scalar(
     name: str,
     value: object,
@@ -153,6 +157,18 @@ def _validated_float32_scalar(
     if numerator != 0 and abs(numerator) * (1 << 150) <= denominator:
         raise ValueError(f"{name} must remain nonzero once narrowed to float32")
     return stored
+
+
+def _finite_l2_norm(values: Array) -> Array:
+    """Preserve a representable norm when only its square sum overflows."""
+
+    direct = jnp.linalg.norm(values)
+    scale = jnp.max(jnp.abs(values))
+    safe_scale = jnp.where(scale > 0.0, scale, 1.0)
+    scaled = values / safe_scale
+    stable = scale * jnp.sqrt(jnp.sum(scaled * scaled))
+    reduction_only_overflow = ~jnp.isfinite(direct) & jnp.all(jnp.isfinite(values))
+    return jnp.where(reduction_only_overflow, stable, direct)
 
 
 def _selector_state_nbytes(n_candidates: int) -> int:
@@ -796,7 +812,12 @@ class FiniteCandidateSelector:
             update_finite = finite
 
         log_weights = state.log_weights - self._learning_rate * update_losses
-        log_weights = log_weights - jnp.mean(log_weights)
+        center = jnp.mean(log_weights)
+        # A finite mean can have an overflowing reduction sum.
+        center = jnp.where(
+            jnp.isfinite(center), center, jnp.sum(log_weights / self._n_candidates)
+        )
+        log_weights = log_weights - center
         cumulative_loss = state.cumulative_loss + jnp.where(
             update_finite,
             jnp.nan_to_num(bounded_losses, nan=0.0),
@@ -939,6 +960,12 @@ def _candidate_scores_to_unit_losses(
 
 FEATURE_VALUE_CLIP = 10.0
 CANDIDATE_IMPRINT_SCALE = 0.1
+
+
+def _observation_width_matches(ops: Array, parent_a: Array, observation: Array) -> Array:
+    """Return whether ``observation`` has the width the raw-feature prefix was built for."""
+    raw_width = jnp.max(jnp.where(ops == OP_RAW, parent_a, -1)) + 1
+    return raw_width == observation.shape[0]
 
 
 def _compute_feature_values(
@@ -1864,6 +1891,7 @@ class CompositionalFeatureLearner:
         compositions of the active raw-input slots.
         """
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        key = _require_typed_threefry_key("key", key)
         if self._n_features < feature_dim:
             raise ValueError("n_features must be at least feature_dim so raw-input slots fit")
         if self._n_features > feature_dim and self._generation_strategy in {
@@ -2634,12 +2662,18 @@ class CompositionalFeatureLearner:
         These literal compositions are the Step 2 hand-off representation:
         downstream Horde or SARSA learners can consume them as fixed features.
         """
-        return _compute_feature_values(
+        values = _compute_feature_values(
             state.ops,
             state.parent_a,
             state.parent_b,
             state.theta,
             observation,
+        )
+        # Indexing clamps a wrong-width observation onto the wrong raw inputs.
+        return jnp.where(
+            _observation_width_matches(state.ops, state.parent_a, observation),
+            values,
+            jnp.nan,
         )
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -3040,6 +3074,7 @@ class CompositionalFeatureLearner:
             jnp.all(jnp.isfinite(observation))
             & jnp.all(jnp.isfinite(targets) | jnp.isnan(targets))
             & jnp.all(jnp.isfinite(context_input))
+            & _observation_width_matches(state.ops, state.parent_a, observation)
         )
         context = jnp.asarray(context_id, dtype=jnp.int32)
         active_mask = ~jnp.isnan(targets)
@@ -3255,7 +3290,7 @@ class CompositionalFeatureLearner:
                 + jnp.sum(jnp.abs(candidate_output_delta))
                 + jnp.sum(jnp.abs(candidate_theta_delta))
             )
-            err_norm = jnp.linalg.norm(errors)
+            err_norm = _finite_l2_norm(errors)
             bound_magnitude = self._obgd_kappa * jnp.maximum(err_norm, 1.0) * total_step
             bounding_scale = 1.0 / jnp.maximum(bound_magnitude, 1.0)
             output_delta = bounding_scale * output_delta
@@ -3370,9 +3405,13 @@ class CompositionalFeatureLearner:
             * state.depth.astype(jnp.float32)
             / jnp.maximum(float(self._max_depth), 1.0)
         )
+        # The documented replacement score of an active feature includes the
+        # depth bonus; both eviction paths (direct replacement and candidate
+        # promotion) must rank slots by this same score.
+        protected_replacement_score = active_replacement_score + retention_bonus
         active_scores = jnp.where(
             eligible_active,
-            active_replacement_score + retention_bonus,
+            protected_replacement_score,
             jnp.inf,
         )
         worst_active = jnp.argmin(active_scores).astype(jnp.int32)
@@ -3496,7 +3535,13 @@ class CompositionalFeatureLearner:
             refresh_scores = jnp.where(eligible_candidates, ranking_candidate_utilities, jnp.inf)
             worst_candidate = jnp.argmin(refresh_scores).astype(jnp.int32)
             compatible_active = compatible_active_by_candidate[best_candidate]
-            promotion_slot_scores = jnp.where(compatible_active, active_replacement_score, jnp.inf)
+            # The depth bonus decides *which* compatible slot a promotion
+            # evicts (the same ranking as the direct-replacement path); the
+            # margin gate still asks whether the candidate beats what that
+            # slot actually contributes.
+            promotion_slot_scores = jnp.where(
+                compatible_active, protected_replacement_score, jnp.inf
+            )
             promotion_slot = jnp.argmin(promotion_slot_scores).astype(jnp.int32)
             should_promote = (
                 should_try_replace
@@ -4295,7 +4340,9 @@ class CompositionalFeatureLearner:
             # resets too.  The source slot refreshed by a promotion is born
             # after the root mutation, so only the subsequent cascade can
             # rebound that fresh proposal and its newly sampled theta remains
-            # valid for its post-root parents.
+            # valid for its post-root parents.  A rebound whose structural
+            # depth exceeds ``max_depth`` cannot keep its descriptor; it is
+            # redrawn over the final active bank instead (see below).
             safe_candidate_pa = jnp.clip(candidate_parent_a, 0, self._n_features - 1)
             safe_candidate_pb = jnp.clip(candidate_parent_b, 0, self._n_features - 1)
             references_active_change = (candidate_ops != OP_RAW) & (
@@ -4354,6 +4401,94 @@ class CompositionalFeatureLearner:
                 candidate_rebound_mask,
                 jnp.zeros_like(candidate_ages),
                 candidate_ages,
+            )
+
+            # A promoted or cascaded parent can sit at ``max_depth``, so its
+            # rebound children are structurally one level too deep.  Such a
+            # descriptor is invalid, and keeping it would fail the source-state
+            # depth check on every later update.  Retire it the way the active
+            # cascade retires an invalidated descendant: draw a fresh
+            # composition over the final active bank, born like a refreshed
+            # candidate.  It stays in ``candidate_rebound_mask`` (one new
+            # lifetime) and the trace reports the redrawn final descriptor.
+            # Candidate substreams start after the active refill indices.
+            over_depth_rebound = candidate_rebound_mask & (rebound_depth > self._max_depth)
+
+            def redraw_over_depth(args: tuple[Array, ...]) -> tuple[Array, ...]:
+                co_a, cpa_a, cpb_a, ctheta_a, cdepth_a, cow_a, cgp_a = args
+                final_feature_values = _compute_feature_values(
+                    ops,
+                    parent_a,
+                    parent_b,
+                    theta,
+                    observation,
+                )
+
+                def draw(index: Array) -> tuple[Array, ...]:
+                    redraw_key = jr.fold_in(
+                        cascade_key,
+                        jnp.uint32(self._n_features) + index.astype(jnp.uint32),
+                    )
+                    gen_op, gen_pa, gen_pb, gen_theta, gen_depth = self._generate_one(
+                        redraw_key,
+                        depth,
+                        new_utilities,
+                        existing_ages=ages,
+                        feature_values=final_feature_values,
+                        feature_credit=feature_credit,
+                        forced_op=forced_op,
+                        parent_mode=parent_mode,
+                    )
+                    gen_weights = self._initial_candidate_output_weights(
+                        gen_op,
+                        gen_pa,
+                        gen_pb,
+                        gen_theta,
+                        final_feature_values,
+                        observation,
+                        errors,
+                        active_count,
+                        imprint_scale=imprint_scale,
+                    )
+                    return gen_op, gen_pa, gen_pb, gen_theta, gen_depth, gen_weights
+
+                gen_op, gen_pa, gen_pb, gen_theta, gen_depth, gen_weights = jax.vmap(draw)(
+                    candidate_indices
+                )
+                return (
+                    jnp.where(over_depth_rebound, gen_op, co_a),
+                    jnp.where(over_depth_rebound, gen_pa, cpa_a),
+                    jnp.where(over_depth_rebound, gen_pb, cpb_a),
+                    jnp.where(over_depth_rebound[:, None], gen_theta, ctheta_a),
+                    jnp.where(over_depth_rebound, gen_depth, cdepth_a).astype(jnp.int32),
+                    jnp.where(over_depth_rebound[None, :], gen_weights.T, cow_a),
+                    jnp.where(over_depth_rebound, generator_policy, cgp_a),
+                )
+
+            def keep_candidates(args: tuple[Array, ...]) -> tuple[Array, ...]:
+                return args
+
+            (
+                candidate_ops,
+                candidate_parent_a,
+                candidate_parent_b,
+                candidate_theta,
+                candidate_depth,
+                candidate_output_weights,
+                candidate_generator_policy,
+            ) = jax.lax.cond(
+                jnp.any(over_depth_rebound),
+                redraw_over_depth,
+                keep_candidates,
+                (
+                    candidate_ops,
+                    candidate_parent_a,
+                    candidate_parent_b,
+                    candidate_theta,
+                    candidate_depth,
+                    candidate_output_weights,
+                    candidate_generator_policy,
+                ),
             )
 
         reset_active_traces = active_change_mask
@@ -4618,7 +4753,14 @@ class CompositionalFeatureLearner:
             uptime_s=state.uptime_s,
         )
 
-        loss = jnp.sum(errors**2) / active_count
+        squared_errors = errors**2
+        loss = jnp.sum(squared_errors) / active_count
+        reduction_only_overflow = jnp.isinf(loss) & jnp.all(jnp.isfinite(squared_errors))
+        loss = jnp.where(
+            reduction_only_overflow,
+            jnp.sum(squared_errors / active_count),
+            loss,
+        )
         mean_abs_error = jnp.sum(jnp.abs(errors)) / active_count
         max_candidate_utility = (
             jnp.max(ranking_candidate_utilities)
@@ -4783,7 +4925,15 @@ def run_compositional_arrays(
         ValueError: If ``num_steps`` is not an exact integer in
             ``[1, 10_000]``.
     """
-    _require_compositional_array_steps(observations, targets)
+    num_steps = _require_compositional_array_steps(observations, targets)
+    host_ops = np.asarray(jax.device_get(state.ops))
+    host_parent_a = np.asarray(jax.device_get(state.parent_a))
+    raw_parents = host_parent_a[host_ops == OP_RAW]
+    if raw_parents.size == 0 or int(np.max(raw_parents)) < 0:
+        raise ValueError("state must contain a valid raw-observation feature prefix")
+    feature_dim = int(np.max(raw_parents)) + 1
+    if observations.shape != (num_steps, feature_dim):
+        raise ValueError(f"observations must have shape ({num_steps}, {feature_dim})")
 
     def step_fn(
         carry: CompositionalFeatureState,
@@ -4796,8 +4946,12 @@ def run_compositional_arrays(
     t0 = time.time()
     final_state, (metrics, updates_applied) = jax.lax.scan(step_fn, state, (observations, targets))
     elapsed = time.time() - t0
+    # The scan carries host clocks through the traced update and narrows them
+    # to float32. Restore the incoming Python values and add this scan's time
+    # to the host uptime base.
     final_state = final_state.replace(  # type: ignore[attr-defined]
-        uptime_s=final_state.uptime_s + elapsed
+        birth_timestamp=state.birth_timestamp,
+        uptime_s=state.uptime_s + elapsed,
     )
     return CompositionalFeatureLearningResult(
         state=final_state,
@@ -4842,8 +4996,11 @@ def run_compositional_loop(
         step_fn, (learner_state, stream_state), jnp.arange(num_steps)
     )
     elapsed = time.time() - t0
+    # Restore the incoming host clocks narrowed by the scan, as in
+    # run_compositional_arrays.
     final_state = final_state.replace(  # type: ignore[attr-defined]
-        uptime_s=final_state.uptime_s + elapsed
+        birth_timestamp=learner_state.birth_timestamp,
+        uptime_s=learner_state.uptime_s + elapsed,
     )
     return CompositionalFeatureLearningResult(
         state=final_state,

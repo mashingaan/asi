@@ -7,8 +7,6 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Literal
 
-import numpy as np
-
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 _MAX_ARCHIVE_ENTRIES = 4096
 _MAX_IDENTITY_CHARACTERS = 1024
@@ -111,11 +109,18 @@ class BoundedPolicyArchive:
             raise ValueError("unknown archive mode")
         if type(self.entries) is not tuple or len(self.entries) > _MAX_ARCHIVE_ENTRIES:
             raise ValueError("entries must be an exact tuple of PolicyEntry values")
+        if self.mode != "diverse_archive" and len(self.entries) > 1:
+            raise ValueError("single-policy control modes accept at most one entry")
         retained_bytes = 0
         identities: set[str] = set()
+        latent_width: int | None = None
         for entry in self.entries:
             if type(entry) is not PolicyEntry:
                 raise ValueError("entries must be an exact tuple of PolicyEntry values")
+            if latent_width is None:
+                latent_width = len(entry.latent)
+            elif len(entry.latent) != latent_width:
+                raise ValueError("all latent descriptors must have equal width")
             retained_bytes += entry.persistent_bytes
             if retained_bytes > self.byte_budget:
                 raise ValueError("entries exceed byte budget")
@@ -127,6 +132,35 @@ class BoundedPolicyArchive:
     def persistent_bytes(self) -> int:
         return sum(entry.persistent_bytes for entry in self.entries)
 
+    def retrieve_nearest(self, latent: tuple[float, ...]) -> PolicyEntry | None:
+        """Return the first nearest retained policy for an exact latent query."""
+        if (
+            type(latent) is not tuple
+            or not latent
+            or any(type(value) is not float or not math.isfinite(value) for value in latent)
+        ):
+            raise ValueError("query latent must be a non-empty tuple of finite floats")
+        if not self.entries:
+            return None
+        if len(latent) != len(self.entries[0].latent):
+            raise ValueError("query latent width must match retained entries")
+        # math.dist scales its reduction, preserving both tiny and huge finite norms.
+        distances = tuple(math.dist(latent, entry.latent) for entry in self.entries)
+        if all(math.isinf(distance) for distance in distances):
+            # Distances themselves can exceed float64. A common scale preserves
+            # their ordering; use it only when no finite candidate can be nearest.
+            scale = max(
+                abs(value)
+                for values in (latent, *(entry.latent for entry in self.entries))
+                for value in values
+            )
+            query = tuple(value / scale for value in latent)
+            distances = tuple(
+                math.dist(query, tuple(value / scale for value in entry.latent))
+                for entry in self.entries
+            )
+        return self.entries[min(range(len(distances)), key=distances.__getitem__)]
+
     def add(self, entry: PolicyEntry) -> BoundedPolicyArchive:
         """Return the deterministic successor archive."""
         if type(entry) is not PolicyEntry:
@@ -134,8 +168,6 @@ class BoundedPolicyArchive:
         if any(old.identity == entry.identity for old in self.entries):
             raise ValueError("entry identity already exists")
         candidates: tuple[PolicyEntry, ...]
-        if self.entries and len(entry.latent) != len(self.entries[0].latent):
-            raise ValueError("all latent descriptors must have equal width")
         if self.mode == "fixed_snapshot" and self.entries:
             return self
         if self.mode == "one_model":
@@ -143,11 +175,13 @@ class BoundedPolicyArchive:
         elif not self.entries:
             candidates = (entry,)
         else:
+            if len(entry.latent) != len(self.entries[0].latent):
+                raise ValueError("all latent descriptors must have equal width")
             distances = tuple(
-                float(np.linalg.norm(np.asarray(entry.latent) - np.asarray(old.latent)))
+                math.dist(entry.latent, old.latent)
                 for old in self.entries
             )
-            nearest = int(np.argmin(np.asarray(distances)))
+            nearest = min(range(len(distances)), key=distances.__getitem__)
             if distances[nearest] < self.min_latent_distance:
                 if entry.score <= self.entries[nearest].score:
                     return self

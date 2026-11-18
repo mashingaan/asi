@@ -106,7 +106,8 @@ def _require_float32(
         upper_inclusive=upper_inclusive,
         positive=positive,
     )
-    if preserve_nonzero and numerator != 0 and stored == 0.0:
+    narrowed = float(np.float32(stored))
+    if preserve_nonzero and numerator != 0 and narrowed == 0.0:
         raise ValueError(f"{name} must remain nonzero once narrowed to float32")
     return stored
 
@@ -123,6 +124,12 @@ def _persistent_resources(raw_dim: int, n_candidates: int) -> dict[str, int]:
         "persistent_scalars": persistent_scalars,
         "persistent_bytes": persistent_bytes,
     }
+
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Return 0 when ``scale`` is 0 so a 0*inf product cannot form."""
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
 
 # =============================================================================
 # State
@@ -397,13 +404,29 @@ class CumulantDiscovery:
         v = state.weights @ observation + state.biases  # (n,)
         v_next = state.weights @ next_observation + state.biases  # (n,)
 
-        td = cumulants + gamma * v_next - v  # (n,)
+        # Default gamma=0 still hits IEEE 0*inf when V(s') overflows.
+        td = cumulants + _skip_zero_scale(gamma, v_next) - v  # (n,)
 
         # Predictor update (per-candidate semi-gradient TD step)
         # weights_i += alpha * td_i * obs
         proposed_weights = state.weights + alpha * td[:, None] * observation[None, :]
         proposed_biases = state.biases + alpha * td
-        proposed_utility = decay * state.utility + (1.0 - decay) * (td**2)
+        utility_weight = 1.0 - decay
+        squared_td = td**2
+        direct_surprise = utility_weight * squared_td
+        # A finite TD error can overflow when squared even though applying the
+        # EMA weight first leaves the weighted square representable. Preserve
+        # the ordinary expression bit-for-bit and reassociate only that
+        # overflow case.
+        square_overflowed = jnp.isfinite(td) & ~jnp.isfinite(squared_td)
+        fallback_td = jnp.where(square_overflowed, td, 0.0)
+        reassociated_surprise = (utility_weight * fallback_td) * fallback_td
+        weighted_surprise = jnp.where(
+            square_overflowed,
+            reassociated_surprise,
+            direct_surprise,
+        )
+        proposed_utility = decay * state.utility + weighted_surprise
         proposed_state = CumulantDiscoveryState(  # type: ignore[call-arg]
             projections=state.projections,
             weights=proposed_weights,
@@ -457,9 +480,25 @@ class CumulantDiscovery:
 
         # Among mature candidates, find the one with lowest utility
         mature = state.ages >= self._maturity_threshold
+        # Rank mature candidates by bias-corrected utility to avoid penalizing
+        # freshly mature candidates whose raw utility EMA is still warming up.
+        safe_ages = jnp.maximum(state.ages.astype(jnp.float32), 1.0)
+        debias = 1.0 - jnp.power(jnp.asarray(self._decay_rate, dtype=jnp.float32), safe_ages)
+        safe_debias = jnp.maximum(debias, jnp.asarray(1e-30, dtype=jnp.float32))
+        ranking_utility = state.utility / safe_debias
+        # A common scale preserves ranking when finite utilities overflow on debiasing.
+        eligible_finite = mature & jnp.isfinite(state.utility)
+        utility_scale = jnp.max(jnp.where(eligible_finite, jnp.abs(state.utility), 0.0))
+        safe_scale = jnp.where(utility_scale > 0.0, utility_scale, 1.0)
+        _, scale_exponent = jnp.frexp(safe_scale)
+        scaled_ranking = jnp.ldexp(state.utility, -scale_exponent) / safe_debias
+        ranking_utility = jnp.where(
+            jnp.any(mature & jnp.isfinite(ranking_utility)), ranking_utility, scaled_ranking
+        )
+
         # Disqualify immature candidates by setting their utility to +inf
         masked_utility = jnp.where(
-            mature, state.utility, jnp.full_like(state.utility, jnp.inf)
+            mature, ranking_utility, jnp.full_like(ranking_utility, jnp.inf)
         )
         # If no candidates are mature, this index is arbitrary
         worst_idx = jnp.argmin(masked_utility)

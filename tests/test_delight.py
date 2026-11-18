@@ -1953,6 +1953,27 @@ def test_paper_specific_dg_delight_equations_match_definition() -> None:
     chex.assert_trees_all_close(result.ordinary_actor_loss, expected_ordinary_loss)
 
 
+def test_zero_advantage_does_not_multiply_infinite_surprisal() -> None:
+    """advantage=0 times -log(0)=+inf is 0*inf=NaN and would poison the loss."""
+    log_probabilities = jnp.array([-jnp.inf, jnp.log(0.25)], dtype=jnp.float32)
+    advantages = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    raw = advantages * (-log_probabilities)
+    assert not bool(jnp.isfinite(raw[0]))
+
+    result = discrete_delightful_policy_gradient(
+        log_probabilities,
+        advantages,
+        DelightfulPolicyGradientConfig(mode="delightful_pg", temperature=1.0),
+    )
+    assert bool(jnp.all(jnp.isfinite(result.delight)))
+    assert bool(jnp.isfinite(result.actor_loss))
+    assert bool(jnp.isfinite(result.ordinary_actor_loss))
+    chex.assert_trees_all_close(result.delight[0], jnp.asarray(0.0, dtype=jnp.float32))
+    chex.assert_trees_all_close(
+        result.actor_coefficients[0], jnp.asarray(0.0, dtype=jnp.float32)
+    )
+
+
 def test_paper_specific_dg_loss_jits_and_stops_gate_and_advantage_gradients() -> None:
     config = DelightfulPolicyGradientConfig(
         mode="delightful_pg",
@@ -2059,6 +2080,51 @@ def test_effective_sample_size_and_signed_gate_rates_are_auditable() -> None:
     assert float(result.diagnostics.negative_advantage_gate_rate) < 0.5
 
 
+@pytest.mark.parametrize("disable_jit", [True, False])
+@pytest.mark.parametrize("mode", ["ordinary_pg", "delightful_pg"])
+def test_policy_gradient_preserves_finite_batch_loss_when_sum_overflows(
+    disable_jit: bool,
+    mode: str,
+) -> None:
+    """Finite per-sample losses must not overflow only while taking their mean."""
+    log_probabilities = jnp.full((2,), -1.0, dtype=jnp.float32)
+    advantages = jnp.full((2,), 2.0e38, dtype=jnp.float32)
+    config = DelightfulPolicyGradientConfig(mode=mode)  # type: ignore[arg-type]
+
+    with jax.disable_jit(disable_jit):
+        def loss(log_prob: Array, advantage: Array) -> Array:
+            return discrete_delightful_policy_gradient(
+                log_prob,
+                advantage,
+                config,
+            ).actor_loss
+
+        result = jax.jit(
+            lambda log_prob, advantage: discrete_delightful_policy_gradient(
+                log_prob,
+                advantage,
+                config,
+            )
+        )(log_probabilities, advantages)
+        gradient = jax.jit(jax.grad(loss))(log_probabilities, advantages)
+
+    expected = float(advantages[0])
+    assert bool(jnp.all(jnp.isfinite(-result.actor_coefficients * log_probabilities)))
+    assert float(result.actor_loss) == expected
+    assert float(result.ordinary_actor_loss) == expected
+    chex.assert_trees_all_equal(gradient, -result.actor_coefficients / 2.0)
+
+
+def test_policy_gradient_does_not_recover_a_nonfinite_sample_loss() -> None:
+    result = discrete_delightful_policy_gradient(
+        jnp.array([-jnp.inf, -1.0], dtype=jnp.float32),
+        jnp.ones((2,), dtype=jnp.float32),
+    )
+
+    assert bool(jnp.isposinf(result.actor_loss))
+    assert bool(jnp.isposinf(result.ordinary_actor_loss))
+
+
 def test_heteroskedastic_gambling_strata_expose_lucky_rare_action_pathology() -> None:
     """A negative-mean rare gamble flips positive after paper-specific DG weighting.
 
@@ -2156,3 +2222,47 @@ def test_delight_stratification_rejects_non_boolean_rare_masks(rare_mask: Array)
         stratify_delight_outcomes(result, rare_mask)
     with pytest.raises(ValueError, match="rare_mask must have boolean dtype"):
         jax.jit(stratify_delight_outcomes)(result, rare_mask)
+
+
+def test_policy_loss_at_log_probability_zero_keeps_gradient() -> None:
+    def loss(log_probability: jax.Array) -> jax.Array:
+        return discrete_delightful_policy_gradient(
+            log_probability,
+            jnp.asarray([2.0], dtype=jnp.float32),
+            config=DelightfulPolicyGradientConfig(mode="ordinary_pg"),
+        ).actor_loss
+
+    gradient = jax.grad(loss)(jnp.asarray([0.0], dtype=jnp.float32))
+    assert float(gradient[0]) == pytest.approx(-2.0)
+
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+@pytest.mark.parametrize("value", [2e38, -2e38, 2.0, 1.1754943508222875e-38])
+def test_delight_stratification_preserves_finite_conditional_mean(
+    disable_jit: bool, value: float
+) -> None:
+    with jax.disable_jit(disable_jit):
+        result = discrete_delightful_policy_gradient(
+            jnp.zeros(3, dtype=jnp.float32),
+            jnp.array([value, value, 0.0], dtype=jnp.float32),
+            DelightfulPolicyGradientConfig(mode="ordinary_pg"),
+        )
+        summary = jax.jit(stratify_delight_outcomes)(
+            result, jnp.array([False, False, True])
+        )
+        assert float(summary.common_advantage_mean) == float(jnp.float32(value))
+        assert float(summary.common_gated_advantage_mean) == float(jnp.float32(value))
+        assert float(summary.common_advantage_variance) == 0.0
+        assert float(summary.rare_advantage_mean) == 0.0
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+def test_delight_masked_mean_retains_mask_and_poison_behavior(disable_jit: bool) -> None:
+    with jax.disable_jit(disable_jit):
+        mean = jax.jit(delight_module._masked_mean)
+        values = jnp.array([2e38, 1e38, jnp.inf], dtype=jnp.float32)
+        assert float(mean(values, jnp.array([True, True, False]))) == pytest.approx(1.5e38)
+        assert float(mean(values, jnp.array([False, False, False]))) == 0.0
+        assert bool(jnp.isinf(mean(values, jnp.array([True, True, True]))))
+        assert bool(jnp.isnan(mean(jnp.array([jnp.nan]), jnp.array([True]))))

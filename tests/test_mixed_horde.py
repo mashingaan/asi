@@ -17,6 +17,7 @@ import chex
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import pytest
 
 from alberta_framework import (
     DemonType,
@@ -568,6 +569,88 @@ class TestRunMixedHordeLearningLoop:
             result.per_demon_metrics, (num_steps, n_demons, 3)
         )
         chex.assert_shape(result.td_errors, (num_steps, n_demons))
+
+    def test_scan_loop_preserves_initialized_host_clocks(self) -> None:
+        horde = MixedHorde(
+            horde_spec=create_horde_spec(
+                [
+                    _gamma0_demon("d0", 0),
+                    _temporal_demon("d1", 1, gamma=0.9, lamda=0.5),
+                ]
+            ),
+            hidden_sizes=(4,),
+            sparsity=0.0,
+        )
+        state = horde.init(3, jr.key(0))
+        birth = 1700000000.125
+        uptime = 2**24 + 0.25
+        assert state.shared_state is not None
+        assert state.independent_state is not None
+        demon_states = tuple(
+            demon.replace(birth_timestamp=birth, uptime_s=uptime)
+            for demon in state.independent_state.demon_states
+        )
+        state = state.replace(
+            birth_timestamp=birth,
+            uptime_s=uptime,
+            shared_state=state.shared_state.replace(
+                birth_timestamp=birth,
+                uptime_s=uptime,
+            ),
+            independent_state=state.independent_state.replace(
+                birth_timestamp=birth,
+                uptime_s=uptime,
+                demon_states=demon_states,
+            ),
+        )
+        observations = jnp.zeros((2, 3), dtype=jnp.float32)
+        cumulants = jnp.zeros((2, 2), dtype=jnp.float32)
+        result = run_mixed_horde_learning_loop(
+            horde, state, observations, cumulants, observations
+        )
+        restored = result.state
+        assert restored.shared_state is not None
+        assert restored.independent_state is not None
+        clocks = (
+            restored,
+            restored.shared_state,
+            restored.independent_state,
+            restored.independent_state.demon_states[0],
+        )
+        for clock in clocks:
+            assert type(clock.birth_timestamp) is float
+            assert clock.birth_timestamp == birth
+            assert type(clock.uptime_s) is float
+        assert restored.uptime_s > uptime
+        assert restored.shared_state.uptime_s == uptime
+        assert restored.independent_state.uptime_s == uptime
+        assert restored.independent_state.demon_states[0].uptime_s == uptime
+
+    @pytest.mark.parametrize("n_cumulants", [2, 4])
+    def test_rejects_wrong_cumulant_width_before_routing(self, n_cumulants: int) -> None:
+        # JAX clamps out-of-range indices, so a short vector would hand the
+        # last demon another demon's cumulant.
+        spec = create_horde_spec(
+            [
+                _gamma0_demon("d0", 0),
+                _temporal_demon("d1", 1, gamma=0.9, lamda=0.5),
+                _gamma0_demon("d2", 2),
+            ]
+        )
+        horde = MixedHorde(horde_spec=spec, hidden_sizes=(4,), sparsity=0.0)
+        state = horde.init(2, jr.key(0))
+        observation = jnp.ones((2,), dtype=jnp.float32)
+        cumulants = jnp.ones((n_cumulants,), dtype=jnp.float32)
+        with pytest.raises(ValueError, match="cumulants must have shape"):
+            horde.update(state, observation, cumulants, observation)
+        with pytest.raises(ValueError, match="cumulants must have shape"):
+            run_mixed_horde_learning_loop(
+                horde,
+                state,
+                observation[None],
+                cumulants[None],
+                observation[None],
+            )
 
 
 # =============================================================================

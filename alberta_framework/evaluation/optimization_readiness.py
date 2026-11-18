@@ -28,6 +28,7 @@ _MAX_PERSISTENT_BYTES: Final[int] = 256 * 1024 * 1024
 _MAX_WORKING_SET_BYTES: Final[int] = 512 * 1024 * 1024
 _MAX_ARRAY_BYTES: Final[int] = 512 * 1024 * 1024
 _FLOAT64_BYTES: Final[int] = np.dtype(np.float64).itemsize
+_FLOAT64_SMALLEST_NORMAL: Final[float] = float(np.finfo(np.float64).smallest_normal)
 _APPENDIX_C1_VALIDATION_OBSERVATIONS: Final[int] = 10_000
 _APPENDIX_C1_BATCH_SIZE: Final[int] = 4
 _APPENDIX_C1_BATCH_COUNT: Final[int] = 128
@@ -214,6 +215,38 @@ def _squared_norm(value: NDArray[np.float64], *, name: str) -> float:
     return result
 
 
+def _require_retained_squared_norm(
+    squared_norm: float, source: NDArray[np.float64], *, name: str
+) -> None:
+    """Reject a nonzero source whose squared norm left the normal float64 range.
+
+    At zero the OR equations take their defined degenerate branches, so an
+    underflowed gradient would report the zero-gradient diagnostics, and a
+    subnormal result has already lost the precision the ratios depend on.
+    """
+    if squared_norm < _FLOAT64_SMALLEST_NORMAL and np.any(source != 0.0):
+        raise ValueError(f"{name} squared norm must not underflow float64")
+
+
+def _mean_squared_norm(values: NDArray[np.float64], *, name: str) -> float:
+    """Average finite squared norms without an overflowing intermediate sum.
+
+    A direct ``np.mean`` accumulates the sum before dividing, so a batch of
+    large-but-finite row norms reaches infinity even though their mean is
+    representable.  Rescaling by a power of two is exact, keeps every summand in
+    ``[0, 1]``, and therefore preserves the mean's magnitude domain.
+    """
+    maximum = float(np.max(values))
+    if maximum == 0.0:
+        return 0.0
+    _, exponent = math.frexp(maximum)
+    scaled = float(np.mean(np.ldexp(values, -exponent)))
+    result = math.ldexp(scaled, exponent)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must fit in a finite float64")
+    return result
+
+
 def estimate_optimization_readiness(
     *,
     loss: float,
@@ -254,11 +287,19 @@ def estimate_optimization_readiness(
     gradient_squared_norm = _squared_norm(
         gradient, name="full_validation_gradient"
     )
+    _require_retained_squared_norm(
+        gradient_squared_norm, gradient, name="full_validation_gradient"
+    )
     row_squared_norms = np.asarray(
         [_squared_norm(row, name="batch gradient") for row in gradients],
         dtype=np.float64,
     )
-    expected_squared_norm = float(np.mean(row_squared_norms))
+    expected_squared_norm = _mean_squared_norm(
+        row_squared_norms, name="expected batch gradient squared norm"
+    )
+    _require_retained_squared_norm(
+        expected_squared_norm, gradients, name="expected batch gradient"
+    )
     strength = gradient_squared_norm / resolved_loss if resolved_loss > 0.0 else 0.0
     reliability = (
         gradient_squared_norm / expected_squared_norm if expected_squared_norm > 0.0 else 0.0
@@ -269,7 +310,13 @@ def estimate_optimization_readiness(
         readiness = strength * reliability
     else:
         readiness = 0.0
-    outputs = (strength, reliability, readiness)
+    outputs = (
+        gradient_squared_norm,
+        expected_squared_norm,
+        strength,
+        reliability,
+        readiness,
+    )
     if not all(math.isfinite(value) for value in outputs):
         raise ValueError("optimization-readiness outputs must be finite")
     return OptimizationReadiness(
@@ -329,13 +376,16 @@ def energy_rank(matrix: object, *, threshold: float = 0.99) -> int:
     if not math.isfinite(threshold) or not 0.0 < threshold <= 1.0:
         raise ValueError("threshold must be a float in (0, 1]")
     resolved = _finite_array(matrix, name="matrix", dimensions=2)
+    scale = float(np.max(np.abs(resolved)))
+    if scale == 0.0:
+        return 0
+    _, exponent = math.frexp(scale)
+    scaled_matrix = np.ldexp(resolved, -exponent)
     try:
-        singular_values = np.linalg.svd(resolved, compute_uv=False)
+        singular_values = np.linalg.svd(scaled_matrix, compute_uv=False)
     except np.linalg.LinAlgError as exc:
         raise ValueError("matrix singular-value decomposition did not converge") from exc
     leading = float(singular_values[0])
-    if leading == 0.0:
-        return 0
     squared = np.square(singular_values / leading)
     total = float(np.sum(squared))
     target = np.nextafter(threshold * total, -math.inf)
@@ -582,6 +632,8 @@ def validate_development_result(payload: object) -> DevelopmentResultReceipt:
             resource_payload["timing_seconds"], name="timing_seconds", nonnegative=True
         ),
     )
+    if resources.peak_working_set_bytes < resources.persistent_bytes:
+        raise ValueError("peak_working_set_bytes must cover persistent_bytes")
 
     if (
         protocol.full_validation_observations != _APPENDIX_C1_VALIDATION_OBSERVATIONS

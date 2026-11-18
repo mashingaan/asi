@@ -64,6 +64,24 @@ def test_inert_reduction_includes_curves_params_state_and_jacobian(
         assert inert[key] == control[key]
 
 
+def test_dead_jacobian_reports_capped_ill_conditioning() -> None:
+    inputs = np.zeros((4, 4), dtype=np.float32)
+    labels = np.array([0, 1, 0, 1], dtype=np.int32)
+
+    dead = run_adamo_diagnostic(
+        inputs,
+        labels,
+        profile="contract-smoke",
+        seed=FROZEN_DEVELOPMENT_SEEDS[0],
+    )
+
+    for arm in dead["arms"]:
+        for diagnostic in arm["post_task_diagnostics"]:
+            assert diagnostic["jacobian_min_singular_value"] == 0.0
+            assert diagnostic["jacobian_max_singular_value"] == 0.0
+            assert diagnostic["jacobian_condition_number_clipped_1e12"] == 1e12
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -99,6 +117,30 @@ def test_hostile_scalar_alias_and_unfrozen_seed_are_rejected(
         validate_adamo_diagnostic(hostile)
     with pytest.raises(ValueError, match="frozen"):
         run_adamo_diagnostic(*tiny_data, profile="contract-smoke", seed=9)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda value: value["frozen_development_seeds"].__setitem__(0, 15600.0),
+         "frozen seed schedule"),
+        (lambda value: value["config"].update(n_tasks=2.0), "profile configuration"),
+        (lambda value: value["arms"][0]["hyperparameters"].update(beta1=0),
+         "hyperparameter drift"),
+        (lambda value: value["arms"][0]["post_task_diagnostics"][1].update(task_index=True),
+         "task index"),
+        (lambda value: value["arms"][0]["post_task_diagnostics"][0].update(task_index=0.0),
+         "task index"),
+    ],
+)
+def test_serialized_scalar_aliases_are_rejected(
+    receipt: dict[str, object], mutation: object, message: str,
+) -> None:
+    hostile = json.loads(json.dumps(receipt))
+    assert validate_adamo_diagnostic(hostile) == receipt
+    mutation(hostile)
+    with pytest.raises(ValueError, match=message):
+        validate_adamo_diagnostic(hostile)
 
 
 def test_runner_observer_is_a_downstream_exact_function_only(

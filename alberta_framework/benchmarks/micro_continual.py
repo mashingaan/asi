@@ -217,19 +217,7 @@ def _require_builtin_finite_real(value: object, *, context: str) -> float:
 # =============================================================================
 
 _INT32_MAX: int = 2**31 - 1
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_ACTUAL_INT_TYPES: tuple[type, ...] = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 
 
 def _require_positive_int32(value: object, *, name: str, minimum: int = 1) -> int:
@@ -704,24 +692,64 @@ def bayes_predict(component_means: Array, dim_sigma: Array, x: Array) -> Array:
     the Bayes rule is ``argmax_c logsumexp_k(-0.5 * mahalanobis²(x, mu_ck))``.
     Components are visited sequentially so memory stays
     ``O(n * n_classes * n_components + n * dim)`` instead of materializing
-    the ``(n, C, K, dim)`` difference tensor.  Computing each coordinate
-    difference before squaring also avoids the catastrophic cancellation in
-    the expanded ``||x||² - 2 x·mu + ||mu||²`` identity.
+    the ``(n, C, K, dim)`` difference tensor.  Each coordinate difference is
+    formed after an exact power-of-two rescaling, which avoids both the
+    catastrophic cancellation in the expanded
+    ``||x||² - 2 x·mu + ||mu||²`` identity and float32 subtraction overflow
+    for opposite-sign extremes.  A finite direct sum of squares still feeds
+    that rule.  When every class sum overflows, the scaled log distance
+    selects the nearer class.
     """
     c, k, d = component_means.shape
-    whitened_means = (component_means / dim_sigma[None, None, :]).reshape(c * k, d)
-    whitened_x = x / dim_sigma[None, :]
+    means = component_means.reshape(c * k, d)
+    sigma_mantissa, sigma_exponent = jnp.frexp(dim_sigma)
 
-    def squared_distances(mean: Array) -> Array:
-        delta = whitened_x - mean[None, :]
-        return jnp.sum(delta * delta, axis=1)
+    def squared_distances(mean: Array) -> tuple[Array, Array]:
+        # Subtract in a shared power-of-two scale to avoid overflow and
+        # cancellation from whitening the two operands separately.
+        magnitude = jnp.maximum(jnp.abs(x), jnp.abs(mean[None, :]))
+        _, magnitude_exponent = jnp.frexp(magnitude)
+        scaled_delta = jnp.ldexp(x, -magnitude_exponent) - jnp.ldexp(
+            mean[None, :], -magnitude_exponent
+        )
+        mantissa, local_exponent = jnp.frexp(scaled_delta / sigma_mantissa)
+        exponent = magnitude_exponent + local_exponent - sigma_exponent
+        delta = jnp.ldexp(mantissa, exponent)
+        direct = jnp.sum(delta * delta, axis=1)
+
+        # Keep the exponent separate even if whitening the difference itself
+        # overflows. Zero coordinates must not set the common exponent.
+        max_exponent = jnp.max(
+            jnp.where(mantissa != 0.0, exponent, -_INT32_MAX - 1),
+            axis=1,
+        )
+        max_exponent = jnp.where(jnp.any(mantissa != 0.0, axis=1), max_exponent, 0)
+        scaled_sum = jnp.sum(
+            jnp.square(jnp.ldexp(mantissa, exponent - max_exponent[:, None])), axis=1
+        )
+        log_distance = jnp.log(scaled_sum) + (
+            jnp.asarray(2.0 * np.log(2.0), dtype=jnp.float32) * max_exponent.astype(jnp.float32)
+        )
+        return direct, log_distance
 
     # lax.map evaluates one component at a time.  Unlike vmap/broadcasting,
     # this makes the bounded-memory contract explicit while retaining a
     # vectorized reduction across samples and dimensions for each component.
-    d2 = jax.lax.map(squared_distances, whitened_means).T.reshape(-1, c, k)
+    direct_rows, log_rows = jax.lax.map(squared_distances, means)
+    d2 = direct_rows.T.reshape(-1, c, k)
+    log_d2 = log_rows.T.reshape(-1, c, k)
     scores = jax.scipy.special.logsumexp(-0.5 * d2, axis=2)
-    return jnp.argmax(scores, axis=1).astype(jnp.int32)
+    ordinary = jnp.argmax(scores, axis=1)
+    # Overflowed sums become -inf, so argmax would return class 0.
+    nearest = jnp.min(log_d2, axis=2)
+    counts = jnp.sum(log_d2 == nearest[:, :, None], axis=2)
+    min_nearest = jnp.min(nearest, axis=1, keepdims=True)
+    at_best = nearest == min_nearest
+    best_count = jnp.max(jnp.where(at_best, counts, 0), axis=1, keepdims=True)
+    eligible = at_best & (counts == best_count)
+    stable = jnp.argmax(eligible.astype(jnp.int32), axis=1)
+    overflow = ~jnp.any(jnp.isfinite(scores), axis=1)
+    return jnp.where(overflow, stable, ordinary).astype(jnp.int32)
 
 
 def two_class_bayes_accuracy(mu0: Array, mu1: Array, dim_sigma: Array) -> float:
@@ -749,15 +777,14 @@ def bayes_reference(
     seed = require_jax_seed(seed, name="seed")
     chunk_size = min(20_000, n_samples)
     class_components = config.n_classes * config.n_components
-    # Exact named host-visible arrays retained at the peak of bayes_predict:
-    # geometry + whitened geometry, y/z/eps/x, whitened x, d2, scores, and
-    # predictions. The one-component delta and expression/compiler temporaries
-    # are intentionally outside this explicitly named work contract.
+    # Preserve the conservative named-array budget, including headroom for
+    # transformed geometry and samples. Component-local expression/compiler
+    # temporaries remain outside this explicitly named work contract.
     bayes_work_scalars = (
         2 * class_components * config.dim
         + config.dim
         + 3 * chunk_size * config.dim
-        + chunk_size * class_components
+        + 2 * chunk_size * class_components
         + chunk_size * config.n_classes
         + class_components
         + 4 * chunk_size
@@ -824,12 +851,32 @@ class MicroArmSpec:
         )
 
 
+def _sgd_raw_param_update(
+    params: dict[str, Array],
+    grads: dict[str, Array],
+    *,
+    step_size: float,
+    weight_decay: float,
+) -> dict[str, Array]:
+    """Apply plain SGD with decoupled decay, skipping a frozen step size.
+
+    ``step_size=0`` is a supported freeze. Scaling infinite grads by that zero
+    step size evaluates ``0 * inf`` and would poison finite parameters.
+    """
+    decay = 1.0 - step_size * weight_decay
+    if step_size == 0.0:
+        return {name: params[name] for name in params}
+    return {
+        name: params[name] * decay - step_size * grads[name] for name in params
+    }
+
+
 def _make_sgd_raw_learner(
     hp: Mapping[str, float],
 ) -> tuple[LearnerInitFn, ScreeningStepFn]:
     """Plain SGD (optionally with decoupled decay) on raw inputs."""
     step_size = hp["step_size"]
-    decay = 1.0 - step_size * hp["weight_decay"]
+    weight_decay = hp["weight_decay"]
 
     def init_fn(params: dict[str, Array]) -> Array:
         del params
@@ -839,10 +886,12 @@ def _make_sgd_raw_learner(
         params: dict[str, Array], state: Array, grads: dict[str, Array], key: Array
     ) -> tuple[dict[str, Array], Array]:
         del key  # deterministic
-        new_params = {
-            name: params[name] * decay - step_size * grads[name] for name in params
-        }
-        return new_params, state
+        return (
+            _sgd_raw_param_update(
+                params, grads, step_size=step_size, weight_decay=weight_decay
+            ),
+            state,
+        )
 
     return _wrap_grad_learner(init_fn, step_fn)
 
@@ -1489,6 +1538,23 @@ def merge_micro_shards(
 # =============================================================================
 
 
+def _transfer_curve(value: object, arm: str, seed: int) -> np.ndarray:
+    """Return one per-regime accuracy curve, refusing it outside [0, 1]."""
+    entries = np.asarray(value).tolist()
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f"arm {arm!r} seed {seed}: per-regime curve must be a non-empty vector")
+    return np.asarray(
+        _validated_curve(
+            entries,
+            n_regimes=len(entries),
+            lower=0.0,
+            upper=1.0,
+            context=f"arm {arm!r} seed {seed}: per-regime curve",
+        ),
+        dtype=np.float64,
+    )
+
+
 def transfer_validation(
     per_arm: Mapping[str, Mapping[int, np.ndarray]],
 ) -> dict[str, Any]:
@@ -1524,18 +1590,17 @@ def transfer_validation(
     seeds = list(seed_sets[LADDER_ARMS[0]])
     if not seeds:
         raise ValueError("no seeds given")
-    lengths = {
-        np.asarray(per_arm[arm][seed]).shape[0] for arm in LADDER_ARMS for seed in seeds
+    checked = {
+        arm: {seed: _transfer_curve(per_arm[arm][seed], arm, seed) for seed in seeds}
+        for arm in LADDER_ARMS
     }
+    lengths = {checked[arm][seed].shape[0] for arm in LADDER_ARMS for seed in seeds}
     if len(lengths) != 1:
         raise ValueError(f"per-regime curves differ in length: {sorted(lengths)}")
     n_regimes = lengths.pop()
     quarter = max(1, n_regimes // 4)
 
-    curves = {
-        arm: np.stack([np.asarray(per_arm[arm][seed], dtype=np.float64) for seed in seeds])
-        for arm in LADDER_ARMS
-    }
+    curves = {arm: np.stack([checked[arm][seed] for seed in seeds]) for arm in LADDER_ARMS}
     overall = {arm: curves[arm].mean(axis=1) for arm in LADDER_ARMS}
     first_regime = {arm: curves[arm][:, 0] for arm in LADDER_ARMS}
     first_window = {arm: curves[arm][:, :quarter].mean(axis=1) for arm in LADDER_ARMS}
@@ -1807,12 +1872,21 @@ def _run_or_skip_shard(
 ) -> Path:
     """Idempotent shard execution: existing shards are validated and kept.
 
-    A shard is only reused when it was produced by the same stream config
-    and the same network size; anything else must go to a fresh directory.
+    A shard is only reused when its payload records the requested arm and
+    seed and it was produced by the same stream config and the same network
+    size; anything else must go to a fresh directory. The filename alone is
+    not identity: a relabelled copy must never stand in for a run that never
+    happened.
     """
     path = micro_shard_path(out_dir, config.family, arm_name, seed)
     if path.exists():
         payload = load_micro_shard(path)
+        if payload["arm_name"] != arm_name or payload["seed"] != seed:
+            raise ValueError(
+                f"{path}: existing shard records arm={payload['arm_name']!r} "
+                f"seed={payload['seed']}, not the requested arm={arm_name!r} "
+                f"seed={seed}; use a fresh --out directory"
+            )
         if payload["stream_config"] != config.to_config():
             raise ValueError(
                 f"{path}: existing shard was produced by a different stream "

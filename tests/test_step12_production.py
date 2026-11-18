@@ -115,6 +115,18 @@ def test_exo_cerebellum_config_nonpositive_step_size_raises() -> None:
         ExoCerebellumConfig(n_demons=3, obs_dim=4, step_size=0.0)
 
 
+def test_exo_cerebellum_config_loader_requires_exact_schema() -> None:
+    payload = ExoCerebellumConfig().to_config()
+    malformed = [
+        {key: value for key, value in payload.items() if key != "type"},
+        {**payload, "type": "RecommendationProtocolConfig"},
+        {**payload, "unexpected": 1},
+    ]
+    for candidate in malformed:
+        with pytest.raises(ValueError, match="(type|fields)"):
+            ExoCerebellumConfig.from_config(candidate)
+
+
 # ---------------------------------------------------------------------------
 # IAConfig validation
 # ---------------------------------------------------------------------------
@@ -131,6 +143,24 @@ def test_ia_config_obs_dim_mismatch_raises() -> None:
 def test_ia_config_matching_dims_ok() -> None:
     cfg = _make_ia_config(obs_dim=5)
     assert cfg.cerebellum.obs_dim == cfg.cortex.observation_dim == 5
+
+
+def test_ia_config_loader_requires_exact_schema() -> None:
+    payload = _make_ia_config().to_config()
+    wrong_cerebellum = dict(payload)
+    wrong_cerebellum["cerebellum"] = {
+        **payload["cerebellum"],
+        "type": "RecommendationProtocolConfig",
+    }
+    malformed = [
+        {key: value for key, value in payload.items() if key != "type"},
+        {**payload, "type": "ExoCerebellumConfig"},
+        {**payload, "unexpected": 1},
+        wrong_cerebellum,
+    ]
+    for candidate in malformed:
+        with pytest.raises(ValueError, match="(type|fields)"):
+            IAConfig.from_config(candidate)
 
 
 # ---------------------------------------------------------------------------
@@ -969,6 +999,18 @@ def test_recommendation_protocol_config_roundtrip() -> None:
     assert RecommendationProtocolConfig.from_config(cfg.to_config()) == cfg
 
 
+def test_recommendation_protocol_config_loader_requires_exact_schema() -> None:
+    payload = RecommendationProtocolConfig().to_config()
+    malformed = [
+        {key: value for key, value in payload.items() if key != "type"},
+        {**payload, "type": "ExoCerebellumConfig"},
+        {**payload, "unexpected": 1},
+    ]
+    for candidate in malformed:
+        with pytest.raises(ValueError, match="(type|fields)"):
+            RecommendationProtocolConfig.from_config(candidate)
+
+
 def test_recommendation_protocol_invalid_decay_raises() -> None:
     with pytest.raises(ValueError, match="acceptance_ema_decay"):
         RecommendationProtocolConfig(acceptance_ema_decay=1.0)
@@ -1113,7 +1155,7 @@ def test_step12_config_preserves_float32_boundaries() -> None:
         ({"steps": True}, "steps"),
         ({"steps": "64"}, "steps"),
         ({"seed": -1}, "seed"),
-        ({"seed": 2**31}, "seed"),
+        ({"seed": 2**32}, "seed"),
         ({"seed": True}, "seed"),
     ],
 )
@@ -1269,3 +1311,12 @@ def test_step12_smoke_result_rejects_hostile_and_boundary_scalars(
 def test_step12_smoke_result_canonicalizes_supported_numpy_step_identity() -> None:
     result = _legal_step12_smoke_result(steps=np.int64(8))
     assert type(result.steps) is int
+
+
+@pytest.mark.parametrize("seed", [0, 2**31 - 1, 2**31, 2**32 - 1, np.uint32(2**32 - 1)])
+def test_step12_smoke_preserves_full_jax_seed_domain(seed: int) -> None:
+    result = run_step12_smoke(steps=2, seed=seed)
+    assert result.finite
+    assert type(result.seed) is int
+    assert result.seed == int(seed)
+    assert json.loads(json.dumps(result.to_dict(), allow_nan=False))["seed"] == int(seed)

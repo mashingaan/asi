@@ -88,6 +88,8 @@ NORMALIZER_LIFETIME_COUNTER_DELTA_NBYTES = 8
 _INT32_MAX = 2**31 - 1
 _UINT32_MAX = 2**32 - 1
 _FLOAT32_CONSECUTIVE_INTEGER_LIMIT = 2**24
+_FLOAT32_TINY = float(np.finfo(np.float32).tiny)
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
 
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
@@ -252,6 +254,23 @@ class StreamingBatchNormalizerState:
 AnyNormalizerState = EMANormalizerState | WelfordNormalizerState | StreamingBatchNormalizerState
 
 
+def _require_feature_shapes(
+    state: AnyNormalizerState,
+    observation: Array,
+) -> None:
+    """Reject feature-axis drift before JAX can broadcast or trace it."""
+
+    expected = tuple(jnp.shape(state.mean))
+    if len(expected) != 1:
+        raise ValueError("normalizer state mean must be rank one")
+    if tuple(jnp.shape(state.var)) != expected:
+        raise ValueError("normalizer state variance shape must match mean shape")
+    if isinstance(state, WelfordNormalizerState) and tuple(jnp.shape(state.p)) != expected:
+        raise ValueError("normalizer state accumulator shape must match mean shape")
+    if tuple(jnp.shape(observation)) != expected:
+        raise ValueError("observation shape must match normalizer state mean shape")
+
+
 @chex.dataclass(frozen=True)
 class NormalizerCounterStatus:
     """Read-only preflight status for one normalizer update transaction."""
@@ -303,8 +322,10 @@ class Normalizer[
             epsilon: Small constant added to std for numerical stability
         """
         epsilon = _validated_finite_real("epsilon", epsilon)
-        if epsilon <= 0.0:
-            raise ValueError("epsilon must be finite and positive")
+        if not _FLOAT32_TINY <= epsilon <= _FLOAT32_MAX:
+            raise ValueError(
+                "epsilon must remain a positive normal finite float32 value"
+            )
         self._epsilon = epsilon
 
     @abstractmethod
@@ -437,6 +458,7 @@ class Normalizer[
         Returns:
             Normalized observation
         """
+        _require_feature_shapes(state, observation)
         std = jnp.sqrt(state.var)
         normalized = (observation - state.mean) / (std + self._epsilon)
         # Inf observation minus an inf mean is inf-inf = NaN. Zero only
@@ -561,6 +583,7 @@ class EMANormalizer(Normalizer[EMANormalizerState]):
             Tuple of (normalized_observation, new_state)
         """
         status = self.counter_status(state)
+        _require_feature_shapes(state, observation)
         observation_valid = jnp.all(jnp.isfinite(observation))
         zero_decay = state.decay == jnp.asarray(0.0, dtype=jnp.float32)
         checked_state = EMANormalizerState(
@@ -720,6 +743,7 @@ class WelfordNormalizer(Normalizer[WelfordNormalizerState]):
             Tuple of (normalized_observation, new_state)
         """
         status = self.counter_status(state)
+        _require_feature_shapes(state, observation)
         observation_valid = jnp.all(jnp.isfinite(observation))
         source_state_finite = _floating_tree_is_finite(state)
         update_available = (
@@ -847,6 +871,7 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
     ) -> NormalizerUpdateResult:
         """Normalize and conditionally commit BatchNorm-style moments."""
         status = self.counter_status(state)
+        _require_feature_shapes(state, observation)
         observation_valid = jnp.all(jnp.isfinite(observation))
         zero_momentum = state.momentum == jnp.asarray(0.0, dtype=jnp.float32)
         checked_state = StreamingBatchNormalizerState(
@@ -876,10 +901,10 @@ class StreamingBatchNormalizer(Normalizer[StreamingBatchNormalizerState]):
                 jnp.zeros_like(state.var),
                 state.var,
             )
-            candidate_var = (
-                state.momentum * var_for_update
-                + one_minus_m * (centered * centered)
-            )
+            # Apply the variance weight before squaring so a finite weighted
+            # variance does not overflow in the unweighted intermediate.
+            weighted_centered = jnp.sqrt(one_minus_m) * centered
+            candidate_var = state.momentum * var_for_update + weighted_centered * weighted_centered
             new_var = jnp.where(
                 is_first,
                 jnp.ones_like(state.var),
@@ -1007,6 +1032,8 @@ def migrate_legacy_normalizer_state(
     value may represent that exact event or any number of later updates lost
     to float32 rounding.  Such states, as well as negative, non-finite, or
     fractional counts, are rejected rather than assigned invented history.
+    Statistics must be float32 arrays of one feature shape, finite, with
+    nonnegative variance terms and a persisted rate inside ``[0, 1]``.
     """
 
     classes: dict[str, type[AnyNormalizerState]] = {
@@ -1031,6 +1058,23 @@ def migrate_legacy_normalizer_state(
         raise ValueError(
             f"legacy normalizer field manifest is not exact; missing={missing}, extra={extra}"
         )
+    feature_shape = jnp.shape(fields["mean"])
+    if len(feature_shape) != 1:
+        raise TypeError("legacy normalizer mean must be rank one")
+    for name in sorted(legacy_names - {"sample_count"}):
+        statistic = jnp.asarray(fields[name])
+        is_rate = name in {"decay", "momentum"}
+        if statistic.shape != (() if is_rate else feature_shape):
+            raise TypeError(f"legacy normalizer {name} shape does not match its feature shape")
+        if statistic.dtype != jnp.dtype(jnp.float32):
+            raise TypeError(f"legacy normalizer {name} must have dtype float32")
+        if not bool(jnp.all(jnp.isfinite(statistic))):
+            raise ValueError(f"legacy normalizer {name} must be finite")
+        if bool(jnp.any(statistic < 0.0)) and name != "mean":
+            raise ValueError(f"legacy normalizer {name} must be nonnegative")
+        if is_rate and float(statistic) > 1.0:
+            raise ValueError(f"legacy normalizer {name} must be at most 1")
+        fields[name] = statistic
     count_array = jnp.asarray(fields["sample_count"])
     if count_array.shape != () or count_array.dtype != jnp.dtype(jnp.float32):
         raise TypeError("legacy normalizer sample_count must be scalar float32")
@@ -1073,6 +1117,7 @@ def normalizer_from_config(config: dict[str, Any]) -> Normalizer[Any]:
     config = dict(config)
     type_name = config.pop("type")
     host_type_name = _require_exact_str("type_name", type_name)
+    versioned_state_schema_declared = "state_schema" in config
     state_schema = _require_exact_str(
         "state_schema", config.pop("state_schema", NORMALIZER_STATE_SCHEMA)
     )
@@ -1099,6 +1144,10 @@ def normalizer_from_config(config: dict[str, Any]) -> Normalizer[Any]:
     elif estimator_schema is not None:
         raise ValueError(f"estimator_schema is not valid for normalizer type '{host_type_name}'")
     elif host_type_name == "EMANormalizer":
+        # Convert once: the semantics check and the constructor must see the
+        # same validated value.
+        if "decay" in config:
+            config["decay"] = _validated_finite_real("decay", config["decay"])
         if _stored_float32_equals_one(config.get("decay", 0.99)):
             expected_semantics = EMA_PRIOR_CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS
             legacy_estimator_semantics = CUMULATIVE_FLOAT32_ESTIMATOR_SEMANTICS
@@ -1106,6 +1155,8 @@ def normalizer_from_config(config: dict[str, Any]) -> Normalizer[Any]:
             expected_semantics = EMA_PRIOR_BOUNDED_RECENCY_ESTIMATOR_SEMANTICS
             legacy_estimator_semantics = BOUNDED_RECENCY_ESTIMATOR_SEMANTICS
     elif host_type_name == "StreamingBatchNormalizer":
+        if "momentum" in config:
+            config["momentum"] = _validated_finite_real("momentum", config["momentum"])
         expected_semantics = (
             STATIC_AFTER_FIRST_ESTIMATOR_SEMANTICS
             if _stored_float32_equals_one(config.get("momentum", 0.99))
@@ -1125,6 +1176,17 @@ def normalizer_from_config(config: dict[str, Any]) -> Normalizer[Any]:
     cls = _NORMALIZER_REGISTRY.get(host_type_name)
     if cls is None:
         raise ValueError(f"Unknown normalizer type: '{host_type_name}'")
+    required_parameters = {
+        "EMANormalizer": {"epsilon", "decay"},
+        "WelfordNormalizer": {"epsilon"},
+        "StreamingBatchNormalizer": {"epsilon", "momentum"},
+    }[host_type_name]
+    missing_parameters = required_parameters - config.keys()
+    if versioned_state_schema_declared and missing_parameters:
+        raise ValueError(
+            "normalizer config is missing required fields: "
+            f"{sorted(missing_parameters)}"
+        )
     result: Normalizer[Any] = cls(**config)
     return result
 

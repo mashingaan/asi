@@ -16,9 +16,10 @@ import math
 import operator
 import platform
 import time
+import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Literal, SupportsIndex, cast
+from typing import IO, Literal, SupportsIndex, cast
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +30,7 @@ from jax import Array
 from alberta_framework.benchmarks.plasticity_comparators import nap_project
 from alberta_framework.benchmarks.plasticity_diagnostics import (
     INPUT_DIM,
+    MAX_DATASET_EXAMPLES,
     N_CLASSES,
     PROFILES,
     DiagnosticProfile,
@@ -42,6 +44,11 @@ from alberta_framework.benchmarks.plasticity_diagnostics import (
     _state_sha256,
     _step,
 )
+
+MAX_DATASET_UNCOMPRESSED_BYTES = (
+    MAX_DATASET_EXAMPLES * INPUT_DIM * 4 + MAX_DATASET_EXAMPLES * 4 + 8192
+)
+_NPZ_REQUIRED_MEMBERS = frozenset({"images.npy", "labels.npy"})
 
 SCHEMA = "asi.nap_ipmnist_comparator.development.v1"
 PAPER_REVISION = "arXiv:2407.01800v1"
@@ -330,9 +337,32 @@ class NaPResult:
 
 
 def _normalize(preactivation: Array) -> Array:
-    centered = preactivation - jnp.mean(preactivation, axis=-1, keepdims=True)
+    mean = jnp.mean(preactivation, axis=-1, keepdims=True)
+    centered = preactivation - mean
     variance = jnp.mean(jnp.square(centered), axis=-1, keepdims=True)
-    return centered * jax.lax.rsqrt(variance + _NORMALIZATION_EPSILON)
+    use_fallback = jnp.all(jnp.isfinite(preactivation), axis=-1, keepdims=True) & (
+        ~jnp.isfinite(mean) | ~jnp.isfinite(variance)
+    )
+    # Keep overflowed rows out of the ordinary gradient computation.
+    ordinary_centered = jnp.where(use_fallback, 0.0, centered)
+    ordinary_variance = jnp.mean(jnp.square(ordinary_centered), axis=-1, keepdims=True)
+    ordinary = ordinary_centered * jax.lax.rsqrt(ordinary_variance + _NORMALIZATION_EPSILON)
+
+    # A power-of-two scale retains the ratios even when dividing by max(abs(x))
+    # would lower to a subnormal reciprocal.
+    fallback_input = jnp.where(use_fallback, preactivation, 0.0)
+    _, exponent = jnp.frexp(jnp.max(jnp.abs(fallback_input), axis=-1, keepdims=True))
+    scaled = jnp.ldexp(fallback_input, -exponent)
+    scaled_centered = scaled - jnp.mean(scaled, axis=-1, keepdims=True)
+    scaled_variance = jnp.mean(jnp.square(scaled_centered), axis=-1, keepdims=True)
+    epsilon = jnp.asarray(_NORMALIZATION_EPSILON, dtype=preactivation.dtype)
+    scaled_denominator = jnp.where(
+        scaled_variance > 0.0,
+        scaled_variance + jnp.ldexp(epsilon, -2 * exponent),
+        1.0,
+    )
+    fallback = scaled_centered * jax.lax.rsqrt(scaled_denominator)
+    return jnp.where(use_fallback, fallback, ordinary)
 
 
 def _forward_arm(state: MLPState, inputs: Array, normalize: Array) -> tuple[Array, Array, Array]:
@@ -417,7 +447,10 @@ def _run_arm(
     seed: int,
 ) -> NaPArmResult:
     normalization_enabled, projection_enabled = _arm_flags(arm_id)
-    key = jr.key(seed)
+    # The arm root is identity-bearing: it is pinned to explicit threefry2x32 so
+    # the frozen seed pins one learner trajectory and final-state identity
+    # regardless of the ambient jax_default_prng_impl.
+    key = jr.key(seed, impl="threefry2x32")
     key, init_key = jr.split(key)
     state = _init_state(init_key, profile.hidden_width)
     initial_norms = (float(jnp.linalg.norm(state.w1)), float(jnp.linalg.norm(state.w2)))
@@ -577,7 +610,7 @@ def validate_result(value: object) -> NaPResult:
         + profile.hidden_width * profile.hidden_width
         + profile.hidden_width * N_CLASSES
     )
-    initial_state = _init_state(jr.key(0), profile.hidden_width)
+    initial_state = _init_state(jr.key(0, impl="threefry2x32"), profile.hidden_width)
     expected_state_bytes = sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(initial_state))
     for arm in value.arms:
         if type(arm) is not NaPArmResult or type(arm.receipt) is not NaPReceipt:
@@ -669,6 +702,61 @@ def _json_result(result: NaPResult) -> str:
     )
 
 
+def _npy_header(buffer: IO[bytes]) -> tuple[tuple[int, ...], np.dtype]:
+    try:
+        version = np.lib.format.read_magic(buffer)
+        if version == (1, 0):
+            shape, _fortran, dtype = np.lib.format.read_array_header_1_0(buffer)
+        elif version in ((2, 0), (3, 0)):
+            shape, _fortran, dtype = np.lib.format.read_array_header_2_0(buffer)
+        else:
+            raise ValueError("dataset NPZ npy version is unsupported")
+    except (ValueError, OSError, EOFError, KeyError) as exc:
+        raise ValueError("dataset NPZ npy header is invalid") from exc
+    try:
+        parsed = tuple(int(dim) for dim in shape)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("dataset NPZ npy header is invalid") from exc
+    return parsed, np.dtype(dtype)
+
+
+def _preflight_dataset_npz(path: Path) -> None:
+    if not zipfile.is_zipfile(path):
+        raise ValueError("dataset NPZ must be a bounded regular file")
+    try:
+        archive = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        raise ValueError("dataset NPZ must be a bounded regular file") from exc
+    with archive:
+        names = archive.namelist()
+        if len(names) != 2 or set(names) != _NPZ_REQUIRED_MEMBERS:
+            raise ValueError("dataset NPZ must contain exactly images and labels")
+        uncompressed = 0
+        for info in archive.infolist():
+            if info.is_dir() or ".." in info.filename or info.filename.startswith("/"):
+                raise ValueError("dataset NPZ must contain exactly images and labels")
+            if info.file_size < 0 or info.file_size > MAX_DATASET_UNCOMPRESSED_BYTES:
+                raise ValueError("MNIST dataset size is empty or unbounded")
+            uncompressed += info.file_size
+            if uncompressed > MAX_DATASET_UNCOMPRESSED_BYTES:
+                raise ValueError("MNIST dataset size is empty or unbounded")
+        with archive.open("images.npy") as handle:
+            image_shape, image_dtype = _npy_header(handle)
+        with archive.open("labels.npy") as handle:
+            label_shape, label_dtype = _npy_header(handle)
+    if image_dtype != np.dtype(np.float32):
+        raise ValueError("images must be an exact float32 ndarray")
+    if label_dtype != np.dtype(np.int32):
+        raise ValueError("labels must be an exact int32 ndarray")
+    if (
+        len(image_shape) != 2
+        or image_shape[1] != INPUT_DIM
+        or label_shape != (image_shape[0],)
+        or not 2 <= image_shape[0] <= MAX_DATASET_EXAMPLES
+    ):
+        raise ValueError("MNIST dataset size is empty or unbounded")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path)
@@ -698,6 +786,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         or args.dataset.stat().st_size > 256 * 1024 * 1024
     ):
         raise ValueError("dataset NPZ must be a bounded regular file")
+    _preflight_dataset_npz(args.dataset)
     with np.load(args.dataset, allow_pickle=False) as payload:
         if set(payload.files) != {"images", "labels"}:
             raise ValueError("dataset NPZ must contain exactly images and labels")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import math
+from fractions import Fraction
 
 import jax
 import jax.numpy as jnp
@@ -281,6 +282,7 @@ def test_executed_control_scalars_are_canonical_actual_float32_values() -> None:
         "sparsity": 0.345678912,
         "leaky_relu_slope": 0.0123456789,
         "lamda": 0.567891234,
+        "initial_q_value": 9.87654321,
     }
     discounted = DiscountedSARSAReferenceConfig.for_switching(
         environment,
@@ -294,6 +296,22 @@ def test_executed_control_scalars_are_canonical_actual_float32_values() -> None:
         assert getattr(discounted, name) == float(np.float32(raw))
     assert differential.core_config().q_step_size == differential.q_step_size
     assert discounted.core_config().gamma == discounted.gamma
+
+
+def test_control_scalars_round_exact_reals_directly_to_float32() -> None:
+    environment = SwitchingTwoStateConfig(phase_length=2)  # type: ignore[call-arg]
+    midpoint = Fraction(1, 1) + Fraction(1, 2**24)
+    above_midpoint = midpoint + Fraction(1, 2**100)
+    expected = float(np.nextafter(np.float32(1.0), np.float32(2.0)))
+
+    differential = DifferentialSARSAReferenceConfig.for_switching(
+        environment,
+        q_step_size=above_midpoint,
+    )
+
+    assert differential.q_step_size == expected
+    assert differential.core_config().q_step_size == expected
+    assert differential.to_config()["q_step_size"] == expected
 
 
 def test_oracle_environment_scalars_bind_the_executed_float32_values() -> None:
@@ -739,6 +757,39 @@ def test_differential_sarsa_applies_hand_computed_first_update() -> None:
     assert step.event.step_result.parameters_changed
 
 
+def test_differential_sarsa_adapter_excludes_host_clock_from_persistent_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "alberta_framework.core.average_reward.time.time",
+        lambda: 1024.0,
+    )
+    adapter = _differential_switching()
+    runner = _switching_runner(
+        adapter,
+        SwitchingTwoStateConfig(phase_length=2),  # type: ignore[call-arg]
+        lifecycle_id="control.differential.no-clock-state",
+        horizon=1,
+    )
+
+    control_state = runner.init().agent_state
+
+    assert isinstance(control_state, ReferenceLifeControlState)
+    learner = control_state.agent_state
+    assert isinstance(learner, DifferentialSARSAState)
+    assert float(learner.birth_timestamp) == 0.0
+    assert float(learner.uptime_s) == 0.0
+    adapter.validate_state(control_state)
+
+    contaminated = learner.replace(  # type: ignore[attr-defined]
+        birth_timestamp=jnp.asarray(1.0, dtype=jnp.float32)
+    )
+    with pytest.raises(DecisionOwnershipError, match="timing metadata"):
+        adapter.validate_state(
+            dataclasses.replace(control_state, agent_state=contaminated)
+        )
+
+
 def test_discounted_sarsa_updates_on_continuing_unit_discount_outcome() -> None:
     rewarding = SwitchingTwoStateConfig(  # type: ignore[call-arg]
         phase_length=10,
@@ -783,6 +834,87 @@ def test_discounted_sarsa_updates_on_continuing_unit_discount_outcome() -> None:
     assert resources.array_elements > 0
     assert resources.persistent_bytes > 0
     assert resources.floating_array_leaves > 0
+
+
+def test_discounted_sarsa_optimistic_initial_q_is_exact_and_resource_neutral() -> None:
+    environment = RiverSwimConfig(n_states=3)  # type: ignore[call-arg]
+    baseline = DiscountedSARSAReferenceAdapter(
+        DiscountedSARSAReferenceConfig.for_riverswim(
+            environment,
+            hidden_sizes=(),
+        )
+    )
+    optimistic = DiscountedSARSAReferenceAdapter(
+        DiscountedSARSAReferenceConfig.for_riverswim(
+            environment,
+            hidden_sizes=(),
+            initial_q_value=10.0,
+        )
+    )
+
+    baseline_state = baseline.init(jr.key(21), lifecycle_id="control.sarsa.baseline")
+    optimistic_state = optimistic.init(
+        jr.key(21),
+        lifecycle_id="control.sarsa.optimistic",
+    )
+    learner = optimistic_state.agent_state
+    assert isinstance(learner, SARSAState)
+    inner = learner.learner_state
+    for weights, bias in zip(
+        inner.head_params.weights,
+        inner.head_params.biases,
+        strict=True,
+    ):
+        np.testing.assert_array_equal(weights, np.full((1, 3), 10.0, dtype=np.float32))
+        np.testing.assert_array_equal(bias, np.zeros((1,), dtype=np.float32))
+    for observation in np.eye(3, dtype=np.float32):
+        values = optimistic._sarsa_agent._horde.predict(  # noqa: SLF001
+            inner,
+            jnp.asarray(observation),
+        )
+        np.testing.assert_array_equal(values, np.full((2,), 10.0, dtype=np.float32))
+
+    assert optimistic.manifest.config["initial_q_value"] == 10.0
+    assert control_state_resource_usage(optimistic_state) == control_state_resource_usage(
+        baseline_state
+    )
+
+
+def test_discounted_sarsa_default_initialization_reduces_to_explicit_none() -> None:
+    environment = RiverSwimConfig(n_states=3)  # type: ignore[call-arg]
+    default = DiscountedSARSAReferenceAdapter(
+        DiscountedSARSAReferenceConfig.for_riverswim(environment, hidden_sizes=())
+    )
+    explicit = DiscountedSARSAReferenceAdapter(
+        DiscountedSARSAReferenceConfig.for_riverswim(
+            environment,
+            hidden_sizes=(),
+            initial_q_value=None,
+        )
+    )
+
+    default_state = default.init(jr.key(22), lifecycle_id="control.sarsa.default")
+    explicit_state = explicit.init(jr.key(22), lifecycle_id="control.sarsa.explicit")
+    default_leaves = jax.tree.leaves(default_state.agent_state)
+    explicit_leaves = jax.tree.leaves(explicit_state.agent_state)
+    assert len(default_leaves) == len(explicit_leaves)
+    for default_leaf, explicit_leaf in zip(default_leaves, explicit_leaves, strict=True):
+        if jax.dtypes.issubdtype(default_leaf.dtype, jax.dtypes.prng_key):
+            np.testing.assert_array_equal(
+                jr.key_data(default_leaf),
+                jr.key_data(explicit_leaf),
+            )
+        else:
+            np.testing.assert_array_equal(default_leaf, explicit_leaf)
+
+
+def test_discounted_sarsa_optimistic_initial_q_requires_tabular_control() -> None:
+    with pytest.raises(ValueError, match="tabular empty-hidden-layer"):
+        DiscountedSARSAReferenceConfig.for_riverswim(
+            RiverSwimConfig(n_states=3),  # type: ignore[call-arg]
+            hidden_sizes=(4,),
+            initial_q_value=10.0,
+        )
 
 
 def test_learning_control_state_validation_requires_exact_persistent_dtypes() -> None:
@@ -1069,3 +1201,212 @@ def test_learning_controls_reject_increasing_epsilon_schedules(factory: object) 
             epsilon_start=0.1,
             epsilon_end=0.2,
         )
+
+
+def test_hidden_sizes_rejects_list_subclass_before_len() -> None:
+    from alberta_framework.reference_life_controls import _canonical_hidden_sizes
+
+    class HostileList(list):
+        calls = 0
+
+        def __len__(self) -> int:  # type: ignore[override]
+            type(self).calls += 1
+            raise AssertionError("HostileList.__len__ must not run")
+
+    HostileList.calls = 0
+    with pytest.raises(ValueError, match="exact tuple or list"):
+        _canonical_hidden_sizes(
+            HostileList([32]),
+            observation_dim=2,
+            n_actions=2,
+        )
+    assert HostileList.calls == 0
+
+
+# --- Opt-in optimistic initial reward rate for differential SARSA -------------------------
+
+_RIVER_SCORECARD_DIFFERENTIAL = {
+    "average_reward_step_size": 0.01,
+    "epsilon_decay_steps": 2500,
+    "epsilon_end": 0.02,
+    "epsilon_start": 0.5,
+    "q_step_size": 0.1,
+    "trace_decay": 0.0,
+    "use_bias": True,
+}
+# Values for the scorecard RiverSwim environment with the preview2 control state.
+# Preview2 binds the carried discount into the manifest and transcript identity.
+# The reward stays equal to the preview1 result because this schedule uses unit discounts.
+_DEFAULT_DIFFERENTIAL_MANIFEST = "2e8381a8e3353b0cfe81f8dc82eae8ec91aac7d0da3dcc4c407272dc58c543c0"
+_DEFAULT_DIFFERENTIAL_300_TRANSCRIPT = (
+    "2154a2a708d63221259f8ffaf4eb7287dc969ae0d994f860a6bcd09901b1c004"
+)
+_DEFAULT_DIFFERENTIAL_300_REWARD = 1.0349999768659472
+
+
+def _scorecard_river() -> RiverSwimConfig:
+    from alberta_framework.benchmarks import reference_life_scorecard as sc
+
+    return sc._river_environment_config(sc.build_development_plan())  # noqa: SLF001
+
+
+def _river_differential(**overrides: object) -> DifferentialSARSAReferenceAdapter:
+    return DifferentialSARSAReferenceAdapter(
+        DifferentialSARSAReferenceConfig.for_riverswim(
+            _scorecard_river(),
+            **(_RIVER_SCORECARD_DIFFERENTIAL | overrides),
+        )
+    )
+
+
+def _leaf_arrays(state: object) -> list[np.ndarray]:
+    leaves = []
+    for leaf in jax.tree.leaves(state):
+        if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key):
+            leaf = jr.key_data(leaf)
+        leaves.append(np.asarray(leaf))
+    return leaves
+
+
+def test_differential_initial_average_reward_default_identity_is_unchanged() -> None:
+    from alberta_framework.benchmarks import reference_life_scorecard as sc
+
+    plan_config = dict(sc.build_development_plan().arm_definition("differential_sarsa")["config"])
+    assert plan_config == _RIVER_SCORECARD_DIFFERENTIAL
+    default = _river_differential()
+    explicit = _river_differential(initial_average_reward=None)
+    assert default.manifest.manifest_id == _DEFAULT_DIFFERENTIAL_MANIFEST
+    assert explicit.manifest.manifest_id == _DEFAULT_DIFFERENTIAL_MANIFEST
+    assert "initial_average_reward" not in default.manifest.config
+
+    runner = _river_runner(
+        default, _scorecard_river(), lifecycle_id="golden.differential.70000", seed=70000,
+        horizon=300,
+    )
+    run = runner.run_to_completion(runner.init())
+    assert run.state.transcript_sha256 == _DEFAULT_DIFFERENTIAL_300_TRANSCRIPT
+    assert float(run.state.metrics.reward_sum) == _DEFAULT_DIFFERENTIAL_300_REWARD
+
+
+def test_differential_initial_average_reward_changes_only_the_reward_rate() -> None:
+    default = _river_differential()
+    optimistic = _river_differential(initial_average_reward=1.0)
+    assert optimistic.manifest.config["initial_average_reward"] == 1.0
+    assert optimistic.manifest.manifest_id != default.manifest.manifest_id
+
+    river = _scorecard_river()
+    base_runner = _river_runner(default, river, lifecycle_id="control.rbar0", seed=31)
+    high_runner = _river_runner(optimistic, river, lifecycle_id="control.rbar0", seed=31)
+    base = base_runner.init().agent_state
+    high = high_runner.init().agent_state
+    assert isinstance(base, ReferenceLifeControlState)
+    assert isinstance(high, ReferenceLifeControlState)
+    base_learner, high_learner = base.agent_state, high.agent_state
+    assert isinstance(base_learner, DifferentialSARSAState)
+    assert isinstance(high_learner, DifferentialSARSAState)
+    assert float(base_learner.average_reward) == 0.0
+    assert float(high_learner.average_reward) == 1.0
+    same_rate = high_learner.replace(  # type: ignore[attr-defined]
+        average_reward=base_learner.average_reward
+    )
+    for left, right in zip(_leaf_arrays(same_rate), _leaf_arrays(base_learner), strict=True):
+        np.testing.assert_array_equal(left, right)
+    assert base.current_action is not None and high.current_action is not None
+    assert base.current_action.to_python() == high.current_action.to_python()
+    assert control_state_resource_usage(high) == control_state_resource_usage(base)
+    optimistic.validate_state(high)
+
+
+def test_differential_initial_average_reward_first_update_is_hand_computed() -> None:
+    rewarding = SwitchingTwoStateConfig(  # type: ignore[call-arg]
+        phase_length=10,
+        payoffs_a=((1.0, 1.0), (1.0, 1.0)),
+        payoffs_b=((1.0, 1.0), (1.0, 1.0)),
+    )
+    adapter = DifferentialSARSAReferenceAdapter(
+        DifferentialSARSAReferenceConfig.for_switching(
+            rewarding,
+            q_step_size=0.5,
+            average_reward_step_size=0.25,
+            epsilon_start=0.0,
+            epsilon_end=0.0,
+            use_bias=False,
+            initial_average_reward=3.0,
+        )
+    )
+    runner = _switching_runner(
+        adapter, rewarding, lifecycle_id="control.differential.rbar0.update", horizon=1
+    )
+    initial = runner.init()
+    decision = adapter.current_decision(initial.agent_state)
+    state_index = int(np.argmax(decision.observation.to_numpy()))
+    action = decision.proposed_action.to_python()  # type: ignore[union-attr]
+    learner = runner.step(initial).state.agent_state.agent_state
+    # delta = r - Rbar0 + Q(s', a') - Q(s, a) = 1 - 3 + 0 - 0 = -2.
+    expected = np.zeros((2, 2), dtype=np.float32)
+    expected[action, state_index] = 0.5 * -2.0
+    np.testing.assert_array_equal(np.asarray(learner.q_weights), expected)
+    assert float(learner.average_reward) == 3.0 + 0.25 * -2.0
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-1.0, -1e-30, math.nan, math.inf, -math.inf, True, "1.0", 1e39],
+)
+def test_differential_initial_average_reward_rejects_invalid_values(value: object) -> None:
+    with pytest.raises(ValueError, match="initial_average_reward"):
+        DifferentialSARSAReferenceConfig.for_riverswim(
+            RiverSwimConfig(n_states=3),  # type: ignore[call-arg]
+            initial_average_reward=value,
+        )
+
+
+def test_differential_initial_average_reward_config_round_trip() -> None:
+    import json
+
+    adapter = _river_differential(initial_average_reward=0.1)
+    stored = json.loads(json.dumps(adapter.manifest.config, sort_keys=True))
+    assert stored["initial_average_reward"] == float(np.float32(0.1))
+    rebuilt = _river_differential(initial_average_reward=stored["initial_average_reward"])
+    assert rebuilt.manifest.manifest_id == adapter.manifest.manifest_id
+    assert rebuilt.config == adapter.config
+    zero = _river_differential(initial_average_reward=0.0)
+    assert zero.manifest.config["initial_average_reward"] == 0.0
+    negative_zero = _river_differential(initial_average_reward=-0.0)
+    assert math.copysign(1.0, negative_zero.config.initial_average_reward) == 1.0
+    assert negative_zero.manifest.manifest_id == zero.manifest.manifest_id
+
+
+def test_differential_uniform_q_offset_changes_no_actions() -> None:
+    """A uniform Q0 is a no-op for differential SARSA, so optimism must come from R-bar.
+
+    Drives the adapter's own core agent on a fixed observation and reward stream, so the
+    comparison isolates the learner: a constant added to every action value leaves every
+    TD error, reward-rate update, and greedy choice unchanged.
+    """
+
+    agent = _river_differential()._differential_agent  # noqa: SLF001
+    rng = np.random.default_rng(91)
+    states = rng.integers(0, 6, size=301)
+    rewards = rng.choice(np.array([0.0, 0.005, 1.0], dtype=np.float32), size=300)
+    observations = np.eye(6, dtype=np.float32)
+
+    def trajectory(offset: float) -> tuple[list[int], list[float]]:
+        state = agent.init(6, jr.key(7))
+        state = state.replace(q_bias=state.q_bias + jnp.float32(offset))
+        state, action = agent.start(state, jnp.asarray(observations[states[0]]))
+        chosen, rates = [int(action)], []
+        for t in range(300):
+            result = agent.update(
+                state, jnp.float32(rewards[t]), jnp.asarray(observations[states[t + 1]])
+            )
+            state = result.state
+            chosen.append(int(result.action))
+            rates.append(float(result.average_reward))
+        return chosen, rates
+
+    base_actions, base_rates = trajectory(0.0)
+    assert len(set(base_actions)) == 2
+    shifted_actions, shifted_rates = trajectory(8.0)
+    assert shifted_actions == base_actions
+    np.testing.assert_allclose(shifted_rates, base_rates, rtol=0, atol=1e-5)

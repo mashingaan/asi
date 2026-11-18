@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import fcntl
 import hashlib
 import json
+import multiprocessing
 import os
 import shutil
 import struct
@@ -33,11 +35,49 @@ from alberta_framework.reference_life_checkpoint import (
     load_reference_life_checkpoint,
     save_reference_life_checkpoint,
 )
-from alberta_framework.streams.closed_loop import SwitchingTwoStateConfig
+from alberta_framework.streams.closed_loop import (
+    PHASE_A,
+    PHASE_B,
+    SwitchingTwoStateConfig,
+    SwitchingTwoStateMDP,
+)
+from tests._forager_matched_platform import HAS_RENAMEAT2, requires_renameat2
 
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
 
 LIFECYCLE_ID = "prototype.0000001100000012"
+
+
+def _snapshot_after_regular_file_becomes_fifo(
+    source: str,
+    swap_started: Any,
+) -> None:
+    """Exercise the directory-entry/open race in an isolated process."""
+
+    real_open = checkpoint_module.os.open
+    swapped = False
+
+    def swap_before_open(
+        path: str | bytes | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if not swapped and path == "payload" and dir_fd is not None:
+            os.unlink(path, dir_fd=dir_fd)
+            os.mkfifo(path, dir_fd=dir_fd)
+            swapped = True
+            swap_started.set()
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    checkpoint_module.os.open = swap_before_open
+    try:
+        with pytest.raises(ValueError, match="non-regular"):
+            checkpoint_module._snapshot_checkpoint(Path(source))
+    finally:
+        checkpoint_module.os.open = real_open
 
 
 def test_switching_metric_schedule_is_constant_time_at_counter_horizon() -> None:
@@ -92,6 +132,25 @@ def test_checkpoint_validator_rejects_generation_and_zero_event_metric_forgery()
             runner.validate_checkpoint_state(forged)
 
 
+def test_checkpoint_decoder_requires_disabled_host_timing_policy() -> None:
+    config = _runner().config.config
+    runner, _prototype_config = checkpoint_module._build_runner(config)
+    accepted = runner.config.config["agent"]["config"].get("host_timing_metadata")
+
+    assert runner.config.config == config
+    assert accepted == "disabled_canonical_float32_positive_zero"
+
+    wall_clock = copy.deepcopy(config)
+    wall_clock["agent"]["config"]["host_timing_metadata"] = "wall_clock"
+    with pytest.raises(ValueError, match="host_timing_metadata is unsupported"):
+        checkpoint_module._build_runner(wall_clock)
+
+    missing = copy.deepcopy(config)
+    del missing["agent"]["config"]["host_timing_metadata"]
+    with pytest.raises(ValueError, match="agent.config fields do not match"):
+        checkpoint_module._build_runner(missing)
+
+
 def _agent_config() -> PrototypeAgentConfig:
     return PrototypeAgentConfig(
         oak=OaKConfig(
@@ -106,10 +165,16 @@ def _agent_config() -> PrototypeAgentConfig:
     )
 
 
-def _runner(*, horizon: int = 6) -> ReferenceLifeRunner:
+def _runner(
+    *,
+    horizon: int = 6,
+    environment_config: SwitchingTwoStateConfig | None = None,
+) -> ReferenceLifeRunner:
+    if environment_config is None:
+        environment_config = SwitchingTwoStateConfig(phase_length=2)  # type: ignore[call-arg]
     return build_prototype_switching_life(
         agent_config=_agent_config(),
-        environment_config=SwitchingTwoStateConfig(phase_length=2),  # type: ignore[call-arg]
+        environment_config=environment_config,
         lifecycle_id=LIFECYCLE_ID,
         seed=29,
         max_accepted_events=horizon,
@@ -188,6 +253,8 @@ def _assert_typed_exact(left: object, right: object, *, path: str = "state") -> 
 def saved_case(
     tmp_path_factory: pytest.TempPathFactory,
 ) -> tuple[ReferenceLifeRunner, ReferenceLifeState, ReferenceLifeState, Path]:
+    if not HAS_RENAMEAT2:
+        pytest.skip("atomic no-replace rename requires Linux renameat2")
     runner = _runner()
     state, _ = _advance(runner, runner.init(), 2)
     assert state.phase is LifePhase.QUIESCENT
@@ -197,6 +264,30 @@ def saved_case(
         tmp_path_factory.mktemp("reference-life-checkpoints"),
     )
     return runner, state, barrier_state, checkpoint
+
+
+@requires_renameat2
+@pytest.mark.parametrize("saved_disable_jit", [False, True])
+def test_checkpoint_rejects_changed_jit_execution_mode(
+    tmp_path: Path,
+    saved_disable_jit: bool,
+) -> None:
+    with jax.disable_jit(saved_disable_jit):
+        runner = _runner()
+        state, _ = _advance(runner, runner.init(), 2)
+        barrier, checkpoint = save_reference_life_checkpoint(runner, state, tmp_path)
+
+    with jax.disable_jit(not saved_disable_jit):
+        with pytest.raises(ValueError, match="manifest.runtime_identity"):
+            load_reference_life_checkpoint(checkpoint)
+
+    # Rejecting the changed runtime must leave the original bundle usable.
+    with jax.disable_jit(saved_disable_jit):
+        restored_runner, restored = load_reference_life_checkpoint(checkpoint)
+        original_final, original_steps = _advance(runner, barrier, 2)
+        restored_final, restored_steps = _advance(restored_runner, restored, 2)
+        _assert_typed_exact(restored_steps, original_steps, path="steps")
+        _assert_semantic_state_exact(restored_final, original_final)
 
 
 def test_quiescent_checkpoint_restores_exact_continuation(
@@ -224,6 +315,54 @@ def test_quiescent_checkpoint_restores_exact_continuation(
     assert restored_final.transcript_sha256 == uninterrupted_state.transcript_sha256
     assert restored_final.environment_rng_cursor == uninterrupted_state.environment_rng_cursor
     assert restored_final.checkpoint_generation == 1
+
+
+# The toggle cycle is optimal in both phases, and both off-diagonal float32
+# pairs (0.7 + 0.4, 0.1 + 0.2) round when added in float32.
+TOGGLE_OPTIMAL_SWITCHING = SwitchingTwoStateConfig(  # type: ignore[call-arg]
+    phase_length=2,
+    payoffs_a=((0.0, 0.7), (0.4, 0.0)),
+    payoffs_b=((0.0, 0.1), (0.2, 0.0)),
+)
+
+
+def test_checkpoint_validator_uses_the_environment_toggle_oracle() -> None:
+    environment = SwitchingTwoStateMDP(TOGGLE_OPTIMAL_SWITCHING)
+    for phase, payoff in (
+        (PHASE_A, TOGGLE_OPTIMAL_SWITCHING.payoffs_a),
+        (PHASE_B, TOGGLE_OPTIMAL_SWITCHING.payoffs_b),
+    ):
+        right, left = np.float32(payoff[0][1]), np.float32(payoff[1][0])
+        toggle = 0.5 * (float(right) + float(left))
+        assert environment.optimal_average_reward(phase) == toggle
+        assert toggle != 0.5 * float(right + left)
+
+    runner = _runner(environment_config=TOGGLE_OPTIMAL_SWITCHING)
+    state = runner.init()
+    runner.validate_checkpoint_state(state)
+    for _ in range(5):
+        state, _ = _advance(runner, state, 1)
+        assert state.phase is LifePhase.QUIESCENT
+        runner.validate_checkpoint_state(state)
+    assert state.metrics.phase_event_counts == (3, 2)
+
+
+@requires_renameat2
+def test_toggle_optimal_checkpoint_restores_exact_continuation(tmp_path: Path) -> None:
+    runner = _runner(environment_config=TOGGLE_OPTIMAL_SWITCHING)
+    state, _ = _advance(runner, runner.init(), 3)
+    assert state.phase is LifePhase.QUIESCENT
+    barrier_state, checkpoint = save_reference_life_checkpoint(runner, state, tmp_path)
+
+    uninterrupted_state, uninterrupted_steps = _advance(runner, barrier_state, 3)
+    restored_runner, restored_state = load_reference_life_checkpoint(checkpoint)
+    _assert_semantic_state_exact(restored_state, barrier_state)
+    restored_final, restored_steps = _advance(restored_runner, restored_state, 3)
+
+    _assert_typed_exact(restored_steps, uninterrupted_steps, path="steps")
+    assert uninterrupted_state.phase is LifePhase.COMPLETED
+    _assert_semantic_state_exact(restored_final, uninterrupted_state)
+    assert restored_final.transcript_sha256 == uninterrupted_state.transcript_sha256
 
 
 def _write_canonical_json(path: Path, value: dict[str, Any]) -> None:
@@ -255,6 +394,36 @@ def _rehash_bundle(path: Path) -> None:
     manifest["bundle_id"] = bundle_id
     _write_canonical_json(manifest_path, manifest)
     (path / "COMMITTED").write_text(f"{bundle_id}\n", encoding="ascii")
+
+
+def test_snapshot_rejects_same_size_source_mutation_during_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "child.bin"
+    source.write_bytes(b"a" * (2 * 1024 * 1024))
+    real_read = os.read
+    mutated = False
+
+    def mutate_between_chunks(descriptor: int, count: int) -> bytes:
+        nonlocal mutated
+        chunk = real_read(descriptor, count)
+        if chunk and not mutated:
+            mutated = True
+            source.write_bytes(b"b" * (2 * 1024 * 1024))
+        return chunk
+
+    monkeypatch.setattr(checkpoint_module.os, "read", mutate_between_chunks)
+    snapshot: Path | None = None
+    try:
+        with pytest.raises(ValueError, match="changed while copied"):
+            snapshot = checkpoint_module._snapshot_checkpoint(source_root)
+    finally:
+        if snapshot is not None:
+            shutil.rmtree(snapshot)
+    assert mutated
 
 
 def test_restore_rejects_incomplete_tampered_unknown_and_symlink_bundles(
@@ -343,6 +512,29 @@ def test_restore_rejects_incomplete_tampered_unknown_and_symlink_bundles(
         load_reference_life_checkpoint(symlinked)
 
 
+def test_snapshot_rejects_fifo_swap_without_blocking(tmp_path: Path) -> None:
+    source = tmp_path / "untrusted-checkpoint"
+    source.mkdir()
+    (source / "payload").write_bytes(b"regular before directory scan")
+
+    context = multiprocessing.get_context("spawn")
+    swap_started = context.Event()
+    process = context.Process(
+        target=_snapshot_after_regular_file_becomes_fifo,
+        args=(str(source), swap_started),
+    )
+    process.start()
+    assert swap_started.wait(timeout=15.0), "child did not reach the controlled file swap"
+    process.join(timeout=2.0)
+    exited_without_blocking = not process.is_alive()
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5.0)
+
+    assert exited_without_blocking, "snapshot blocked while opening a raced FIFO"
+    assert process.exitcode == 0
+
+
 def test_restore_rejects_rehashed_duplicate_prototype_metadata_key(
     saved_case: tuple[ReferenceLifeRunner, ReferenceLifeState, ReferenceLifeState, Path],
     tmp_path: Path,
@@ -361,6 +553,28 @@ def test_restore_rejects_rehashed_duplicate_prototype_metadata_key(
 
     with pytest.raises(ValueError, match="duplicate key 'schema'"):
         load_reference_life_checkpoint(duplicate)
+
+
+def test_restore_bounds_committed_marker_before_reading_payload(
+    saved_case: tuple[ReferenceLifeRunner, ReferenceLifeState, ReferenceLifeState, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, _, checkpoint = saved_case
+    oversized = tmp_path / "oversized-committed-marker"
+    shutil.copytree(checkpoint, oversized)
+    (oversized / "COMMITTED").write_bytes(b"0" * 66)
+    real_read_bytes = Path.read_bytes
+
+    def reject_unbounded_marker_read(path: Path) -> bytes:
+        if path.name == "COMMITTED":
+            raise AssertionError("COMMITTED must be size-checked before its payload is read")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_unbounded_marker_read)
+
+    with pytest.raises(ValueError, match="COMMITTED marker"):
+        load_reference_life_checkpoint(oversized)
 
 
 def test_publish_failure_and_existing_generation_leave_runner_unchanged(
@@ -394,6 +608,7 @@ def test_publish_failure_and_existing_generation_leave_runner_unchanged(
     assert not tuple(parent.glob(".*.staging-*"))
 
 
+@requires_renameat2
 def test_post_commit_lock_cleanup_failure_returns_committed_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -503,6 +718,7 @@ def test_save_through_ancestor_symlink_into_generation_is_rejected(
     assert restored_runner.current_state is restored_state
 
 
+@requires_renameat2
 def test_checkpoint_filesystem_publication_stays_inside_runner_barrier(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -573,3 +789,12 @@ def test_checkpoint_filesystem_publication_stays_inside_runner_barrier(
     restored_runner, restored_state = load_reference_life_checkpoint(checkpoint)
     _assert_semantic_state_exact(restored_state, barrier)
     assert restored_runner.current_state is restored_state
+
+
+@pytest.mark.skipif(HAS_RENAMEAT2, reason="tests Linux-only publication refusal off Linux")
+def test_save_reference_life_checkpoint_refuses_off_linux(tmp_path: Path) -> None:
+    runner = _runner()
+    state, _ = _advance(runner, runner.init(), 2)
+    with pytest.raises(OSError, match="atomic no-replace rename requires Linux renameat2"):
+        save_reference_life_checkpoint(runner, state, tmp_path)
+    assert not any(p.name.startswith("generation-") for p in tmp_path.iterdir())

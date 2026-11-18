@@ -38,19 +38,7 @@ from alberta_framework.core.update_safety import (
 
 _INT32_MAX: int = 2**31 - 1
 _FLOAT32_MIN_NORMAL: float = float.fromhex("0x1.0p-126")
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_ACTUAL_INT_TYPES: tuple[type, ...] = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 
 
 def _require_unit_interval(name: str, value: object) -> float:
@@ -308,6 +296,40 @@ def _softmax(logits: Array) -> Array:
     return exp / jnp.maximum(jnp.sum(exp), 1e-12)
 
 
+def _weighted_square(scale: Array, value: Array) -> Array:
+    """Return ``scale * value**2`` when the weighted square is representable.
+
+    A finite square keeps the direct product. The mantissa split applies the
+    scale before the overflowed square, and only replaces that product.
+    """
+    direct = scale * (value * value)
+    value_mantissa, value_exponent = jnp.frexp(value)
+    scale_mantissa, scale_exponent = jnp.frexp(scale)
+    recovered = jnp.ldexp(
+        scale_mantissa * (value_mantissa * value_mantissa),
+        scale_exponent + value_exponent + value_exponent,
+    )
+    return jnp.where(jnp.isfinite(direct) | ~jnp.isfinite(recovered), direct, recovered)
+
+
+def _mean_squared_distance(diffs: Array, feature_dim: int) -> Array:
+    """Mean of squared components, including a representable scaled sum.
+
+    Finite squares keep ``jnp.mean``. A finite-component reduction that
+    overflows is divided by ``feature_dim`` first, as before. A component
+    square that overflows is scaled by ``1 / feature_dim`` on its mantissa
+    and replaces the mean only when that sum is finite.
+    """
+    squared = diffs * diffs
+    ordinary = jnp.mean(squared, axis=-1)
+    components_finite = jnp.all(jnp.isfinite(squared), axis=-1)
+    divided = jnp.sum(squared / feature_dim, axis=-1)
+    ordinary = jnp.where(components_finite & ~jnp.isfinite(ordinary), divided, ordinary)
+    scale = jnp.asarray(1.0, dtype=jnp.float32) / jnp.asarray(feature_dim, dtype=jnp.float32)
+    recovered = jnp.sum(_weighted_square(scale, diffs), axis=-1)
+    return jnp.where(jnp.isfinite(ordinary) | ~jnp.isfinite(recovered), ordinary, recovered)
+
+
 class PrototypeMemoryLearner:
     """Fixed-budget multi-prototype classifier.
 
@@ -418,12 +440,12 @@ class PrototypeMemoryLearner:
     ) -> Float[Array, " n_classes"]:
         x = jnp.asarray(observation)
         diffs = state.means - x[None, None, :]
-        distances = jnp.mean(diffs * diffs, axis=2)
+        distances = _mean_squared_distance(diffs, self._config.feature_dim)
         slot_logits = -distances / jnp.asarray(self._config.bandwidth, dtype=jnp.float32)
         slot_logits = jnp.where(state.counts > 0.0, slot_logits, -jnp.inf)
         logits = jnp.max(slot_logits, axis=1)
         any_active = jnp.any(state.counts > 0.0, axis=1)
-        logits = jnp.where(any_active, logits, -1e9)
+        # Inactive classes keep -inf; only an all-empty bank becomes zeros.
         logits = jnp.where(jnp.any(any_active), logits, jnp.zeros_like(logits))
         inputs_valid = self._state_is_valid(state) & jnp.all(jnp.isfinite(x))
         return jnp.where(inputs_valid, logits, jnp.full_like(logits, jnp.nan))
@@ -545,9 +567,9 @@ class PrototypeMemoryLearner:
             used = current.counts[head] > 0.0
             has_used = jnp.any(used)
             has_empty = jnp.any(~used)
-            distances = jnp.mean(
-                (current.means[head] - safe_observation[None, :]) ** 2,
-                axis=1,
+            distances = _mean_squared_distance(
+                current.means[head] - safe_observation[None, :],
+                self._config.feature_dim,
             )
             used_distances = jnp.where(used, distances, jnp.inf)
             nearest_slot = jnp.argmin(used_distances)

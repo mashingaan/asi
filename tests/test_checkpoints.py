@@ -1,6 +1,10 @@
 """Tests for checkpoint save/load utilities."""
 
+from pathlib import Path
+from typing import NamedTuple
+
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import orbax.checkpoint as ocp
@@ -18,6 +22,16 @@ from alberta_framework import (
     load_checkpoint_metadata,
     save_checkpoint,
 )
+from alberta_framework.core.checkpoints import _require_path
+from alberta_framework.core.recurrent_trace_actor_critic import (
+    RecurrentTraceActorCriticAgent,
+    RecurrentTraceActorCriticConfig,
+)
+
+
+class _UnsortedPair(NamedTuple):
+    zeta: jax.Array
+    alpha: jax.Array
 
 
 class TestSaveLoadRoundTrip:
@@ -55,6 +69,39 @@ class TestSaveLoadRoundTrip:
 
         with pytest.raises(ValueError, match="does not match the restore template"):
             load_checkpoint(template, tmp_path / "empty_shape")
+
+    def test_template_dtype_cannot_silently_cast_saved_state(self, tmp_path):
+        saved = {"accepted_events": jnp.asarray(16_777_217, dtype=jnp.int32)}
+        template = {"accepted_events": jnp.asarray(0, dtype=jnp.float32)}
+
+        save_checkpoint(saved, tmp_path / "dtype_mismatch")
+
+        with pytest.raises(ValueError, match="dtype"):
+            load_checkpoint(template, tmp_path / "dtype_mismatch")
+
+    def test_namedtuple_state_with_unsorted_fields_round_trips(self, tmp_path):
+        """Orbax stores NamedTuple fields sorted by name, not in field order."""
+        agent = RecurrentTraceActorCriticAgent(
+            RecurrentTraceActorCriticConfig(
+                n_actions=2, hidden_size=4, encoder_width=4, output_width=4
+            )
+        )
+        state = agent.init(3, jr.key(0))
+        state = agent.start(state, jnp.ones(3, dtype=jnp.float32))[0]
+
+        save_checkpoint(state, tmp_path / "rtu")
+        loaded, _ = load_checkpoint(agent.init(3, jr.key(1)), tmp_path / "rtu")
+
+        chex.assert_trees_all_equal(loaded, state)
+
+    def test_namedtuple_template_dtype_still_cannot_cast(self, tmp_path):
+        saved = _UnsortedPair(zeta=jnp.arange(3, dtype=jnp.int32), alpha=jnp.float32(1.0))
+        template = _UnsortedPair(zeta=jnp.zeros(3, dtype=jnp.float32), alpha=jnp.float32(0.0))
+
+        save_checkpoint(saved, tmp_path / "pair")
+
+        with pytest.raises(ValueError, match="dtype"):
+            load_checkpoint(template, tmp_path / "pair")
 
     def test_user_metadata_cannot_forge_empty_array_manifest(self, tmp_path):
         saved = {"x": jnp.array([42.0], dtype=jnp.float32)}
@@ -465,3 +512,30 @@ class TestCheckpointExists:
         """checkpoint_exists should return False for a regular file."""
         (tmp_path / "not_a_ckpt").touch()
         assert not checkpoint_exists(tmp_path / "not_a_ckpt")
+
+
+@pytest.mark.parametrize("as_string", [False, True])
+def test_checkpoint_path_boundary_resolves_relative_input(tmp_path, monkeypatch, as_string):
+    monkeypatch.chdir(tmp_path)
+    relative = Path("nested") / "agent.ckpt"
+    supplied = str(relative) if as_string else relative
+
+    resolved = _require_path(supplied)
+
+    assert resolved.is_absolute()
+    assert resolved == tmp_path / relative
+
+
+def test_relative_checkpoint_round_trip_pins_absolute_target(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state = {"weights": jnp.arange(3, dtype=jnp.float32)}
+    relative = Path("nested") / "agent.ckpt"
+    absolute = tmp_path / relative
+
+    save_checkpoint(state, relative, metadata={"epoch": 7})
+
+    assert checkpoint_exists(absolute)
+    restored, metadata = load_checkpoint(state, relative)
+    chex.assert_trees_all_equal(restored, state)
+    assert metadata == {"epoch": 7}
+    assert load_checkpoint_metadata(relative) == {"epoch": 7}

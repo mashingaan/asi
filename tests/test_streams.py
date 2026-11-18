@@ -385,6 +385,16 @@ class TestPeriodicChangeStream:
         chex.assert_trees_all_close(timestep1.observation, timestep2.observation)
         chex.assert_trees_all_close(timestep1.target, timestep2.target)
 
+    @pytest.mark.parametrize("cycles", [1, 10_000, 100_000, 2_000_000])
+    def test_weights_repeat_exactly_each_period(self, cycles):
+        """float32(t) * 2*pi / period loses the phase once t exceeds 2**24."""
+        stream = PeriodicChangeStream(feature_dim=2, period=1000, noise_std=0.0)
+        state = stream.init(jax.random.key(0))
+        early, _ = stream.step(state.replace(step_count=jnp.asarray(7, dtype=jnp.int32)), 0)
+        late_step = jnp.asarray(7 + 1000 * cycles, dtype=jnp.int32)
+        late, _ = stream.step(state.replace(step_count=late_step), 0)
+        np.testing.assert_array_equal(np.asarray(late.target), np.asarray(early.target))
+
 
 class TestScaledStreamWrapper:
     """Tests for the ScaledStreamWrapper class."""
@@ -445,6 +455,14 @@ class TestScaledStreamWrapper:
         ):
             with pytest.raises(ValueError, match="finite"):
                 ScaledStreamWrapper(inner, feature_scales=scales)
+
+    def test_rejects_complex_scales_before_discarding_imaginary_components(self):
+        """A declared complex scale must not run as its real projection."""
+        inner = RandomWalkStream(feature_dim=2)
+        scales = jnp.asarray([1.0 + 8.0j, 2.0 - 3.0j], dtype=jnp.complex64)
+
+        with pytest.raises(ValueError, match="real"):
+            ScaledStreamWrapper(inner, feature_scales=scales)
 
     def test_works_with_different_streams(self, rng_key):
         """Should work with any stream implementing the protocol."""
@@ -1005,10 +1023,10 @@ class TestScheduleModuliRejectInvalid:
         chex.assert_trees_all_close(eager_timestep, jit_timestep)
         jax.block_until_ready((eager_state, jit_state))
 
-    def test_cyclic_int32_max_num_configurations_constructs(self):
-        """The representable boundary is valid even when allocation would be impractical."""
-        stream = CyclicStream(feature_dim=3, num_configurations=_INT32_MAX)
-        assert stream.feature_dim == 3
+    def test_cyclic_rejects_unnameable_configuration_working_set(self):
+        """Individually legal dimensions must not defer a huge matrix to JAX."""
+        with pytest.raises(ValueError, match="working set byte count"):
+            CyclicStream(feature_dim=3, num_configurations=59_652_323)
 
 
 def test_scaled_stream_wrapper_rejects_non_vector_feature_scales():

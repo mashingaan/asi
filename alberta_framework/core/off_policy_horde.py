@@ -25,11 +25,15 @@ from jax import Array
 from jaxtyping import Bool, Float, Int
 
 from alberta_framework.core._float32_scalars import validated_float32_scalar
-from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
+from alberta_framework.core.learners import (
+    _gradient_step_error,
+    _update_from_gradient_with_diagnostics,
+)
 from alberta_framework.core.multi_head_learner import (
     AnyOptimizer,
     MultiHeadMLPLearner,
     MultiHeadMLPState,
+    _multi_head_update_working_set_bytes,
 )
 from alberta_framework.core.normalizers import (
     EMANormalizerState,
@@ -51,21 +55,7 @@ _INT32_MAX = 2**31 - 1
 # hands its caller-supplied step arrays straight to ``jax.lax.scan`` with no
 # other cap on the scanned sequence length.
 _OFF_POLICY_HORDE_SEQUENCE_MAX_STEPS = 10_000
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _TRUSTED_REAL_TYPES = (
     _ACTUAL_INT_TYPES | frozenset(np.dtype(code).type for code in ("e", "f", "d", "g")) | {float}
 )
@@ -240,6 +230,37 @@ def _extract_mean_step_size(opt_state: Any) -> Array:
     return jnp.array(0.0, dtype=jnp.float32)
 
 
+@chex.dataclass(frozen=True, kw_only=True)
+class OffPolicyHordeState(MultiHeadMLPState):
+    """Multi-head state plus each demon's last accepted outgoing discount.
+
+    A head trace describes the observation the last accepted transition
+    consumed, before that transition's outgoing discount. TD(lambda) credit
+    assignment decays it by the discount that *entered* the current
+    observation, so the next accepted update must use that saved incoming
+    discount for the trace while the TD target keeps bootstrapping with the
+    current outgoing discount. Inactive or rejected heads retain both their
+    trace and their discount for retry. Fresh zero traces start from an inert
+    incoming discount of 1 (the same seed as ``TDIDBDState.previous_gamma``).
+
+    Only this learner's state carries the field; the generic
+    ``MultiHeadMLPState`` schema and the generic checkpoint format version
+    are unchanged. A legacy ``MultiHeadMLPState`` lacks the history and
+    cannot resume silently: construction without ``previous_discounts`` is a
+    ``TypeError`` and updating a plain ``MultiHeadMLPState`` is a
+    ``TypeError``. Adopt a legacy state explicitly with
+    ``OffPolicyHordeState(**dict(old), previous_discounts=known_history)``
+    using a float32 vector holding each head's last accepted outgoing
+    discount; adoption does not repair earlier mislearning.
+
+    Attributes:
+        previous_discounts: Per-demon float32 vector of the outgoing discount
+            of each head's last accepted transition, shape ``(n_demons,)``.
+    """
+
+    previous_discounts: Float[Array, " n_demons"]
+
+
 @chex.dataclass(frozen=True)
 class OffPolicyHordeUpdateResult:
     """Result of one off-policy Horde update.
@@ -248,7 +269,7 @@ class OffPolicyHordeUpdateResult:
         state: Updated shared-trunk multi-head learner state.
         predictions: Predictions at ``s_t``, shape ``(n_demons,)``.
         next_predictions: Bootstrap predictions at ``s_{t+1}``.
-        td_targets: TD targets ``c_t + gamma_t V(s_{t+1})``.
+        td_targets: TD targets ``c_t + gamma_t V(s_{t+1}) + (1 - gamma_t) z``.
         td_errors: Unweighted TD errors.
         rhos: Raw importance-sampling ratios.
         clipped_rhos: Ratios after update clipping.
@@ -344,8 +365,12 @@ class OffPolicyHordeLearner:
 
     ``delta_i = c_i + gamma_i V_i(s') - V_i(s)``
 
-    ``z_i <- gamma_i lambda_i min(rho_i, trace_ratio_clip) z_i
-    + min(rho_i, ratio_clip) grad V_i(s)``
+    ``z_i <- gamma_i^prev lambda_i min(rho_i, trace_ratio_clip) z_i
+    + min(rho_i, ratio_clip) grad V_i(s)``, where ``gamma_i^prev`` is the
+    PRIOR call's discount for demon ``i`` (the discount into the state being
+    processed); the current call's discount only controls the TD bootstrap.
+    A terminal transition therefore still credits the episode trace instead
+    of wiping it before the terminal error is applied.
 
     ``w_i <- w_i + alpha delta_i z_i``
 
@@ -411,6 +436,9 @@ class OffPolicyHordeLearner:
         )
 
         self._horde_spec = horde_spec
+        self._terminal_rewards = jnp.array(
+            [demon.terminal_reward for demon in horde_spec.demons], dtype=jnp.float32
+        )
         self._hidden_sizes = hidden_sizes
         self._optimizer: AnyOptimizer = (
             optimizer if optimizer is not None else LMS(step_size=step_size)
@@ -473,9 +501,41 @@ class OffPolicyHordeLearner:
         """Eligibility-trace ratio clip."""
         return self._trace_ratio_clip
 
-    def init(self, feature_dim: int, key: Array) -> MultiHeadMLPState:
-        """Initialize learner state."""
-        return self._learner.init(feature_dim, key)
+    def init(self, feature_dim: int, key: Array) -> OffPolicyHordeState:
+        """Initialize zero eligibility and the explicit per-demon discount history."""
+        feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        # Extend the wrapped learner's source/proposed/committed envelope by
+        # the three simultaneously live copies of the new float32 vector
+        # before the wrapped learner allocates anything.
+        if (
+            _multi_head_update_working_set_bytes(self.n_demons, self._hidden_sizes, feature_dim)
+            + 12 * self.n_demons
+            > _INT32_MAX
+        ):
+            raise ValueError("off-policy Horde update working set bytes must fit signed int32")
+        base = self._learner.init(feature_dim, key)
+        return OffPolicyHordeState(
+            **dict(cast(Mapping[str, Any], base)),
+            previous_discounts=jnp.ones(self.n_demons, dtype=jnp.float32),
+        )  # type: ignore[call-arg]
+
+    @staticmethod
+    def _require_previous_discounts(state: MultiHeadMLPState, n_demons: int) -> Array:
+        """Return the carried incoming discounts or fail closed on legacy/malformed state."""
+        if not isinstance(state, OffPolicyHordeState):
+            raise TypeError(
+                "state must be an OffPolicyHordeState carrying previous_discounts; adopt a "
+                "legacy MultiHeadMLPState explicitly with OffPolicyHordeState(**dict(state), "
+                "previous_discounts=<float32 vector of each head's last accepted discount>)"
+            )
+        previous_discounts = state.previous_discounts
+        if not isinstance(previous_discounts, jax.Array):
+            raise TypeError("state.previous_discounts must be a float32 JAX array")
+        if jnp.dtype(previous_discounts.dtype) != jnp.dtype(jnp.float32):
+            raise TypeError("state.previous_discounts must have dtype float32")
+        if tuple(previous_discounts.shape) != (n_demons,):
+            raise ValueError("state.previous_discounts must have shape (n_demons,)")
+        return previous_discounts
 
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict(self, state: MultiHeadMLPState, observation: Array) -> Array:
@@ -553,8 +613,23 @@ class OffPolicyHordeLearner:
         rhos: Array,
         discounts: Array,
     ) -> OffPolicyHordeUpdateResult:
-        """Update using explicit ratios and transition discounts."""
+        """Update using explicit ratios and transition discounts.
+
+        ``discounts`` are the *outgoing* discounts of this transition and
+        drive the TD target. The head traces decay by the *incoming*
+        discounts carried in ``state.previous_discounts`` (each head's last
+        accepted outgoing discount), which accepted heads then overwrite with
+        this transition's ``discounts``. A legacy ``MultiHeadMLPState`` or a
+        non-canonical history raises; a non-finite or out-of-``[0, 1]``
+        history rejects the whole transaction atomically.
+        """
         n_demons = self.n_demons
+        previous_discounts = self._require_previous_discounts(state, n_demons)
+        history_valid = jnp.all(
+            jnp.isfinite(previous_discounts)
+            & (previous_discounts >= 0.0)
+            & (previous_discounts <= 1.0)
+        )
         replacing = self._trace_mode == TraceMode.REPLACING
         counter_status = self._learner._counter_status(state)
 
@@ -576,7 +651,11 @@ class OffPolicyHordeLearner:
             jnp.zeros_like(next_predictions),
             next_predictions,
         )
-        td_targets = cumulants + discounts * bootstrap_predictions
+        td_targets = (
+            cumulants
+            + discounts * bootstrap_predictions
+            + (1.0 - discounts) * self._terminal_rewards
+        )
         requested_mask = ~jnp.isnan(cumulants)
         checked_state = state
         if self._utility_decay == 0.0:
@@ -590,8 +669,10 @@ class OffPolicyHordeLearner:
                 trunk_traces=tuple(jnp.zeros_like(trace) for trace in state.trunk_traces),
             )
         lamdas = self._horde_spec.lamdas
+        # The carried trace is only consumed through its incoming-discount
+        # decay, so a zero *outgoing* discount must not hide a poisoned trace.
         head_decay_unused = jnp.all(
-            (discounts == 0.0) | (jnp.asarray(lamdas, dtype=jnp.float32) == 0.0)
+            (previous_discounts == 0.0) | (jnp.asarray(lamdas, dtype=jnp.float32) == 0.0)
         )
         checked_state = checked_state.replace(  # type: ignore[attr-defined]
             head_traces=tuple(
@@ -602,7 +683,7 @@ class OffPolicyHordeLearner:
                 for old_w, old_b in state.head_traces
             )
         )
-        source_state_finite = _floating_tree_is_finite(checked_state)
+        source_state_finite = _floating_tree_is_finite(checked_state) & history_valid
         global_inputs_valid = jnp.all(jnp.isfinite(observation))
         next_observation_valid = jnp.all(jnp.isfinite(next_observation))
         head_inputs_valid = (
@@ -619,7 +700,7 @@ class OffPolicyHordeLearner:
         safe_targets = jnp.where(active_mask, td_targets, 0.0)
         safe_clipped_rhos = jnp.where(active_mask, clipped_rhos, 0.0)
         safe_trace_coefficients = jnp.where(active_mask, trace_coefficients, 0.0)
-        safe_discounts = jnp.where(active_mask, discounts, 0.0)
+        safe_previous_discounts = jnp.where(active_mask, previous_discounts, 0.0)
 
         obs = observation
         new_normalizer_state = state.normalizer_state
@@ -721,6 +802,7 @@ class OffPolicyHordeLearner:
                 state.trunk_optimizer_states[2 * i],
                 new_w_trace,
                 error=None,
+                param=state.trunk_params.weights[i],
             )
             trunk_steps.append(w_step)
             new_trunk_opt_states.append(new_w_opt)
@@ -738,6 +820,7 @@ class OffPolicyHordeLearner:
                 state.trunk_optimizer_states[2 * i + 1],
                 new_b_trace,
                 error=None,
+                param=state.trunk_params.biases[i],
             )
             trunk_steps.append(b_step)
             new_trunk_opt_states.append(new_b_opt)
@@ -749,13 +832,14 @@ class OffPolicyHordeLearner:
             for i in range(n_trunk_layers):
                 trunk_params_flat.append(state.trunk_params.weights[i])
                 trunk_params_flat.append(state.trunk_params.biases[i])
+            # The bounder's metric is a reporting scalar (ObGD's step scale,
+            # AGC's clipped-unit fraction); it must never scale the traces.
             bounded_trunk_steps, trunk_bounding_metric = self._bounder.bound(
                 tuple(trunk_steps),
                 jnp.array(1.0, dtype=jnp.float32),
                 tuple(trunk_params_flat),
             )
             trunk_steps = list(bounded_trunk_steps)
-            new_trunk_traces = [trunk_bounding_metric * t for t in new_trunk_traces]
 
         new_trunk_weights: list[Array] = []
         new_trunk_biases: list[Array] = []
@@ -789,11 +873,14 @@ class OffPolicyHordeLearner:
             # as it enters the trace, and the trace decay carries the
             # (trace-clipped) ratio forward, so ``z = rho (gl z + grad)``
             # when the two clips agree.  The update below is ``delta * z``
-            # with no additional ratio.
+            # with no additional ratio.  The decay uses the *incoming*
+            # discount carried from the last accepted transition (gamma_t in
+            # Sutton & Barto eq. 12.25); only the TD target above uses this
+            # transition's outgoing discount.
             safe_hidden = jnp.where(active_mask[i], hidden, jnp.zeros_like(hidden))
             w_grad = safe_clipped_rhos[i] * safe_hidden.reshape(1, -1)
             b_grad = safe_clipped_rhos[i] * jnp.ones(1, dtype=jnp.float32)
-            head_gl = safe_discounts[i] * lamdas[i] * safe_trace_coefficients[i]
+            head_gl = safe_previous_discounts[i] * lamdas[i] * safe_trace_coefficients[i]
 
             if replacing:
                 new_w_trace = jnp.where(
@@ -816,27 +903,30 @@ class OffPolicyHordeLearner:
                 old_w_opt,
                 new_w_trace,
                 error=error_i,
+                param=head_w,
             )
             b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
                 head_optimizer,
                 old_b_opt,
                 new_b_trace,
                 error=error_i,
+                param=head_b,
             )
             optimizer_updates_applied.extend((w_update_applied, b_update_applied))
+            step_error = _gradient_step_error(head_optimizer, error_i)
 
+            # Head bounding only rescales the applied step; the traces keep
+            # their gamma * lambda decay.
             if self._bounder is not None:
-                bounded_head_steps, bound_scale = self._bounder.bound(
+                bounded_head_steps, _bound_metric = self._bounder.bound(
                     (w_step, b_step),
-                    error_i,
+                    step_error,
                     (head_w, head_b),
                 )
                 w_step, b_step = bounded_head_steps
-                new_w_trace = bound_scale * new_w_trace
-                new_b_trace = bound_scale * new_b_trace
 
-            new_w = head_w + error_i * w_step
-            new_b = head_b + error_i * b_step
+            new_w = head_w + step_error * w_step
+            new_b = head_b + step_error * b_step
             # Inf TD error zeros the ObGD step, then error_i * step is 0*inf=NaN.
             # Hold that head's previous finite params/traces/opt like a NaN cumulant.
             head_ok = (
@@ -905,7 +995,7 @@ class OffPolicyHordeLearner:
             weights=tuple(new_head_weights),
             biases=tuple(new_head_biases),
         )  # type: ignore[call-arg]
-        new_state = MultiHeadMLPState(
+        new_state = OffPolicyHordeState(
             trunk_params=new_trunk_params,
             head_params=new_head_params,
             trunk_optimizer_states=tuple(new_trunk_opt_states),
@@ -918,6 +1008,9 @@ class OffPolicyHordeLearner:
             step_words=counter_status.proposed_step_words,
             birth_timestamp=state.birth_timestamp,
             uptime_s=state.uptime_s,
+            # Only accepted active heads advance their incoming discount;
+            # inactive and rejected heads keep trace and discount for retry.
+            previous_discounts=jnp.where(active_mask, discounts, previous_discounts),
         )  # type: ignore[call-arg]
 
         candidate_state_finite = _floating_tree_is_finite(new_state)
@@ -1018,8 +1111,36 @@ class OffPolicyHordeLearner:
             optimizer_from_config,
         )
 
-        config = dict(config)
-        config.pop("type", None)
+        expected_fields = {
+            "type",
+            "horde_spec",
+            "hidden_sizes",
+            "optimizer",
+            "bounder",
+            "normalizer",
+            "sparsity",
+            "leaky_relu_slope",
+            "use_layer_norm",
+            "head_optimizer",
+            "trace_mode",
+            "utility_decay",
+            "ratio_clip",
+            "trace_ratio_clip",
+            "min_behavior_probability",
+        }
+        if type(config) is not dict or any(type(key) is not str for key in config):
+            raise ValueError("OffPolicyHordeLearner config must be an exact dict")
+        if set(config) != expected_fields:
+            raise ValueError("OffPolicyHordeLearner config fields do not match the schema")
+        if type(config["type"]) is not str or config["type"] != "OffPolicyHordeLearner":
+            raise ValueError("OffPolicyHordeLearner config type is invalid")
+        if type(config["hidden_sizes"]) is not list:
+            raise ValueError("OffPolicyHordeLearner config hidden_sizes must be a list")
+        if type(config["trace_mode"]) is not str:
+            raise ValueError("OffPolicyHordeLearner config trace_mode must be a string")
+
+        config = config.copy()
+        config.pop("type")
         horde_spec = HordeSpec.from_config(config.pop("horde_spec"))
         optimizer = optimizer_from_config(config.pop("optimizer"))
         bounder_cfg = config.pop("bounder", None)
@@ -1088,6 +1209,9 @@ class NonlinearSharedGTDHordeLearner:
                 raise ValueError(f"{name} must contain values in [0, 1]")
         hidden_size = _require_int32("hidden_size", hidden_size, minimum=1)
         self._horde_spec = horde_spec
+        self._terminal_rewards = jnp.array(
+            [demon.terminal_reward for demon in horde_spec.demons], dtype=jnp.float32
+        )
         self._hidden_size = hidden_size
         self._primary_step_size = _require_float32(
             "primary_step_size", primary_step_size, positive=True
@@ -1330,7 +1454,11 @@ class NonlinearSharedGTDHordeLearner:
             jnp.zeros_like(next_predictions),
             next_predictions,
         )
-        td_targets = cumulants + discounts * bootstrap_predictions
+        td_targets = (
+            cumulants
+            + discounts * bootstrap_predictions
+            + (1.0 - discounts) * self._terminal_rewards
+        )
         td_errors = td_targets - predictions
         requested = ~jnp.isnan(cumulants)
         active_mask = (
@@ -1393,58 +1521,72 @@ class NonlinearSharedGTDHordeLearner:
             # (NaN cumulant) contribute nothing this step.
             masked_rho = jnp.where(effective_mask[i], clipped_rhos[i], 0.0)
             terminated_i = discounts[i] == 0.0
+            # A zero ratio means this demon contributes nothing to the shared
+            # trunk this step. Multiplying it through an overflowed
+            # ``secondary_dot`` or gradient would form 0*inf=NaN and, because
+            # the trunk steps are summed across demons, reject the whole
+            # update for every healthy demon too. Skip the product instead.
+            rho_discount = _skip_zero_scale(masked_rho, discounts[i])
             rho_dot = jnp.where(
                 terminated_i,
                 jnp.zeros_like(secondary_dot),
-                masked_rho * discounts[i] * secondary_dot,
+                _skip_zero_scale(rho_discount, secondary_dot),
             )
             correction_trunk_w = jnp.where(
                 terminated_i,
                 jnp.zeros_like(next_grad_trunk_w),
-                rho_dot * next_grad_trunk_w,
+                _skip_zero_scale(rho_dot, next_grad_trunk_w),
             )
             correction_trunk_b = jnp.where(
                 terminated_i,
                 jnp.zeros_like(next_grad_trunk_b),
-                rho_dot * next_grad_trunk_b,
+                _skip_zero_scale(rho_dot, next_grad_trunk_b),
             )
             correction_head_w = jnp.where(
                 terminated_i,
                 jnp.zeros_like(next_grad_head_w),
-                rho_dot * next_grad_head_w,
+                _skip_zero_scale(rho_dot, next_grad_head_w),
             )
             correction_head_b = jnp.where(
                 terminated_i,
                 jnp.zeros_like(next_grad_head_b),
-                rho_dot * next_grad_head_b,
+                _skip_zero_scale(rho_dot, next_grad_head_b),
             )
-            rho_delta = masked_rho * safe_td_errors[i]
+            rho_delta = _skip_zero_scale(masked_rho, safe_td_errors[i])
 
             trunk_w_step = trunk_w_step + primary_alpha * (
-                rho_delta * grad_trunk_w - correction_trunk_w
+                _skip_zero_scale(rho_delta, grad_trunk_w) - correction_trunk_w
             )
             trunk_b_step = trunk_b_step + primary_alpha * (
-                rho_delta * grad_trunk_b - correction_trunk_b
+                _skip_zero_scale(rho_delta, grad_trunk_b) - correction_trunk_b
             )
             head_w_step = head_w_step.at[i].add(
-                primary_alpha * (rho_delta * grad_head_w - correction_head_w)
+                primary_alpha * (_skip_zero_scale(rho_delta, grad_head_w) - correction_head_w)
             )
             head_b_step = head_b_step.at[i].add(
-                primary_alpha * (rho_delta * grad_head_b - correction_head_b)
+                primary_alpha * (_skip_zero_scale(rho_delta, grad_head_b) - correction_head_b)
             )
 
             masked_beta = jnp.where(effective_mask[i], secondary_beta, 0.0)
-            sec_trunk_w = state.secondary_trunk_w[i] + masked_beta * (
-                rho_delta * grad_trunk_w - secondary_dot * grad_trunk_w
+            sec_trunk_w = state.secondary_trunk_w[i] + _skip_zero_scale(
+                masked_beta,
+                _skip_zero_scale(rho_delta, grad_trunk_w)
+                - _skip_zero_scale(secondary_dot, grad_trunk_w),
             )
-            sec_trunk_b = state.secondary_trunk_b[i] + masked_beta * (
-                rho_delta * grad_trunk_b - secondary_dot * grad_trunk_b
+            sec_trunk_b = state.secondary_trunk_b[i] + _skip_zero_scale(
+                masked_beta,
+                _skip_zero_scale(rho_delta, grad_trunk_b)
+                - _skip_zero_scale(secondary_dot, grad_trunk_b),
             )
-            sec_head_w = state.secondary_head_w[i] + masked_beta * (
-                rho_delta * grad_head_w - secondary_dot * grad_head_w
+            sec_head_w = state.secondary_head_w[i] + _skip_zero_scale(
+                masked_beta,
+                _skip_zero_scale(rho_delta, grad_head_w)
+                - _skip_zero_scale(secondary_dot, grad_head_w),
             )
-            sec_head_b = state.secondary_head_b[i] + masked_beta * (
-                rho_delta * grad_head_b - secondary_dot * grad_head_b
+            sec_head_b = state.secondary_head_b[i] + _skip_zero_scale(
+                masked_beta,
+                _skip_zero_scale(rho_delta, grad_head_b)
+                - _skip_zero_scale(secondary_dot, grad_head_b),
             )
             new_secondary_trunk_w.append(sec_trunk_w)
             new_secondary_trunk_b.append(sec_trunk_b)
@@ -1598,8 +1740,10 @@ def run_off_policy_horde_learning_loop(
         (observations, cumulants, next_observations, rhos, discounts),
     )
     elapsed = time.time() - t0
+    # Host-only clocks are narrowed while carried through the traced scan.
     final_state = final_state.replace(  # type: ignore[attr-defined]
-        uptime_s=final_state.uptime_s + elapsed
+        birth_timestamp=state.birth_timestamp,
+        uptime_s=state.uptime_s + elapsed,
     )
 
     return OffPolicyHordeLearningResult(
@@ -1670,6 +1814,7 @@ __all__ = [
     "NonlinearSharedGTDHordeUpdateResult",
     "OffPolicyHordeLearner",
     "OffPolicyHordeLearningResult",
+    "OffPolicyHordeState",
     "OffPolicyHordeUpdateResult",
     "run_off_policy_horde_learning_loop",
     "run_off_policy_horde_learning_loop_batched",

@@ -122,12 +122,178 @@ def test_nap_projection_and_off_reduction() -> None:
     assert np.isclose(float(jnp.linalg.norm(nap_project(weights, initial_norm=2.0))), 2.0)
 
 
+def test_nap_projection_preserves_radius_when_direct_norm_overflows() -> None:
+    weights = jnp.asarray([1.5e19, 1.5e19], dtype=jnp.float32)
+    assert bool(jnp.all(jnp.isfinite(weights)))
+    assert bool(jnp.isinf(jnp.linalg.norm(weights)))
+
+    projected = nap_project(weights, initial_norm=3.0)
+
+    assert projected.dtype == weights.dtype
+    assert bool(jnp.all(jnp.isfinite(projected)))
+    assert np.linalg.norm(np.asarray(projected, dtype=np.float64)) == pytest.approx(
+        3.0,
+        rel=1e-6,
+    )
+
+
+def test_nap_projection_preserves_radius_when_reciprocal_underflows() -> None:
+    weights = jnp.asarray([3.0e38], dtype=jnp.float32)
+    wide_norm = np.linalg.norm(np.asarray(weights, dtype=np.float64))
+    assert np.isfinite(wide_norm)
+    norm = jnp.asarray(wide_norm, dtype=jnp.float32)
+    assert bool(jnp.isfinite(norm))
+    assert float(jnp.asarray(3.0, dtype=jnp.float32) / norm) == 0.0
+
+    projected = nap_project(weights, initial_norm=3.0)
+
+    assert np.linalg.norm(np.asarray(projected, dtype=np.float64)) == pytest.approx(
+        3.0,
+        rel=1e-6,
+    )
+
+
+def test_nap_projection_preserves_radius_when_normalization_overflows() -> None:
+    weights = jnp.asarray([1.0e-18], dtype=jnp.float32)
+    target_norm = 3.0e38
+    norm = jnp.linalg.norm(weights)
+    assert bool(jnp.isfinite(norm) & (norm > 0))
+    assert bool(jnp.isinf(jnp.asarray(target_norm, dtype=weights.dtype) / norm))
+
+    eager = nap_project(weights, initial_norm=target_norm)
+    compiled = jax.jit(lambda value: nap_project(value, initial_norm=target_norm))(weights)
+
+    for projected in (eager, compiled):
+        assert bool(jnp.all(jnp.isfinite(projected)))
+        assert np.linalg.norm(np.asarray(projected, dtype=np.float64)) == pytest.approx(
+            target_norm,
+            rel=1e-6,
+        )
+
+
+def test_nap_projection_preserves_radius_when_direct_multiply_overflows() -> None:
+    weights = jnp.asarray([100.0], dtype=jnp.float32)
+    target_norm = float(np.finfo(np.float32).max)
+    norm = jnp.linalg.norm(weights)
+    normalization = jnp.asarray(target_norm, dtype=weights.dtype) / norm
+    assert bool(jnp.isfinite(normalization))
+    assert bool(jnp.isinf(weights[0] * normalization))
+
+    eager = nap_project(weights, initial_norm=target_norm)
+    compiled = jax.jit(lambda value: nap_project(value, initial_norm=target_norm))(weights)
+
+    for projected in (eager, compiled):
+        assert bool(jnp.all(jnp.isfinite(projected)))
+        assert float(projected[0]) == target_norm
+
+
+def test_nap_projection_preserves_radius_when_direct_norm_underflows() -> None:
+    weights = jnp.asarray([1.0e-30, 1.0e-30], dtype=jnp.float32)
+    assert bool(jnp.any(weights != 0))
+    assert float(jnp.linalg.norm(weights)) == 0.0
+
+    eager = nap_project(weights, initial_norm=3.0)
+    compiled = jax.jit(lambda value: nap_project(value, initial_norm=3.0))(weights)
+
+    for projected in (eager, compiled):
+        assert np.linalg.norm(np.asarray(projected, dtype=np.float64)) == pytest.approx(
+            3.0,
+            rel=1e-6,
+        )
+    assert bool(jnp.all(nap_project(weights, initial_norm=0.0) == 0))
+
+
+def test_nap_projection_uses_wide_accumulation_for_large_low_precision_array() -> None:
+    weights = jnp.ones((262_144,), dtype=jnp.float16)
+    assert bool(jnp.isinf(jnp.linalg.norm(weights)))
+
+    projected = nap_project(weights, initial_norm=3.0)
+
+    assert projected.dtype == weights.dtype
+    assert bool(jnp.all(jnp.isfinite(projected)))
+    assert np.linalg.norm(np.asarray(projected, dtype=np.float64)) == pytest.approx(
+        3.0,
+        rel=1e-3,
+    )
+
+
+def test_nap_projection_uses_wide_direct_norm_for_low_precision_array() -> None:
+    weights = jnp.asarray([0.001, 0.001], dtype=jnp.float16)
+    assert bool(jnp.isfinite(jnp.linalg.norm(weights)))
+
+    eager = nap_project(weights, initial_norm=1.0)
+    compiled = jax.jit(lambda value: nap_project(value, initial_norm=1.0))(weights)
+
+    for projected in (eager, compiled):
+        assert projected.dtype == weights.dtype
+        assert np.linalg.norm(np.asarray(projected, dtype=np.float64)) == pytest.approx(
+            1.0,
+            rel=2e-3,
+        )
+
+
 def test_c_chain_churn_loss_and_off_reduction() -> None:
     before = jnp.asarray([1.0, 2.0])
     after = jnp.asarray([2.0, 4.0])
     assert float(churn_loss(before, after, strength=0)) == 0
     assert np.isclose(float(churn_loss(before, after, strength=1)), 1.25)
     assert int(ntk_threshold_rank(jnp.eye(3), threshold=0.66)) == 2
+
+
+def _scaled_square_sum(delta: np.ndarray, scale: np.float32) -> np.float32:
+    total = np.float32(0.0)
+    for value in np.asarray(delta, dtype=np.float32).reshape(-1):
+        with np.errstate(over="ignore"):
+            square = value * value
+            ordinary = scale * square
+            value_mantissa, value_exponent = np.frexp(value)
+            scale_mantissa, scale_exponent = np.frexp(scale)
+            recovered = np.ldexp(
+                scale_mantissa * value_mantissa * value_mantissa,
+                int(scale_exponent) + 2 * int(value_exponent),
+            )
+        piece = ordinary if np.isfinite(square) or not np.isfinite(recovered) else recovered
+        total = np.float32(total + np.float32(piece))
+    return total
+
+
+def test_churn_loss_keeps_direct_square_for_modest_predictions() -> None:
+    before = jnp.asarray([1.0, 2.0], dtype=jnp.float32)
+    after = jnp.asarray([2.0, 4.0], dtype=jnp.float32)
+    loss = churn_loss(before, after, strength=1.0)
+    assert loss.dtype == jnp.float32
+    assert float(loss) == float(np.float32(1.25))
+
+
+@pytest.mark.parametrize("sign", [np.float32(1.0), np.float32(-1.0)])
+def test_churn_loss_keeps_representable_square(sign: np.float32) -> None:
+    """Half a mean square stays finite when a component square overflows."""
+    before = jnp.zeros((1,), dtype=jnp.float32)
+    after = jnp.asarray([sign * np.float32(2.0e19)], dtype=jnp.float32)
+    expected = _scaled_square_sum(np.asarray([sign * np.float32(2.0e19)]), np.float32(0.5))
+    with np.errstate(over="ignore"):
+        raw_square = np.float32(2.0e19) * np.float32(2.0e19)
+    assert not np.isfinite(raw_square)
+    assert np.isfinite(expected)
+
+    loss = churn_loss(before, after, strength=1.0)
+    compiled = jax.jit(lambda left, right: churn_loss(left, right, strength=1.0))(before, after)
+    assert float(np.asarray(loss)) == float(expected)
+    assert float(np.asarray(compiled)) == float(expected)
+
+
+def test_churn_loss_rejects_unrepresentable_square() -> None:
+    before = jnp.zeros((1,), dtype=jnp.float32)
+    after = jnp.asarray([np.float32(1.0e20)], dtype=jnp.float32)
+    with pytest.raises(ValueError, match="churn loss"):
+        churn_loss(before, after, strength=1.0)
+
+
+def test_ntk_threshold_rank_never_exceeds_singular_dimension() -> None:
+    mat = jr.normal(jr.key(0), (20, 20), dtype=jnp.float32)
+    rank = int(ntk_threshold_rank(mat, threshold=1.0))
+    assert 1 <= rank <= 20
+    assert int(ntk_threshold_rank(jnp.zeros((10, 10), dtype=jnp.float32), threshold=1.0)) == 0
 
 
 def test_low_cost_activation_and_feature_controls() -> None:
@@ -321,3 +487,22 @@ def test_jitted_pure_kernel_matches_eager_without_partial_state() -> None:
     assert all(bool(jnp.all(jnp.isnan(value))) for value in updated)
     with pytest.raises(ValueError, match="Threefry"):
         interval_dropout(jnp.ones(1), jnp.asarray([0, 0], dtype=jnp.uint32), relu_probability=1)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("arm", ["smooth_leaky", "smooth_leaky_off"])
+def test_smooth_leaky_training_gradient_is_finite_in_saturation_tails(
+    compiled: bool, arm: str,
+) -> None:
+    from alberta_framework.benchmarks.low_cost_controls_ipmnist import _activate
+
+    values = jnp.asarray([-60.0, -2.0, 0.0, 2.0, 60.0], dtype=jnp.float32)
+    gradient = jax.grad(lambda x: jnp.sum(_activate(arm, x, jr.key(0), True)))
+    if compiled:
+        gradient = jax.jit(gradient)
+    derivatives = gradient(values)
+    assert bool(jnp.all(jnp.isfinite(derivatives)))
+    expected_tails = jnp.asarray([1.0, 1.0] if arm.endswith("_off") else [0.1, 1.0])
+    np.testing.assert_allclose(derivatives[jnp.asarray([0, 4])], expected_tails, rtol=1e-6)
+    if arm.endswith("_off"):
+        np.testing.assert_array_equal(derivatives, jnp.ones_like(values))

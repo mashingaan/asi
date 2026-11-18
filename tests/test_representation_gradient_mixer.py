@@ -250,6 +250,40 @@ def test_conflicting_active_sources_report_negative_dot_and_cosine() -> None:
     assert bool(tiny.diagnostics.conflict)
 
 
+def test_near_cancelling_large_gradients_keep_representable_diagnostics() -> None:
+    magnitude = np.float32(1e20)
+    adjacent = np.nextafter(magnitude, np.float32(0.0), dtype=np.float32)
+    behavior = jnp.asarray([magnitude, magnitude], dtype=jnp.float32)
+    world = jnp.asarray([magnitude, -adjacent], dtype=jnp.float32)
+    expected_dot = np.float32(
+        np.dot(
+            np.asarray(behavior, dtype=np.float64),
+            np.asarray(world, dtype=np.float64),
+        )
+    )
+    expected_cosine = np.float32(
+        float(expected_dot)
+        / (
+            np.linalg.norm(np.asarray(behavior, dtype=np.float64))
+            * np.linalg.norm(np.asarray(world, dtype=np.float64))
+        )
+    )
+
+    def run(first: Array, second: Array) -> RepresentationGradientMixResult:
+        return mix_representation_gradients(
+            RepresentationGradientMixerConfig(representation_dim=2),
+            first,
+            second,
+        )
+
+    for result in (run(behavior, world), jax.jit(run)(behavior, world)):
+        np.testing.assert_array_equal(result.diagnostics.dot_product, expected_dot)
+        np.testing.assert_array_equal(
+            result.diagnostics.cosine_similarity,
+            expected_cosine,
+        )
+
+
 @pytest.mark.parametrize(
     ("mode", "expected", "behavior_active", "world_active", "applied"),
     [
@@ -312,6 +346,35 @@ def test_any_invalid_actively_weighted_source_atomically_rejects_to_exact_zero(
     assert bool(result.zero_output)
     assert bool(result.diagnostics.rejected)
     assert np.isfinite(np.asarray(result.diagnostics.final_mixed_norm)).all()
+
+
+def test_active_subnormal_source_rejects_instead_of_reporting_a_zero_update() -> None:
+    config = RepresentationGradientMixerConfig(
+        representation_dim=2,
+        mode="behavior_only",
+    )
+    smallest_subnormal = np.nextafter(
+        np.float32(0.0),
+        np.float32(1.0),
+        dtype=np.float32,
+    )
+    behavior = jnp.asarray([smallest_subnormal, 0.0], dtype=jnp.float32)
+    world = jnp.zeros((2,), dtype=jnp.float32)
+
+    def run(active: Array, inactive: Array) -> RepresentationGradientMixResult:
+        return mix_representation_gradients(config, active, inactive)
+
+    assert np.asarray(behavior)[0] != 0.0
+    for result in (run(behavior, world), jax.jit(run)(behavior, world)):
+        np.testing.assert_array_equal(
+            result.gradient,
+            jnp.zeros((2,), dtype=jnp.float32),
+        )
+        assert not bool(result.valid)
+        assert not bool(result.applied)
+        assert bool(result.rejected)
+        assert bool(result.zero_output)
+        assert not bool(result.diagnostics.behavior_valid)
 
 
 def test_masked_or_zero_weight_invalid_source_is_recorded_without_poisoning_output() -> None:
@@ -533,7 +596,7 @@ def test_gradient_mixer_rejects_integer_spoofs_without_running_repr() -> None:
 def test_gradient_mixer_allocation_contract_endpoints_are_allocation_free() -> None:
     fixed_output_bytes = 12 * 4 + 12
     output_last_legal = ((2**31 - 1) - fixed_output_bytes) // 4
-    update_last_legal = 25_565_280
+    update_last_legal = (_INT32_MAX - fixed_output_bytes) // (4 * 33)
     with pytest.raises(ValueError, match="update working set byte count"):
         RepresentationGradientMixerConfig(representation_dim=output_last_legal)
     config = RepresentationGradientMixerConfig(representation_dim=update_last_legal)
@@ -761,7 +824,9 @@ def test_mixer_persist_is_empty_and_output_fits_at_max_dim() -> None:
 def test_mixer_last_fit_and_first_overflow_are_adjacent() -> None:
     last_fit = None
     first_overflow = None
-    for representation_dim in range(25_565_279, 25_565_283):
+    # 33 float32 vectors and 60 fixed output bytes.
+    expected_last_fit = (_INT32_MAX - 60) // (4 * 33)
+    for representation_dim in range(expected_last_fit, expected_last_fit + 3):
         working_set_bytes = _mixer_update_working_set_bytes(representation_dim)
         if working_set_bytes <= _INT32_MAX:
             last_fit = representation_dim
@@ -783,3 +848,29 @@ def test_mixer_output_byte_bound_still_fires_first() -> None:
 def test_preflight_helper_rejects_the_same_working_set() -> None:
     with pytest.raises(ValueError, match="update working set byte count"):
         _preflight_mixer_update_working_set(_MAX_REPRESENTATION_DIM)
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("sign", [-1.0, 1.0])
+@pytest.mark.parametrize("swap", [False, True])
+@pytest.mark.parametrize(
+    "left,right", [([1e-30, 0.0], [1e20, 1e30]), ([3e38, 3e38], [1e-30, 1e-30])]
+)
+def test_dot_diagnostic_restores_units_only_after_mantissa_product(
+    compiled, sign, swap, left, right
+):
+    first = np.asarray(left, dtype=np.float32)
+    second = np.asarray(right, dtype=np.float32) * sign
+    if swap:
+        first, second = second, first
+    expected = np.dot(first.astype(np.float64), second.astype(np.float64))
+    config = RepresentationGradientMixerConfig(representation_dim=2)
+    def fn(a, b):
+        return mix_representation_gradients(config, a, b)
+
+    if compiled:
+        fn = jax.jit(fn)
+    result = fn(jnp.asarray(first), jnp.asarray(second))
+    np.testing.assert_allclose(result.diagnostics.dot_product, expected, rtol=2e-6, atol=0)
+    assert bool(result.valid)
+    assert bool(result.diagnostics.conflict) is (sign < 0)
+    np.testing.assert_array_equal(result.gradient, jnp.asarray(first) + jnp.asarray(second))

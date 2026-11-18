@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 from decimal import Decimal
 from fractions import Fraction
+from importlib import import_module
 from typing import Any, Never
 
+import jax
 import numpy as np
 import pytest
 
@@ -23,6 +26,7 @@ from alberta_framework.utils.experiments import (
     get_final_performance,
     get_metric_timeseries,
     run_multi_seed_experiment,
+    run_single_experiment,
 )
 
 pytestmark = pytest.mark.unit
@@ -49,6 +53,38 @@ def _config(
         stream_factory=stream_factory,
         num_steps=num_steps,
     )
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("show_progress", [False, True])
+def test_experiment_import_error_does_not_repeat_completed_runs(
+    parallel: bool, show_progress: bool
+) -> None:
+    if parallel:
+        pytest.importorskip("joblib")
+    if show_progress:
+        pytest.importorskip("tqdm")
+    calls = {"healthy": 0, "missing_dependency": 0}
+
+    def healthy_learner() -> LinearLearner:
+        calls["healthy"] += 1
+        return LinearLearner()
+
+    def missing_dependency_learner() -> LinearLearner:
+        calls["missing_dependency"] += 1
+        import_module("asi_test_missing_optional_learner_dependency")
+        raise AssertionError("the optional learner dependency must be absent")
+
+    configs = [
+        _config("healthy", learner_factory=healthy_learner),
+        _config("missing_dependency", learner_factory=missing_dependency_learner),
+    ]
+    with pytest.raises(ModuleNotFoundError) as error:
+        run_multi_seed_experiment(
+            configs, seeds=[17], parallel=parallel, n_jobs=1, show_progress=show_progress
+        )
+    assert error.value.name == "asi_test_missing_optional_learner_dependency"
+    assert calls == {"healthy": 1, "missing_dependency": 1}
 
 
 def test_duplicate_names_reject_before_distinct_factories_execute() -> None:
@@ -173,6 +209,17 @@ def test_integer_seed_count_still_aligns_identities() -> None:
         show_progress=False,
     )
     assert results["baseline"].seeds == [0, 1]
+
+
+def test_single_experiment_seed_is_independent_of_ambient_prng_default() -> None:
+    config = _config("rng-contract", num_steps=4)
+
+    with jax.default_prng_impl("threefry2x32"):
+        threefry = run_single_experiment(config, seed=17)
+    with jax.default_prng_impl("rbg"):
+        rbg = run_single_experiment(config, seed=17)
+
+    assert rbg.metrics_history == threefry.metrics_history
 
 
 @pytest.mark.parametrize("window", [True, False, 1.0])
@@ -318,6 +365,23 @@ def test_get_final_performance_accepts_unequal_trace_lengths_when_window_fits() 
     )
     performance = get_final_performance({"short": short, "long": long}, window=2)
     assert performance["short"] == performance["long"] == (2.0, pytest.approx(np.sqrt(2.0)))
+
+
+@pytest.mark.parametrize("candidate_seeds", [[2, 3], [1, 0]])
+def test_get_final_performance_rejects_unmatched_seed_schedules(
+    candidate_seeds: list[int],
+) -> None:
+    baseline = _two_seed_trace()._replace(config_name="baseline")
+    candidate = baseline._replace(
+        config_name="candidate",
+        seeds=candidate_seeds,
+    )
+
+    with pytest.raises(ValueError, match="same ordered seed schedule"):
+        get_final_performance(
+            {"baseline": baseline, "candidate": candidate},
+            window=2,
+        )
 
 
 def test_get_final_performance_window_longer_than_trace_uses_full_trace() -> None:
@@ -537,8 +601,10 @@ class _NonfiniteFloatThatConvertsFinite(float):
 
 def _platform_longdouble_1e4000() -> np.longdouble:
     """Parse the cross-platform boundary without leaking an expected warning."""
-    with np.errstate(over="ignore", invalid="ignore"):
-        return np.longdouble("1e4000")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        with np.errstate(over="ignore", invalid="ignore"):
+            return np.longdouble("1e4000")
 
 
 @pytest.mark.parametrize(
@@ -1029,3 +1095,38 @@ def test_run_multi_seed_experiment_rejects_invalid_seed_sequences(
 def test_get_final_performance_rejects_non_builtin_positive_window(window: object) -> None:
     with pytest.raises(ValueError, match="window"):
         get_final_performance({"candidate": _two_seed_trace()}, window=window)  # type: ignore[arg-type]
+
+
+def test_platform_longdouble_1e4000_emits_no_warnings() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        val = _platform_longdouble_1e4000()
+        assert val is not None
+
+
+@pytest.mark.parametrize(
+    "values, expected_mean, expected_std",
+    [
+        ([1e308, 1e308], 1e308, 0.0),
+        ([-1e308, -1e308], -1e308, 0.0),
+        ([0.0, 2e200], 1e200, np.sqrt(2.0) * 1e200),
+        ([0.0, 2e-200], 1e-200, np.sqrt(2.0) * 1e-200),
+        ([0.0, 0.0], 0.0, 0.0),
+    ],
+)
+def test_finite_aggregate_reductions_preserve_scale(
+    values: list[float], expected_mean: float, expected_std: float
+) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        result = aggregate_metrics([_single_run(i, [value] * 3) for i, value in enumerate(values)])
+        summary = result.summary["squared_error"]
+        performance = get_final_performance({"candidate": result}, window=3)["candidate"]
+        mean, lower, upper = get_metric_timeseries(result)
+    np.testing.assert_allclose(summary.values, values, rtol=1e-14, atol=0.0)
+    np.testing.assert_allclose([summary.mean, summary.std], [expected_mean, expected_std],
+                               rtol=1e-14, atol=0.0)
+    np.testing.assert_allclose(performance, [expected_mean, expected_std], rtol=1e-14, atol=0.0)
+    np.testing.assert_allclose(mean, expected_mean, rtol=1e-14, atol=0.0)
+    np.testing.assert_allclose(lower, expected_mean - expected_std, rtol=1e-14, atol=0.0)
+    np.testing.assert_allclose(upper, expected_mean + expected_std, rtol=1e-14, atol=0.0)

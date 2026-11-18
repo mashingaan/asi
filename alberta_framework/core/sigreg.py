@@ -304,19 +304,36 @@ def _stable_std(values: Array, *, axis: int) -> Array:
     scale = jnp.max(jnp.abs(values), axis=axis, keepdims=True)
     safe_scale = jnp.where(scale == 0.0, jnp.ones_like(scale), scale)
     normalized = values / safe_scale
-    return jnp.std(normalized, axis=axis) * jnp.squeeze(scale, axis=axis)
+    direct = jnp.std(normalized, axis=axis) * jnp.squeeze(scale, axis=axis)
+
+    # XLA can lower division by a value near FLT_MAX to a reciprocal multiply.
+    # That reciprocal is subnormal and may flush to zero, falsely reporting a
+    # zero spread. Power-of-two scaling keeps both factors representable.
+    _, exponent = jnp.frexp(scale)
+    power_scaled = jnp.ldexp(values, -exponent)
+    stable = jnp.ldexp(
+        jnp.std(power_scaled, axis=axis),
+        jnp.squeeze(exponent, axis=axis),
+    )
+    maximum = jnp.squeeze(jnp.max(values, axis=axis, keepdims=True), axis=axis)
+    minimum = jnp.squeeze(jnp.min(values, axis=axis, keepdims=True), axis=axis)
+    direct_failed = (~jnp.isfinite(direct)) | ((direct == 0.0) & (maximum != minimum))
+    return jnp.where(direct_failed & jnp.isfinite(stable), stable, direct)
 
 
 def _epps_pulley_gaussian_statistic(samples: Array, width: Array) -> Array:
     """Compute the statistic after ``width`` has passed boundary validation."""
     x = jnp.ravel(jnp.asarray(samples, dtype=jnp.float32))
     width_squared = width * width
-    diffs = x[:, None] - x[None, :]
-    empirical = jnp.mean(jnp.exp(-(diffs**2) / (2.0 * width_squared)))
+    # Halve before subtraction so opposite finite extremes do not overflow.
+    # Normalize before squaring; neither squared samples nor 2 * width**2
+    # need be representable even when the Gaussian kernel is well defined.
+    half_diffs = x[:, None] * 0.5 - x[None, :] * 0.5
+    scaled_half_diffs = half_diffs / width
+    empirical = jnp.mean(jnp.exp(-2.0 * scaled_half_diffs**2))
     cross_scale = jnp.sqrt(width_squared / (width_squared + 1.0))
-    cross = jnp.mean(
-        cross_scale * jnp.exp(-(x**2) / (2.0 * (width_squared + 1.0)))
-    )
+    scaled_x = x / jnp.sqrt(width_squared + 1.0)
+    cross = jnp.mean(cross_scale * jnp.exp(-0.5 * scaled_x**2))
     target = jnp.sqrt(width_squared / (width_squared + 2.0))
     return jnp.maximum(empirical - 2.0 * cross + target, 0.0)
 
@@ -335,8 +352,20 @@ def sample_sigreg_directions(
         (cfg.n_projections, latent_dim),
         dtype=jnp.float32,
     )
+    # ``eps`` is a degeneracy floor, not a substitute denominator. Dividing a
+    # short Gaussian by ``eps`` silently returns a non-unit direction and
+    # changes the sliced SIGReg number. Renormalize after the floor so every
+    # returned row is a unit vector; exact-zero rows fall back to e_0.
+    eps = jnp.asarray(cfg.eps, dtype=jnp.float32)
     norms = jnp.linalg.norm(directions, axis=1, keepdims=True)
-    return directions / jnp.maximum(norms, jnp.asarray(cfg.eps, dtype=jnp.float32))
+    scaled = directions / jnp.maximum(norms, eps)
+    scaled_norms = jnp.linalg.norm(scaled, axis=1, keepdims=True)
+    # Second division uses the true scaled norm. Flooring it by ``eps``
+    # again would re-shorten any draw whose original norm is below ``eps``.
+    fallback = jnp.zeros_like(scaled).at[:, 0].set(1.0)
+    safe_scaled_norms = jnp.where(scaled_norms == 0.0, jnp.ones_like(scaled_norms), scaled_norms)
+    unit = scaled / safe_scaled_norms
+    return jnp.where(scaled_norms == 0.0, fallback, unit)
 
 
 def epps_pulley_gaussian_statistic(

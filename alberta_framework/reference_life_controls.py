@@ -14,7 +14,6 @@ import hashlib
 import json
 import math
 import re
-from numbers import Real
 from typing import Any, Literal, cast
 
 import jax
@@ -23,6 +22,8 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._bounded_containers import require_json_text_nesting
+from alberta_framework._float32 import round_real_to_float32_with_ratio
 from alberta_framework.core.average_reward import (
     DifferentialSARSAAgent,
     DifferentialSARSAConfig,
@@ -71,7 +72,7 @@ UNIFORM_RANDOM_STATE_SCHEMA = "asi.uniform_random_exact_control_state.preview1"
 ANALYTIC_ORACLE_IMPLEMENTATION_ID = "asi.analytic_oracle_exact_control.preview1"
 ANALYTIC_ORACLE_STATE_SCHEMA = "asi.analytic_oracle_exact_control_state.preview1"
 DIFFERENTIAL_SARSA_IMPLEMENTATION_ID = "asi.differential_sarsa_exact_control.preview1"
-DIFFERENTIAL_SARSA_STATE_SCHEMA = "asi.differential_sarsa_exact_control_state.preview1"
+DIFFERENTIAL_SARSA_STATE_SCHEMA = "asi.differential_sarsa_exact_control_state.preview2"
 DISCOUNTED_SARSA_IMPLEMENTATION_ID = "asi.discounted_sarsa_exact_control.preview1"
 DISCOUNTED_SARSA_STATE_SCHEMA = "asi.discounted_sarsa_exact_control_state.preview1"
 
@@ -86,6 +87,9 @@ _THREEFRY_IMPLEMENTATION = REFERENCE_LIFE_PRNG_IMPLEMENTATION
 _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9._:-]*$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_ID_LENGTH = 256
+# Same ceiling as reference_agent string-fed JSON. Origin json.loads
+# RecursionErrors a 16_000-deep object nest before the oracle schema runs.
+_MAX_JSON_NESTING_DEPTH = 64
 _RANDOM_DOMAIN = 0x4354524C
 
 EnvironmentKind = Literal["switching_two_state", "riverswim"]
@@ -134,33 +138,43 @@ def _canonical_float32(
 ) -> float:
     """Return the actual executed float32 value after checking both domains."""
 
-    if not isinstance(value, Real) or isinstance(value, (bool, np.bool_)):
-        raise ValueError(f"{name} must be a real non-boolean float32 scalar")
     try:
-        raw = float(value)
-        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
-            converted = float(np.float32(raw))
+        numerator, denominator, converted = round_real_to_float32_with_ratio(value)
     except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{name} must be a finite float32 value") from exc
-    if not math.isfinite(raw) or not math.isfinite(converted):
+        raise ValueError(f"{name} must be a real non-boolean float32 scalar") from exc
+    if not math.isfinite(converted):
         raise ValueError(f"{name} must be a finite float32 value")
 
-    def in_bounds(candidate: float) -> bool:
+    def compare_to_boundary(boundary: float) -> int:
+        boundary_numerator, boundary_denominator = boundary.as_integer_ratio()
+        return (
+            numerator * boundary_denominator
+            - boundary_numerator * denominator
+        )
+
+    def converted_in_bounds(candidate: float) -> bool:
         lower_ok = candidate >= minimum if minimum_inclusive else candidate > minimum
         upper_ok = candidate <= maximum if maximum_inclusive else candidate < maximum
         return lower_ok and upper_ok
 
-    if not in_bounds(raw):
+    lower_comparison = compare_to_boundary(minimum)
+    upper_comparison = compare_to_boundary(maximum)
+    exact_in_bounds = (
+        lower_comparison >= 0 if minimum_inclusive else lower_comparison > 0
+    ) and (
+        upper_comparison <= 0 if maximum_inclusive else upper_comparison < 0
+    )
+    if not exact_in_bounds:
         left = "[" if minimum_inclusive else "("
         right = "]" if maximum_inclusive else ")"
         raise ValueError(
             f"{name} must remain in {left}{minimum}, {maximum}{right} as float32"
         )
-    if not minimum_inclusive and raw > minimum and converted == minimum:
+    if not minimum_inclusive and lower_comparison > 0 and converted == minimum:
         raise ValueError(f"{name} must not collapse to its strict float32 lower bound")
-    if not maximum_inclusive and raw < maximum and converted == maximum:
+    if not maximum_inclusive and upper_comparison < 0 and converted == maximum:
         raise ValueError(f"{name} must not round to its strict float32 upper bound")
-    if not in_bounds(converted):
+    if not converted_in_bounds(converted):
         left = "[" if minimum_inclusive else "("
         right = "]" if maximum_inclusive else ")"
         raise ValueError(
@@ -189,8 +203,8 @@ def _canonical_hidden_sizes(
     observation_dim: int,
     n_actions: int,
 ) -> tuple[int, ...]:
-    if not isinstance(value, (tuple, list)):
-        raise ValueError("hidden_sizes must be a bounded tuple or list")
+    if type(value) is not tuple and type(value) is not list:
+        raise ValueError("hidden_sizes must be an exact tuple or list")
     if len(value) > _MAX_HIDDEN_LAYERS:
         raise ValueError(f"hidden_sizes must contain at most {_MAX_HIDDEN_LAYERS} layers")
     hidden_sizes = tuple(value)
@@ -225,6 +239,26 @@ def _canonical_json(value: dict[str, Any]) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def _require_oracle_config_json(raw: object) -> str:
+    """Reject nesting that would RecursionError json.loads before it runs."""
+
+    if type(raw) is not str:
+        raise ValueError("oracle environment config must be canonical JSON")
+    try:
+        require_json_text_nesting(
+            raw,
+            max_depth=_MAX_JSON_NESTING_DEPTH,
+            name="oracle environment config",
+        )
+    except ValueError as exc:
+        if "nesting limit" not in str(exc):
+            raise
+        raise ValueError(
+            "oracle environment config exceeds the JSON nesting limit"
+        ) from exc
+    return raw
 
 
 def _canonical_switching_environment(
@@ -455,6 +489,7 @@ class DifferentialSARSAReferenceConfig:
     epsilon_end: float = 0.02
     epsilon_decay_steps: int = 2500
     use_bias: bool = True
+    initial_average_reward: float | None = None
 
     def __post_init__(self) -> None:
         _require_environment_shape(
@@ -502,6 +537,14 @@ class DifferentialSARSAReferenceConfig:
             raise ValueError("epsilon_end must not exceed epsilon_start")
         if not isinstance(self.use_bias, bool):
             raise ValueError("use_bias must be boolean")
+        if self.initial_average_reward is not None:
+            initial_average_reward = _canonical_float32(
+                self.initial_average_reward,
+                name="initial_average_reward",
+                minimum=0.0,
+                maximum=_FLOAT32_MAX,
+            )
+            object.__setattr__(self, "initial_average_reward", initial_average_reward)
 
     @classmethod
     def for_switching(
@@ -542,7 +585,7 @@ class DifferentialSARSAReferenceConfig:
         )
 
     def to_config(self) -> dict[str, Any]:
-        return {
+        config: dict[str, Any] = {
             "schema": REFERENCE_CONTROL_CONFIG_SCHEMA,
             "algorithm": "differential_sarsa",
             "environment_kind": self.environment_kind,
@@ -560,6 +603,10 @@ class DifferentialSARSAReferenceConfig:
             "initial_key_contract": "scalar_threefry2x32_typed_or_legacy.preview1",
             "boundary_mode": "continuing_unit_discount_only",
         }
+        # Emitted only when set, so the default manifest identity is unchanged.
+        if self.initial_average_reward is not None:
+            config["initial_average_reward"] = self.initial_average_reward
+        return config
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -579,6 +626,7 @@ class DiscountedSARSAReferenceConfig:
     leaky_relu_slope: float = 0.01
     use_layer_norm: bool = False
     lamda: float = 0.0
+    initial_q_value: float | None = None
 
     def __post_init__(self) -> None:
         _require_environment_shape(
@@ -652,6 +700,21 @@ class DiscountedSARSAReferenceConfig:
                 n_actions=self.n_actions,
             ),
         )
+        if self.initial_q_value is not None:
+            object.__setattr__(
+                self,
+                "initial_q_value",
+                _canonical_float32(
+                    self.initial_q_value,
+                    name="initial_q_value",
+                    minimum=0.0,
+                    maximum=_FLOAT32_MAX,
+                ),
+            )
+            if self.hidden_sizes:
+                raise ValueError(
+                    "initial_q_value requires the tabular empty-hidden-layer control"
+                )
         if not isinstance(self.use_layer_norm, bool):
             raise ValueError("use_layer_norm must be boolean")
 
@@ -707,6 +770,7 @@ class DiscountedSARSAReferenceConfig:
             "leaky_relu_slope": self.leaky_relu_slope,
             "use_layer_norm": self.use_layer_norm,
             "lamda": self.lamda,
+            "initial_q_value": self.initial_q_value,
             "rng_schedule": "owned_sarsa_key.preview1",
             "rng_implementation": _THREEFRY_IMPLEMENTATION,
             "initial_key_contract": "scalar_threefry2x32_typed_or_legacy.preview1",
@@ -736,10 +800,13 @@ class AnalyticOracleReferenceConfig:
             self.policy_sha256
         ) is None:
             raise ValueError("oracle policy_sha256 must be a lowercase SHA-256 digest")
-        if type(self.environment_config_json) is not str:
-            raise ValueError("oracle environment config must be canonical JSON")
+        _require_oracle_config_json(self.environment_config_json)
         try:
             decoded = json.loads(self.environment_config_json)
+        except RecursionError as exc:
+            raise ValueError(
+                "oracle environment config exceeds the JSON nesting limit"
+            ) from exc
         except (TypeError, json.JSONDecodeError) as exc:
             raise ValueError("oracle environment config must be canonical JSON") from exc
         if (
@@ -845,7 +912,13 @@ class AnalyticOracleReferenceConfig:
 
     @property
     def environment_config(self) -> dict[str, Any]:
-        decoded = json.loads(self.environment_config_json)
+        _require_oracle_config_json(self.environment_config_json)
+        try:
+            decoded = json.loads(self.environment_config_json)
+        except RecursionError as exc:
+            raise ValueError(
+                "oracle environment config exceeds the JSON nesting limit"
+            ) from exc
         assert isinstance(decoded, dict)
         return decoded
 
@@ -1727,7 +1800,22 @@ class DifferentialSARSAReferenceAdapter(_BaseReferenceControlAdapter):
             key,
             name="differential-SARSA initial key",
         )
-        return None, self._differential_agent.init(self.config.observation_dim, explicit_key)
+        if self.config.initial_average_reward is None:
+            learner = self._differential_agent.init(self.config.observation_dim, explicit_key)
+        else:
+            learner = self._differential_agent.init(
+                self.config.observation_dim,
+                explicit_key,
+                average_reward=self.config.initial_average_reward,
+            )
+        # The exact-dispatch adapter never calls the core agent's timed loop
+        # helpers. Keep their host-clock metadata out of persistent state, as
+        # the discounted-SARSA adapter does for the same inherited fields.
+        learner = learner.replace(  # type: ignore[attr-defined]
+            birth_timestamp=jnp.asarray(0.0, dtype=jnp.float32),
+            uptime_s=jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        return None, learner
 
     def _start_payload(
         self,
@@ -1763,9 +1851,12 @@ class DifferentialSARSAReferenceAdapter(_BaseReferenceControlAdapter):
                 (self.config.n_actions, self.config.observation_dim),
             ),
             ("q_trace_bias", learner.q_trace_bias, (self.config.n_actions,)),
+            ("previous_discount", learner.previous_discount, ()),
             ("average_reward", learner.average_reward, ()),
             ("last_observation", learner.last_observation, (self.config.observation_dim,)),
             ("epsilon", learner.epsilon, ()),
+            ("birth_timestamp", learner.birth_timestamp, ()),
+            ("uptime_s", learner.uptime_s, ()),
         )
         for name, value, shape in expected_float_shapes:
             array = np.asarray(value)
@@ -1794,6 +1885,10 @@ class DifferentialSARSAReferenceAdapter(_BaseReferenceControlAdapter):
         )
         if not _tree_finite(learner):
             raise DecisionOwnershipError("differential-SARSA state must be finite")
+        if float(learner.birth_timestamp) != 0.0 or float(learner.uptime_s) != 0.0:
+            raise DecisionOwnershipError(
+                "differential-SARSA timing metadata must remain disabled"
+            )
         if int(learner.step_count) != state.decision_index:
             raise DecisionOwnershipError("differential-SARSA counter does not match decision")
         if not np.array_equal(step_words, _counter_words(state.decision_index)):
@@ -1805,6 +1900,9 @@ class DifferentialSARSAReferenceAdapter(_BaseReferenceControlAdapter):
         epsilon = float(learner.epsilon)
         if not 0.0 <= epsilon <= 1.0:
             raise DecisionOwnershipError("differential-SARSA epsilon is invalid")
+        previous_discount = float(learner.previous_discount)
+        if not 0.0 <= previous_discount <= 1.0:
+            raise DecisionOwnershipError("differential-SARSA previous discount is invalid")
 
     def _advance_payload(
         self,
@@ -1893,7 +1991,20 @@ class DiscountedSARSAReferenceAdapter(_BaseReferenceControlAdapter):
         # JIT update otherwise promotes both Python floats into persistent JAX
         # leaves on the first transition.  Canonical scalar arrays keep the
         # whole-life state shape fixed and exclude wall-clock time from state.
-        inner = learner.learner_state.replace(  # type: ignore[attr-defined]
+        inner = learner.learner_state
+        if self.config.initial_q_value is not None:
+            initial_q = jnp.asarray(self.config.initial_q_value, dtype=jnp.float32)
+            head_params = inner.head_params.replace(  # type: ignore[attr-defined]
+                weights=tuple(
+                    jnp.full_like(weights, initial_q)
+                    for weights in inner.head_params.weights
+                ),
+                biases=tuple(
+                    jnp.zeros_like(biases) for biases in inner.head_params.biases
+                ),
+            )
+            inner = inner.replace(head_params=head_params)  # type: ignore[attr-defined]
+        inner = inner.replace(  # type: ignore[attr-defined]
             birth_timestamp=jnp.asarray(0.0, dtype=jnp.float32),
             uptime_s=jnp.asarray(0.0, dtype=jnp.float32),
         )

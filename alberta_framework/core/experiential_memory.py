@@ -40,19 +40,7 @@ from alberta_framework.core._float32_scalars import validated_float32_scalar
 _INT32_MAX = 2_147_483_647
 _UINT32_MAX = 4_294_967_295
 
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_ACTUAL_INT_TYPES: tuple[type, ...] = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 _ACTUAL_FLOAT_TYPES = frozenset(
     {float, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
 )
@@ -127,6 +115,24 @@ class ExperientialMemoryConfig:
             raise ValueError("config fields do not match the serialized schema")
         if type(config["type"]) is not str or config["type"] != "ExperientialMemoryConfig":
             raise ValueError("config type differs")
+        integer_fields = {
+            "capacity",
+            "observation_dim",
+            "key_dim",
+            "action_dim",
+            "outcome_dim",
+            "top_k",
+            "min_neighbors",
+            "max_age",
+        }
+        for name, value in config.items():
+            if name == "type":
+                continue
+            expected_type = int if name in integer_fields else float
+            if type(value) is not expected_type:
+                raise ValueError(
+                    "serialized experiential memory config values must use exact JSON scalar types"
+                )
         payload = dict(config)
         payload.pop("type")
         return cls(**payload)
@@ -421,7 +427,7 @@ def _validate_config(config: ExperientialMemoryConfig) -> None:
         + 2 * config.top_k * (payload_values + 4)
         + 9 * config.top_k
         + payload_values
-        + 4
+        + 5
     )
     if persistent_bytes + 4 * query_temporary_scalars > _INT32_MAX:
         raise ValueError(
@@ -759,6 +765,9 @@ class ExperientialMemory:
             (state.active_count == active_count)
             & (state.active_count <= self._config.capacity)
             & (state.accepted_query_count <= state.query_count)
+            & (state.query_count <= state.step_count)
+            & (state.write_count <= state.step_count)
+            & (state.rejected_write_count <= state.step_count)
             & (state.eviction_count <= state.write_count)
             & (state.write_count >= state.active_count)
         )
@@ -990,13 +999,21 @@ class ExperientialMemory:
 
         safe_query_key = jnp.where(jnp.isfinite(query_key), query_key, 0.0)
         safe_keys = jnp.where(finite_rows[:, None], entries.keys, 0.0)
-        squared_distance = jnp.mean(
-            (safe_keys - safe_query_key[None, :]) ** 2,
-            axis=1,
-        )
-        similarities = jnp.exp(
-            -squared_distance / jnp.asarray(cfg.distance_scale, dtype=jnp.float32)
-        )
+        differences = safe_keys - safe_query_key[None, :]
+        squared_distance = jnp.mean(differences**2, axis=1)
+        distance_scale = jnp.asarray(cfg.distance_scale, dtype=jnp.float32)
+        scaled_distance = squared_distance / distance_scale
+        # Scale before squaring when float32 loses the ordinary reduction or
+        # the reciprocal of the configured scale is not a normal float32.
+        scale_root = jnp.asarray(cfg.distance_scale**0.5, dtype=jnp.float32)
+        recovered_distance = jnp.mean((differences / scale_root) ** 2, axis=1)
+        tiny = float(np.finfo(np.float32).tiny)
+        if cfg.distance_scale < tiny or cfg.distance_scale > 1.0 / tiny:
+            normalized_distance = recovered_distance
+        else:
+            recover = ~jnp.isfinite(squared_distance) | (squared_distance < tiny)
+            normalized_distance = jnp.where(recover, recovered_distance, scaled_distance)
+        similarities = jnp.exp(-normalized_distance)
         safe_ages = jnp.where(entries.ages >= 0, entries.ages, 0)
         staleness_scale = jnp.asarray(cfg.staleness_scale, dtype=jnp.float32)
         # Every positive float32 scale is legal. Cap the mathematically huge
@@ -1068,6 +1085,16 @@ class ExperientialMemory:
         )
         weighted_reliability = jnp.sum(neighbor_weights * effective_reliabilities[indices])
 
+        aggregate_values_finite = (
+            jnp.all(jnp.isfinite(weighted_observation))
+            & jnp.all(jnp.isfinite(weighted_action))
+            & jnp.all(jnp.isfinite(weighted_outcome))
+            & jnp.isfinite(weighted_reward)
+            & jnp.isfinite(weighted_uncertainty)
+            & jnp.isfinite(weighted_safety_cost)
+            & jnp.isfinite(weighted_reliability)
+        )
+
         has_neighbors = jnp.sum(neighbor_mask.astype(jnp.int32)) >= cfg.min_neighbors
         version_compatible = jnp.any(same_version)
         freshness_ok = jnp.any(fresh)
@@ -1084,9 +1111,9 @@ class ExperientialMemory:
         )
         safety_ok = jnp.any(safety_eligible)
         aggregate_ok = (
-            (weighted_uncertainty <= cfg.max_uncertainty)
+            aggregate_values_finite
+            & (weighted_uncertainty <= cfg.max_uncertainty)
             & (weighted_safety_cost <= cfg.max_safety_cost)
-            & jnp.isfinite(weighted_reliability)
         )
         accepted = (
             state_valid

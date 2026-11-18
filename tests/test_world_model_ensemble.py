@@ -15,6 +15,7 @@ import pytest
 
 import alberta_framework as alberta
 import alberta_framework.core as core
+from alberta_framework.core.checkpoints import load_checkpoint_metadata, save_checkpoint
 from alberta_framework.core.learning_signals import (
     LearningSignalEstimatorConfig,
 )
@@ -23,6 +24,7 @@ from alberta_framework.core.world_model_ensemble import (
     WorldModelEnsemble,
     WorldModelEnsembleConfig,
     WorldModelEnsembleResourceBudget,
+    load_world_model_ensemble_checkpoint,
     save_world_model_ensemble_checkpoint,
 )
 
@@ -141,10 +143,37 @@ def test_config_and_ensemble_round_trip_are_strict() -> None:
     with pytest.raises(ValueError, match="not accepted scientific evidence"):
         WorldModelEnsembleConfig.from_config(bad)
 
-    with pytest.raises(ValueError, match="keys"):
+    with pytest.raises(ValueError, match="fields"):
         WorldModelEnsemble.from_config(
             {"type": "WorldModelEnsemble", "config": config.to_config(), "extra": 1}
         )
+
+    incomplete_nested = config.to_config()
+    incomplete_nested["signal_estimator"].pop("change_temperature")
+    with pytest.raises(ValueError, match="serialized schema"):
+        WorldModelEnsembleConfig.from_config(incomplete_nested)
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ("type", "development_only", "accepted_scientific_evidence"),
+)
+def test_config_restore_rejects_incomplete_identity_and_policy(
+    missing_field: str,
+) -> None:
+    payload = _config().to_config()
+    payload.pop(missing_field)
+
+    with pytest.raises(ValueError, match="fields"):
+        WorldModelEnsembleConfig.from_config(payload)
+
+
+def test_ensemble_restore_requires_its_construction_type() -> None:
+    payload = WorldModelEnsemble(_config()).to_config()
+    payload.pop("type")
+
+    with pytest.raises(ValueError, match="fields"):
+        WorldModelEnsemble.from_config(payload)
 
 
 @pytest.mark.parametrize(
@@ -206,6 +235,42 @@ def test_init_uses_distinct_member_keys_and_isolated_real_replay_mask_keys() -> 
     chex.assert_trees_all_equal(
         state.last_replay_bootstrap_mask, jnp.zeros(3, dtype=jnp.bool_)
     )
+
+
+def test_init_rejects_rbg_key_that_fails_the_static_bootstrap_contract() -> None:
+    """RBG init must not return a state the published static contract rejects.
+
+    ``jr.split`` / ``jr.fold_in`` accept a typed RBG key, so ``init`` can
+    construct member and mask streams. The keys it would store then fail the
+    existing ``key_data`` shape/dtype check used by ``state_valid`` and
+    ``resource_budget``. Reject that key at ``init`` instead of handing back
+    an unusable state. Legacy ``jr.PRNGKey`` remains a (2,) uint32 Threefry
+    word payload and stays accepted.
+    """
+    ensemble = WorldModelEnsemble(_config())
+    rbg = jr.key(7, impl="rbg")
+    rbg_words = jr.key_data(rbg)
+    assert rbg_words.shape != (2,) or rbg_words.dtype != jnp.uint32
+
+    split_keys = jr.split(rbg, ensemble.config.ensemble_size + 1)
+    replay_key = jr.fold_in(rbg, 0x5245504C)
+    for stored in (split_keys[-1], replay_key):
+        stored_words = jr.key_data(stored)
+        assert stored_words.shape != (2,) or stored_words.dtype != jnp.uint32
+
+    good = ensemble.init(jr.key(7))
+    with pytest.raises(ValueError, match="must be one JAX PRNG key"):
+        ensemble.state_valid(good.replace(bootstrap_key=split_keys[-1]))
+    with pytest.raises(ValueError, match="must be one JAX PRNG key"):
+        ensemble.resource_budget(good.replace(replay_bootstrap_key=replay_key))
+
+    with pytest.raises(ValueError, match="must be one JAX PRNG key"):
+        ensemble.init(rbg)
+
+    legacy = ensemble.init(jr.PRNGKey(7))
+    assert bool(ensemble.state_valid(legacy))
+    budget = ensemble.resource_budget(legacy)
+    assert budget.persistent_state_bytes == ensemble.resource_budget(good).persistent_state_bytes
 
 
 def test_resource_budget_counts_member_lifetime_words_and_matches_state() -> None:
@@ -765,6 +830,24 @@ def test_checkpoint_rejects_invalid_state(tmp_path: Path) -> None:
         )
 
 
+def test_checkpoint_rejects_undeclared_metadata(tmp_path: Path) -> None:
+    ensemble = WorldModelEnsemble(_config())
+    state = ensemble.init(jr.key(0))
+    clean_path = tmp_path / "clean"
+    save_world_model_ensemble_checkpoint(ensemble, state, clean_path)
+    metadata = load_checkpoint_metadata(clean_path)
+    load_world_model_ensemble_checkpoint(clean_path)
+
+    forged_path = tmp_path / "forged"
+    save_checkpoint(
+        state,
+        forged_path,
+        metadata={**metadata, "accepted_scientific_evidence": True},
+    )
+    with pytest.raises(ValueError, match="metadata fields do not match"):
+        load_world_model_ensemble_checkpoint(forged_path)
+
+
 def test_config_preflights_complete_update_result_at_exact_boundary() -> None:
     # Linear 2-observation/2-action fixture: 864 * ensemble_size + 316 bytes.
     last_legal = (2**31 - 1 - 316) // 864
@@ -880,3 +963,38 @@ def test_public_prediction_neutralizes_nonfinite_aggregate_variance() -> None:
         np.asarray(prediction.member_raw_predictions),
         np.zeros((2, 4), dtype=np.float32),
     )
+
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+@pytest.mark.parametrize("magnitude", [1.1754943508222875e-38, -1.1754943508222875e-38, 1.0])
+def test_public_prediction_preserves_small_normal_member_means(
+    disable_jit: bool, magnitude: float
+) -> None:
+    ensemble = WorldModelEnsemble(_config())
+    state = ensemble.init(jr.key(0))
+    members = []
+    for member in state.member_states:
+        heads = member.learner_state.head_params
+        members.append(dataclasses.replace(
+            member, learner_state=dataclasses.replace(
+                member.learner_state, head_params=dataclasses.replace(
+                    heads,
+                    weights=tuple(jnp.zeros_like(weight) for weight in heads.weights),
+                    biases=tuple(jnp.full_like(bias, magnitude) for bias in heads.biases),
+                ),
+            ),
+        ))
+    with jax.disable_jit(disable_jit):
+        prediction = ensemble.predict(
+            dataclasses.replace(state, member_states=tuple(members)),
+            jnp.zeros(2, dtype=jnp.float32), jnp.asarray(0, dtype=jnp.int32),
+        )
+        assert bool(prediction.valid)
+        np.testing.assert_array_equal(
+            np.asarray(prediction.member_rewards), np.full(2, magnitude, dtype=np.float32)
+        )
+        assert float(prediction.mean_reward) == float(np.float32(magnitude))
+        np.testing.assert_array_equal(
+            np.asarray(prediction.mean_raw_prediction), np.full(4, magnitude, dtype=np.float32)
+        )

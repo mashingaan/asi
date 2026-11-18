@@ -17,6 +17,7 @@ from alberta_framework.evaluation import evidence_manifest_cli
 from alberta_framework.evaluation.evidence_manifest import (
     CLAIM_CONTRACT_VERSION,
     DIRTY_STATE_POLICY_VERSION,
+    EVIDENCE_SPECS,
     MANIFEST_SCHEMA_VERSION,
     EvidenceClass,
     EvidenceLevel,
@@ -142,6 +143,73 @@ def _write_artifact(
 def _claims(manifest: Mapping[str, object]) -> dict[str, dict[str, object]]:
     claims = cast(list[dict[str, object]], manifest["claims"])
     return {cast(str, claim["claim_id"]): claim for claim in claims}
+
+
+@pytest.mark.unit
+def test_shared_measurement_validator_is_registered_for_current_source_inventories() -> None:
+    helper = Path("alberta_framework/evaluation/_measurement_validation.py")
+    importer_claims = {
+        "scale_robust_pair_features",
+        "ftl_world_model_decision_fidelity",
+        "recurring_multiagent_coadaptation",
+        "continual_intelligence_amplification",
+    }
+    specs = {spec.name: spec for spec in EVIDENCE_SPECS}
+
+    assert importer_claims <= specs.keys()
+    registered_claims = {
+        claim for claim in importer_claims if helper in specs[claim].source_paths
+    }
+    # The FTL and IA historical chains retain immutable exact source-path sets;
+    # they cannot retroactively attest helper bytes that their artifacts omitted.
+    assert registered_claims == {
+        "scale_robust_pair_features",
+        "recurring_multiagent_coadaptation",
+    }
+
+
+@pytest.mark.unit
+def test_current_validators_hash_every_registered_source() -> None:
+    """A registered-source edit must move the validator that accepts the artifact.
+
+    The scale-robust and multiagent registries already list the shared
+    measurement helper. Their validators must hash that same set; otherwise
+    a helper edit leaves a byte-matching artifact accepted.
+    """
+
+    from alberta_framework.evaluation.continual_multiagent_artifact import (
+        _source_provenance as multiagent_source_provenance,
+    )
+    from alberta_framework.evaluation.continual_multiagent_artifact import (
+        _validate_source_provenance as validate_multiagent_provenance,
+    )
+    from alberta_framework.evaluation.scale_robust_feature_artifact import (
+        current_source_fingerprint,
+    )
+
+    specs = {spec.name: spec for spec in EVIDENCE_SPECS}
+
+    def registered(claim: str) -> set[str]:
+        return {path.as_posix() for path in specs[claim].source_paths}
+
+    scale_paths = registered("scale_robust_pair_features")
+    multiagent_paths = registered("recurring_multiagent_coadaptation")
+    helper = "alberta_framework/evaluation/_measurement_validation.py"
+    assert helper in scale_paths
+    assert helper in multiagent_paths
+    assert set(current_source_fingerprint()) == scale_paths
+    provenance = multiagent_source_provenance()
+    hashes = provenance["source_sha256"]
+    assert isinstance(hashes, dict)
+    assert set(hashes) == multiagent_paths
+    drifted_hashes = dict(hashes)
+    drifted_hashes[helper] = "0" * 64
+    errors: list[str] = []
+    validate_multiagent_provenance(
+        {**provenance, "source_sha256": drifted_hashes},
+        errors,
+    )
+    assert any("pinned source hashes" in error for error in errors)
 
 
 @pytest.mark.unit

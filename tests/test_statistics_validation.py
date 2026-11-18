@@ -36,6 +36,7 @@ import pytest
 from alberta_framework.utils.experiments import AggregatedResults
 from alberta_framework.utils.statistics import (
     SignificanceResult,
+    _holm_decisions,
     bonferroni_correction,
     bootstrap_ci,
     cohens_d,
@@ -78,6 +79,32 @@ class TestComputeStatistics:
         assert s.ci_lower == pytest.approx(4.2)
         assert s.ci_upper == pytest.approx(4.2)
         assert s.n_seeds == 1
+
+    def test_large_constant_values_remain_finite_without_warnings(self) -> None:
+        values = np.asarray([1.0e308, 1.0e308], dtype=np.float64)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            summary = compute_statistics(values)
+
+        assert summary.mean == 1.0e308
+        assert summary.std == 0.0
+        assert summary.sem == 0.0
+        assert summary.ci_lower == 1.0e308
+        assert summary.ci_upper == 1.0e308
+        assert summary.median == 1.0e308
+        assert summary.iqr == 0.0
+
+    def test_unrepresentable_large_interval_fails_closed_without_warnings(self) -> None:
+        values = np.asarray([-1.0e308, 1.0e308], dtype=np.float64)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError,
+                match=r"^values cannot be represented as finite float64 statistics$",
+            ):
+                compute_statistics(values)
 
     def test_empty_values_rejected_without_warnings(self) -> None:
         with warnings.catch_warnings():
@@ -363,6 +390,23 @@ class TestProbabilityContracts:
 
 
 class TestTimeseriesStatistics:
+    @pytest.mark.parametrize(
+        "metric_array",
+        [
+            np.asarray(1.0, dtype=np.float64),
+            np.asarray([1.0, 2.0, 3.0], dtype=np.float64),
+            np.ones((2, 3, 4), dtype=np.float64),
+        ],
+    )
+    def test_requires_seed_by_step_matrix(
+        self, metric_array: np.ndarray[Any, np.dtype[np.float64]]
+    ) -> None:
+        with pytest.raises(
+            ValueError,
+            match=r"^metric_array must be a two-dimensional seed-by-step matrix",
+        ):
+            compute_timeseries_statistics(metric_array)
+
     def test_matches_per_column_compute_statistics(self) -> None:
         """Vectorised timeseries CI agrees with per-step scalar CI."""
         rng = np.random.default_rng(2)
@@ -375,6 +419,47 @@ class TestTimeseriesStatistics:
             assert lo[step] == pytest.approx(s.ci_lower)
             assert hi[step] == pytest.approx(s.ci_upper)
 
+    def test_large_constant_column_remains_finite_without_warnings(self) -> None:
+        arr = np.asarray([[1.0e308, 1.0], [1.0e308, 2.0]], dtype=np.float64)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            mean, lo, hi = compute_timeseries_statistics(arr)
+
+        assert np.isfinite(mean).all()
+        assert np.isfinite(lo).all()
+        assert np.isfinite(hi).all()
+        assert mean[0] == 1.0e308
+        assert lo[0] == 1.0e308
+        assert hi[0] == 1.0e308
+
+    def test_representable_interval_survives_unrepresentable_sample_std(self) -> None:
+        """Eight symmetric seeds have finite mean/CI despite an overflowing SD."""
+        from scipy import stats
+
+        maximum = np.finfo(np.float64).max
+        signs = np.tile([-1.0, 1.0], 4)
+        arr = np.column_stack((signs * maximum, signs, np.full(8, maximum)))
+        # For eight +/-M observations, the mean is zero and SEM is M/sqrt(7).
+        # Form the dimensionless margin first; the returned bounds fit float64.
+        margin_fraction = float(stats.t.ppf(0.975, 7)) / np.sqrt(7.0)
+        margin = margin_fraction * maximum
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            mean, lo, hi = compute_timeseries_statistics(arr, confidence_level=0.95)
+
+        assert np.isfinite(mean).all()
+        assert np.isfinite(lo).all()
+        assert np.isfinite(hi).all()
+        np.testing.assert_array_equal(mean, [0.0, 0.0, maximum])
+        np.testing.assert_allclose(
+            lo, [-margin, -margin_fraction, maximum], rtol=1e-14, atol=0.0
+        )
+        np.testing.assert_allclose(
+            hi, [margin, margin_fraction, maximum], rtol=1e-14, atol=0.0
+        )
+
     def test_zero_seed_matrix_rejected_without_warnings(self) -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("error")
@@ -382,6 +467,14 @@ class TestTimeseriesStatistics:
                 ValueError, match=r"^metric_array must contain at least one seed row$"
             ):
                 compute_timeseries_statistics(np.empty((0, 3)))
+
+    def test_zero_step_matrix_rejected_without_warnings(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with pytest.raises(
+                ValueError, match=r"^metric_array must contain at least one time step$"
+            ):
+                compute_timeseries_statistics(np.empty((3, 0)))
 
     def test_nonfinite_seed_rejected_without_warnings(self) -> None:
         arr = np.array([[1.0, 2.0], [np.nan, 3.0]], dtype=np.float64)
@@ -536,6 +629,26 @@ class TestBootstrapCI:
         with pytest.raises(ValueError, match="n_bootstrap.*positive integer"):
             bootstrap_ci([1.0, 2.0, 3.0], n_bootstrap=HostileInt(10))
 
+    @pytest.mark.parametrize(
+        "seed",
+        [None, True, False, 1.0, -1, [1], (1,), "1"],
+        ids=repr,
+    )
+    def test_bootstrap_seed_must_be_one_reproducible_integer(self, seed: object) -> None:
+        with pytest.raises(ValueError, match="seed must be a non-negative integer"):
+            bootstrap_ci([1.0, 2.0, 3.0], n_bootstrap=10, seed=seed)  # type: ignore[arg-type]
+
+    def test_bootstrap_seed_rejects_a_stateful_generator(self) -> None:
+        generator = np.random.default_rng(0)
+        state = generator.bit_generator.state
+        with pytest.raises(ValueError, match="seed must be a non-negative integer"):
+            bootstrap_ci([1.0, 2.0, 3.0], n_bootstrap=10, seed=generator)  # type: ignore[arg-type]
+        assert generator.bit_generator.state == state
+
+    def test_bootstrap_numpy_integer_seed_keeps_its_stream(self) -> None:
+        expected = bootstrap_ci([1.0, 2.0, 9.0], n_bootstrap=20, seed=7)
+        assert bootstrap_ci([1.0, 2.0, 9.0], n_bootstrap=20, seed=np.int64(7)) == expected
+
     @pytest.mark.parametrize("confidence_level", [0.0, 1.0, -0.1, 1.1, float("nan")])
     def test_invalid_confidence_level_rejected_without_warnings(
         self,
@@ -602,6 +715,24 @@ class TestPairedTests:
         # every a_i < b_i: effect size sign must reflect a < b
         assert res.effect_size < 0.0
 
+    def test_paired_ttest_effect_size_uses_within_pair_differences(self) -> None:
+        # Large shared between-seed variation with a small, consistent
+        # per-seed shift: pooled Cohen's d (wrong for paired data) is nearly
+        # zero because the shared variation dominates its denominator, while
+        # the correct paired d_z -- computed from the differences, where the
+        # shared variation cancels -- is large.
+        a = np.asarray([101.0, 202.0, 303.0, 404.0])
+        b = np.asarray([100.0, 200.0, 300.0, 400.0])
+        differences = a - b
+
+        res = ttest_comparison(a, b, paired=True)
+
+        assert res.effect_size == pytest.approx(
+            float(np.mean(differences) / np.std(differences, ddof=1))
+        )
+        assert abs(res.effect_size) > 1.0
+        assert abs(cohens_d(a, b)) < 0.1
+
     def test_paired_ttest_rejects_identical_samples(self) -> None:
         values = [0.91, 0.88, 0.95]
         with pytest.raises(
@@ -663,12 +794,66 @@ class TestIdenticalWilcoxonRejection:
                 )
 
     def test_constant_nonzero_shift_stays_defined(self) -> None:
+        # A rank statistic stays finite for a constant per-pair shift, so the
+        # effect size beside it must stay finite too or the result cannot be
+        # exported. Wilcoxon therefore keeps pooled Cohen's d rather than d_z,
+        # whose denominator is zero for exactly this input.
         result = wilcoxon_comparison([1.0, 2.0, 3.0], [0.5, 1.5, 2.5])
 
         assert result.test_name == "Wilcoxon signed-rank"
         assert result.statistic == pytest.approx(0.0)
         assert result.p_value < 1.0
         assert result.effect_size == cohens_d([1.0, 2.0, 3.0], [0.5, 1.5, 2.5])
+        assert np.isfinite(result.effect_size)
+
+    def test_constant_shift_wilcoxon_survives_the_significance_export_path(
+        self,
+    ) -> None:
+        # A producer-only assertion is not enough: every public significance
+        # export path runs _preflight_significance_results, which refuses a
+        # non-finite effect size. This sends the constant-shift result through
+        # the supported table generator so the producer and exporter contracts
+        # cannot drift apart again.
+        from alberta_framework.utils.export import generate_significance_table
+
+        result = wilcoxon_comparison([1.0, 2.0, 3.0], [0.5, 1.5, 2.5])
+        results = {(result.method_a, result.method_b): result}
+
+        for table_format in ("markdown", "latex"):
+            table = generate_significance_table(results, format=table_format)
+            assert isinstance(table, str)
+            assert table
+            assert "inf" not in table.lower()
+
+    def test_zero_difference_variance_effect_size_agrees_with_the_statistic(
+        self,
+    ) -> None:
+        # A perfectly consistent shift has zero difference variance, so the
+        # paired t statistic is itself infinite. Reporting a finite effect size
+        # beside an infinite statistic would disagree with the test the effect
+        # size accompanies, so d_z carries the same signed infinity.
+        for values_a, values_b, sign in (
+            ([2.0, 3.0, 4.0], [1.0, 2.0, 3.0], 1.0),
+            ([1.0, 2.0, 3.0], [2.0, 3.0, 4.0], -1.0),
+        ):
+            result = ttest_comparison(np.asarray(values_a), np.asarray(values_b), paired=True)
+
+            assert np.isinf(result.statistic)
+            assert np.isinf(result.effect_size)
+            assert np.sign(result.statistic) == sign
+            assert np.sign(result.effect_size) == sign
+            # Never NaN: the sign of the shift stays readable.
+            assert not np.isnan(result.effect_size)
+
+    def test_zero_difference_variance_with_equal_means_is_zero(self) -> None:
+        # Zero difference variance AND a zero mean difference is a genuine null,
+        # not an infinite effect, so it must stay finite.
+        result = ttest_comparison(
+            np.asarray([1.0, 2.0, 5.0]), np.asarray([1.0, 3.0, 4.0]), paired=True
+        )
+
+        assert result.effect_size == 0.0
+        assert np.isfinite(result.effect_size)
 
 
 class TestOneSampleRejection:
@@ -813,6 +998,15 @@ class TestCorrections:
             False,
             False,
         ]
+
+    def test_holm_ties_keep_source_order_for_record_thresholds(self) -> None:
+        significant, thresholds = _holm_decisions(
+            [0.01, 0.01, 0.0, 0.0],
+            alpha=0.05,
+        )
+
+        assert significant == [True, True, True, True]
+        assert thresholds == pytest.approx([0.05 / 2, 0.05, 0.05 / 4, 0.05 / 3])
 
     def test_holm_strictly_more_powerful_fixture(self) -> None:
         # Bonferroni (alpha/3 = 0.0167) rejects only the first two;
@@ -1010,6 +1204,14 @@ class TestPairwiseComparisons:
         with pytest.raises(ValueError, match="Unknown correction"):
             pairwise_comparisons(self._results(), correction="fdr")
 
+    @pytest.mark.parametrize("n_methods", [0, 1])
+    def test_unknown_options_raise_with_nothing_to_compare(self, n_methods: int) -> None:
+        results = {"only": _make_aggregated("only", 0.1, seed=4)} if n_methods else {}
+        with pytest.raises(ValueError, match="Unknown test"):
+            pairwise_comparisons(results, test="anova")
+        with pytest.raises(ValueError, match="Unknown correction"):
+            pairwise_comparisons(results, correction="fdr")
+
     @pytest.mark.parametrize("window", [0, -1])
     def test_nonpositive_window_rejected_without_warnings(self, window: int) -> None:
         with warnings.catch_warnings():
@@ -1138,6 +1340,33 @@ class TestPairwiseComparisons:
 
         assert result[("a", "b")].statistic == pytest.approx(0.0)
 
+    def test_final_window_mean_preserves_representable_finite_extremes(self) -> None:
+        maximum = np.finfo(np.float64).max
+        high = AggregatedResults(
+            config_name="high",
+            seeds=[0, 1, 2],
+            metric_arrays={"reward": np.full((3, 2), maximum, dtype=np.float64)},
+            summary={},
+        )
+        low = AggregatedResults(
+            config_name="low",
+            seeds=[10, 11, 12],
+            metric_arrays={"reward": np.full((3, 2), maximum / 2.0, dtype=np.float64)},
+            summary={},
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            result = pairwise_comparisons(
+                {"high": high, "low": low},
+                metric="reward",
+                test="mann_whitney",
+                window=2,
+            )[("high", "low")]
+
+        assert result.statistic == pytest.approx(9.0)
+        assert result.effect_size == pytest.approx(1.0)
+
     @staticmethod
     def _settled_trace(name: str, n_steps: int, transient: float) -> AggregatedResults:
         """Three seeds that start at ``transient`` and settle at exactly 1.0 after step 9."""
@@ -1179,3 +1408,185 @@ class TestPairwiseComparisons:
     def test_common_final_window_requires_positive_integer(self, window: object) -> None:
         with pytest.raises(ValueError, match="window must be a positive integer"):
             common_final_window({"learner": 10}, window, "squared_error")
+
+    @pytest.mark.parametrize("n_steps", [0, -1, True, 1.5, 10.0, "10", None])
+    def test_common_final_window_requires_positive_step_counts(self, n_steps: object) -> None:
+        with pytest.raises(ValueError, match="step count must be a positive integer"):
+            common_final_window({"learner": n_steps}, 10, "squared_error")
+
+    def test_common_final_window_keeps_positive_numpy_step_counts(self) -> None:
+        assert common_final_window({"learner": np.int64(4)}, 10, "squared_error") == 4
+
+
+@pytest.mark.parametrize("timeseries", [False, True])
+def test_unrepresentable_maximum_spread_raises_without_runtime_warning(timeseries: bool) -> None:
+    maximum = np.finfo(np.float64).max
+    values = np.asarray([-maximum, maximum])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ValueError, match="cannot be represented as finite float64 statistics"):
+            if timeseries:
+                compute_timeseries_statistics(values[:, None])
+            else:
+                compute_statistics(values)
+
+
+_REAL_SAMPLES = np.array([1.0, 2.0, 3.0, 4.0, 5.5])
+_OTHER_SAMPLES = np.array([1.5, 2.5, 3.0, 4.5, 6.0])
+_NON_REAL_SAMPLES = [
+    pytest.param(_REAL_SAMPLES + 1j, id="complex"),
+    pytest.param(np.array(["2020-01-01"] * 5, dtype="datetime64[D]"), id="datetime"),
+    pytest.param(np.array([1, 2, 3, 4, 5], dtype="timedelta64[s]"), id="timedelta"),
+]
+
+
+@pytest.mark.parametrize("samples", _NON_REAL_SAMPLES)
+@pytest.mark.parametrize(
+    "summarize",
+    [
+        pytest.param(compute_statistics, id="compute_statistics"),
+        pytest.param(lambda x: bootstrap_ci(x, n_bootstrap=20), id="bootstrap_ci"),
+        pytest.param(lambda x: cohens_d(x, _OTHER_SAMPLES), id="cohens_d_a"),
+        pytest.param(lambda x: cohens_d(_OTHER_SAMPLES, x), id="cohens_d_b"),
+        pytest.param(lambda x: ttest_comparison(x, _OTHER_SAMPLES), id="ttest_a"),
+        pytest.param(lambda x: ttest_comparison(_OTHER_SAMPLES, x), id="ttest_b"),
+        pytest.param(
+            lambda x: ttest_comparison(x, _OTHER_SAMPLES, paired=False), id="ttest_unpaired"
+        ),
+        pytest.param(lambda x: mann_whitney_comparison(x, _OTHER_SAMPLES), id="mann_whitney"),
+        pytest.param(lambda x: wilcoxon_comparison(x, _OTHER_SAMPLES), id="wilcoxon"),
+        pytest.param(lambda x: compute_timeseries_statistics(np.stack([x, x])), id="timeseries"),
+    ],
+)
+def test_non_real_samples_are_rejected(summarize: Any, samples: np.ndarray) -> None:
+    """A real-valued summary must not drop an imaginary part or read a date as a number."""
+    with pytest.raises(ValueError, match="must be real numeric samples"):
+        summarize(samples)
+
+
+@pytest.mark.parametrize("samples", _NON_REAL_SAMPLES)
+def test_pairwise_comparisons_reject_non_real_final_windows(samples: np.ndarray) -> None:
+    window = np.stack([samples, samples[::-1]])
+    results = {
+        "real": AggregatedResults("real", [0, 1], {"m": np.stack([_REAL_SAMPLES] * 2)}, {}),
+        "other": AggregatedResults("other", [0, 1], {"m": window}, {}),
+    }
+    with pytest.raises(ValueError, match="must be real numeric samples"):
+        pairwise_comparisons(results, metric="m", window=3)
+
+
+class TestProbabilityPrecision:
+    """Stored p-values and alphas keep full float64 precision.
+
+    p-values are measurement outputs and alpha is a preregistered decision
+    threshold; neither has a float32 consumer, so narrowing them to binary32
+    corrupts the recorded artifact (anything below ~1.4e-45 flushes to an
+    impossible exact 0) and makes verdicts depend on the host container type
+    of the same real number.
+    """
+
+    def test_ttest_p_value_matches_scipy_exactly(self) -> None:
+        scipy_stats = pytest.importorskip("scipy.stats")
+        rng = np.random.default_rng(11)
+        x = rng.normal(0.0, 1.0, 20)
+        y = x + 0.9 + rng.normal(0.0, 0.05, 20)
+        expected = float(scipy_stats.ttest_rel(x, y).pvalue)
+        result = ttest_comparison(x, y, paired=True)
+        assert result.p_value == expected
+
+    def test_extreme_p_value_is_not_flushed_to_zero(self) -> None:
+        scipy_stats = pytest.importorskip("scipy.stats")
+        rng = np.random.default_rng(20260823)
+        a = 0.010 + rng.normal(0.0, 0.00008, 20)
+        b = 0.500 + rng.normal(0.0, 0.00080, 20)
+        expected = float(scipy_stats.ttest_rel(a, b).pvalue)
+        assert 0.0 < expected < 1e-45
+        result = ttest_comparison(a, b, paired=True)
+        assert result.p_value == expected
+        assert result.p_value > 0.0
+
+    def test_alpha_is_recorded_exactly(self) -> None:
+        result = ttest_comparison(
+            np.asarray([1.0, 2.0, 4.0, 8.0]),
+            np.asarray([1.5, 2.5, 3.5, 6.0]),
+            paired=True,
+            alpha=np.float64(0.01),
+        )
+        assert result.alpha == 0.01
+
+    @pytest.mark.parametrize("correction", [bonferroni_correction, holm_correction])
+    def test_correction_verdicts_do_not_depend_on_host_container(
+        self, correction: Any
+    ) -> None:
+        boundary = 0.016666666666666663
+        assert boundary < 0.05 / 3
+        from_double = correction([np.float64(boundary)] * 3, alpha=0.05)
+        from_builtin = correction([boundary] * 3, alpha=0.05)
+        assert from_double == from_builtin
+        significant = from_double[0] if correction is bonferroni_correction else from_double
+        assert list(significant) == [True, True, True]
+
+
+@pytest.mark.parametrize("statistic", ["mean", "median"])
+@pytest.mark.parametrize("value", [1.0e308, -1.0e308, 0.0])
+def test_bootstrap_large_constant_finite(statistic: str, value: float) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result = bootstrap_ci([value, value], statistic=statistic, n_bootstrap=32)
+    assert result == (value, value, value)
+
+
+@pytest.mark.parametrize("statistic", ["mean", "median"])
+def test_bootstrap_opposite_extremes_finite(statistic: str) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        point, lower, upper = bootstrap_ci(
+            [-1.0e308, 1.0e308], statistic=statistic, n_bootstrap=100
+        )
+    assert (point, lower, upper) == (0.0, -1.0e308, 1.0e308)
+
+
+_T_TEST_A = np.asarray([1.0, 1.1, 0.9, 1.05], dtype=np.float64)
+_T_TEST_B = np.asarray([-1.0, -1.1, -0.8, -1.25], dtype=np.float64)
+
+
+@pytest.mark.parametrize("paired", [True, False])
+@pytest.mark.parametrize("scale", [1.0e-300, 1.0e-200, 1.0e160, 1.0e300, 2.0**1022])
+def test_ttest_verdict_does_not_depend_on_measurement_units(paired: bool, scale: float) -> None:
+    expected = ttest_comparison(_T_TEST_A, _T_TEST_B, paired=paired)
+    result = ttest_comparison(_T_TEST_A * scale, _T_TEST_B * scale, paired=paired)
+    assert expected.significant
+    assert result.significant
+    assert result.statistic == pytest.approx(expected.statistic)
+    assert result.p_value == pytest.approx(expected.p_value)
+    assert result.effect_size == pytest.approx(expected.effect_size)
+
+
+@pytest.mark.parametrize("paired", [True, False])
+def test_ttest_does_not_report_overlapping_tiny_samples_as_significant(paired: bool) -> None:
+    a = np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float64)
+    b = np.asarray([2.0, 1.0, 4.0, 3.5], dtype=np.float64)
+    expected = ttest_comparison(a, b, paired=paired)
+    result = ttest_comparison(a * 1.0e-200, b * 1.0e-200, paired=paired)
+    assert not result.significant
+    assert result.p_value == pytest.approx(expected.p_value)
+
+
+def test_ttest_binary_scaling_keeps_ordinary_values_exact() -> None:
+    a = np.asarray([0.1, 0.2, 0.35], dtype=np.float64)
+    b = np.asarray([0.3, 0.1, 0.7], dtype=np.float64)
+    from scipy import stats
+
+    assert ttest_comparison(a, b, paired=False).statistic == float(stats.ttest_ind(a, b)[0])
+    assert ttest_comparison(a, b, paired=True).statistic == float(stats.ttest_rel(a, b)[0])
+
+
+
+def test_ttest_paired_scaling_preserves_residuals_after_extreme_ties() -> None:
+    a = np.asarray([1e308, 1e-300, 2e-300, 3e-300], dtype=np.float64)
+    b = np.asarray([1e308, 0.0, 0.0, 0.0], dtype=np.float64)
+    expected = ttest_comparison([0.0, 1.0, 2.0, 3.0], [0.0] * 4, paired=True)
+    result = ttest_comparison(a, b, paired=True)
+    assert result.statistic == pytest.approx(expected.statistic)
+    assert result.p_value == pytest.approx(expected.p_value)
+    assert result.effect_size == pytest.approx(expected.effect_size)

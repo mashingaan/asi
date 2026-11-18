@@ -179,6 +179,7 @@ _PROTOTYPE_CHECKPOINT_SCHEMA_V2 = "alberta.prototype_agent.v2"
 _PROTOTYPE_CHECKPOINT_SCHEMA_V1 = "alberta.prototype_agent.v1"
 _PROTOTYPE_EMPTY_ARRAY_CODEC = "alberta.prototype_agent.empty_array_projection.v1"
 _PROTOTYPE_SUPPORTED_PRNG_IMPLS = frozenset({"threefry2x32", "rbg"})
+_GUARDED_DREAM_STREAM_TAG = 0x44524D53
 _DREAM_NEXT_OBSERVATION_STREAM_TAG = 0x44524D4F
 _PROTOTYPE_V2_REPLAY_MIGRATION_TAG = 0x50525632
 _PROTOTYPE_FEATURE_LIFECYCLE_KEY_TAG = 0x50464C43
@@ -188,6 +189,47 @@ _INT32_MAX = 2**31 - 1
 # ---------------------------------------------------------------------------
 # Standalone utility
 # ---------------------------------------------------------------------------
+
+
+def _guarded_dream_rng_root(stored_real_key: Array) -> Array:
+    """Derive dreaming randomness without consuming the future real stream."""
+    return jr.fold_in(stored_real_key, _GUARDED_DREAM_STREAM_TAG)
+
+
+def _reduction_safe_l2_norm(value: Array) -> Array:
+    """Preserve a representable L2 norm when only its square sum overflows."""
+    direct = jnp.linalg.norm(value)
+    scale = jnp.max(jnp.abs(value))
+    _, exponent = jnp.frexp(scale)
+    scaled = jnp.ldexp(value, -exponent)
+    stable = jnp.ldexp(jnp.linalg.norm(scaled), exponent)
+    reduction_only_overflow = ~jnp.isfinite(direct) & jnp.all(jnp.isfinite(value))
+    return jnp.where(reduction_only_overflow, stable, direct)
+
+
+@jax.custom_jvp
+def _half_square(error: Array) -> Array:
+    """Return ``0.5 * error**2`` when that half-square is representable.
+
+    A finite square keeps the direct product. The mantissa split applies the
+    one-half before the overflowed square. The derivative stays ``error`` on
+    both paths, so a finite behavior gradient is not dropped with the loss.
+    """
+    half = jnp.asarray(0.5, dtype=error.dtype)
+    direct = half * (error * error)
+    mantissa, exponent = jnp.frexp(error)
+    recovered = jnp.ldexp(half * (mantissa * mantissa), exponent + exponent)
+    return jnp.where(jnp.isfinite(direct) | ~jnp.isfinite(recovered), direct, recovered)
+
+
+@_half_square.defjvp
+def _half_square_jvp(
+    primals: tuple[Array, ...],
+    tangents: tuple[Array, ...],
+) -> tuple[Array, Array]:
+    (error,) = primals
+    (error_tangent,) = tangents
+    return _half_square(error), error * error_tangent
 
 
 def feature_to_subtask_specs(
@@ -237,7 +279,10 @@ def feature_to_subtask_specs(
     opt_q = oak_state.stomp_state.option_policies.q_weights      # (n_opts, n_prim, obs_dim)
     opt_q_abs = jnp.abs(opt_q)
     obs_dim = int(opt_q.shape[-1])
-    opt_importance = jnp.max(opt_q_abs.reshape(-1, obs_dim), axis=0)  # (obs_dim,)
+    # ``initial=0.0`` is the exact identity for absolute values, so an agent
+    # with no options yet ranks by its base Q-weights alone instead of
+    # reducing over an empty axis.
+    opt_importance = jnp.max(opt_q_abs.reshape(-1, obs_dim), axis=0, initial=0.0)
 
     combined = jnp.maximum(feature_importance, opt_importance)
     n = min(normalized_n_subtasks, obs_dim)
@@ -261,19 +306,7 @@ def feature_to_subtask_specs(
 
 _INT32_MAX = 2**31 - 1
 _UINT32_MAX = 4_294_967_295
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-)
+_ACTUAL_INT_TYPES: tuple[type, ...] = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 _ACTUAL_FLOAT_TYPES: tuple[type, ...] = (
     float,
     Fraction,
@@ -497,6 +530,30 @@ def _init_gru_state(cfg: GRUPerceptionConfig, key: Array) -> GRUPerceptionState:
     )
 
 
+def _finite_product_matvec(matrix: Array, vector: Array) -> Array:
+    """Return a matrix-vector product that keeps large finite cancellation.
+
+    A compiled GEMV can turn an exact cancelling pair of finite products
+    into a huge finite value. The scaled product sum replaces that result.
+    Eagerly, a direct product that already matches stays bit for bit. Under
+    ``jax.jit`` the fused graph can round a few ulp differently, as the
+    compiled direct product already does relative to eager.
+    """
+
+    products = matrix * vector
+    max_abs = jnp.max(jnp.abs(products), axis=-1, keepdims=True)
+    # Scale by a power of two. Dividing by max_abs compiles to a reciprocal
+    # multiply, and the reciprocal of a value above 2**126 flushes to zero.
+    _, exponent = jnp.frexp(max_abs)
+    scaled_sum = jnp.sum(jnp.ldexp(products, -exponent), axis=-1)
+    stable = jnp.ldexp(scaled_sum, jnp.reshape(exponent, (-1,)))
+    direct = matrix @ vector
+    gap = jnp.abs(direct - stable)
+    limit = jnp.maximum(jnp.abs(stable), jnp.asarray(1.0, dtype=jnp.float32))
+    use_stable = jnp.isfinite(stable) & (gap > limit * jnp.asarray(1024.0, dtype=jnp.float32))
+    return jnp.where(use_stable, stable, direct)
+
+
 def _gru_step(
     gru: GRUPerceptionState,
     obs: Float[Array, " obs_dim"],
@@ -507,9 +564,15 @@ def _gru_step(
     ``[obs, new_hidden]`` as the augmented observation.
     """
     h = gru.hidden
-    z = jax.nn.sigmoid(gru.W_z @ obs + gru.U_z @ h + gru.b_z)
-    r = jax.nn.sigmoid(gru.W_r @ obs + gru.U_r @ h + gru.b_r)
-    h_tilde = jnp.tanh(gru.W_h @ obs + gru.U_h @ (r * h) + gru.b_h)
+    z = jax.nn.sigmoid(
+        _finite_product_matvec(gru.W_z, obs) + _finite_product_matvec(gru.U_z, h) + gru.b_z
+    )
+    r = jax.nn.sigmoid(
+        _finite_product_matvec(gru.W_r, obs) + _finite_product_matvec(gru.U_r, h) + gru.b_r
+    )
+    h_tilde = jnp.tanh(
+        _finite_product_matvec(gru.W_h, obs) + _finite_product_matvec(gru.U_h, r * h) + gru.b_h
+    )
     new_h = (1.0 - z) * h + z * h_tilde
     new_gru = cast(GRUPerceptionState, gru.replace(hidden=new_h))
     return new_gru, jnp.concatenate([obs, new_h], axis=0)
@@ -3860,7 +3923,7 @@ class PrototypeAgent:
                     representation,
                 )[action]
                 error = target - prediction
-                return jnp.asarray(0.5, dtype=jnp.float32) * jnp.square(error), prediction
+                return _half_square(error), prediction
 
             (loss, prediction), gradient = jax.value_and_grad(
                 loss_fn,
@@ -3935,7 +3998,7 @@ class PrototypeAgent:
             def loss_fn(representation: Array) -> tuple[Array, Array]:
                 prediction = q_weights[action] @ representation
                 error = target - prediction
-                return jnp.asarray(0.5, dtype=jnp.float32) * jnp.square(error), prediction
+                return _half_square(error), prediction
 
             (loss, prediction), gradient = jax.value_and_grad(
                 loss_fn,
@@ -3957,6 +4020,17 @@ class PrototypeAgent:
             )
 
         executing = stomp_state.executing_option >= 0
+        if stomp_config.n_options == 0:
+            # lax.cond traces both branches, but a zero-option configuration
+            # has no option-policy row that the unreachable branch can index.
+            gradient_payload = base_source(None)
+        else:
+            gradient_payload = jax.lax.cond(
+                executing,
+                intra_option_source,
+                base_source,
+                operand=None,
+            )
         (
             raw_gradient,
             prediction,
@@ -3966,12 +4040,7 @@ class PrototypeAgent:
             option_terminates,
             parameters_finite,
             source_indices_valid,
-        ) = jax.lax.cond(
-            executing,
-            intra_option_source,
-            base_source,
-            operand=None,
-        )
+        ) = gradient_payload
         inputs_finite = (
             jnp.all(jnp.isfinite(current))
             & jnp.all(jnp.isfinite(bootstrap))
@@ -3982,7 +4051,7 @@ class PrototypeAgent:
         )
         td_error = target - prediction
         gradient_finite = jnp.all(jnp.isfinite(raw_gradient))
-        gradient_norm = jnp.linalg.norm(raw_gradient)
+        gradient_norm = _reduction_safe_l2_norm(raw_gradient)
         prediction_finite = jnp.isfinite(prediction)
         target_finite = jnp.isfinite(target)
         td_error_finite = jnp.isfinite(td_error)
@@ -4622,6 +4691,9 @@ class PrototypeAgent:
         )
         if lifecycle_id is None:
             lifecycle_words = jr.key_data(session_key)
+            if lifecycle_words.shape != (2,):
+                # RBG keys carry four data words; draw the two-word nonce instead.
+                lifecycle_words = jr.bits(session_key, (2,), jnp.uint32)
         else:
             lifecycle_words = _strict_uint32_words(
                 lifecycle_id,
@@ -5457,13 +5529,14 @@ class PrototypeAgent:
         rng_key: Array,
     ) -> tuple[OaKState, Float[Array, " n_dreams"]]:
         n_prim = self._config.oak.n_primitive_actions
+        dream_root = _guarded_dream_rng_root(rng_key)
         sample_one_hot = (
             self._config.dream_next_observation_mode == "sample_one_hot"
         )
         dream_observation_root = (
-            jr.fold_in(rng_key, _DREAM_NEXT_OBSERVATION_STREAM_TAG)
+            jr.fold_in(dream_root, _DREAM_NEXT_OBSERVATION_STREAM_TAG)
             if sample_one_hot
-            else rng_key
+            else dream_root
         )
 
         def _dream_step(
@@ -5536,7 +5609,7 @@ class PrototypeAgent:
 
         (new_oak_state, _), dream_td_errors = jax.lax.scan(
             _dream_step,
-            (oak_state, rng_key),
+            (oak_state, dream_root),
             jnp.arange(self._config.n_dreams_per_step),
         )
         return new_oak_state, dream_td_errors
@@ -7005,7 +7078,14 @@ class PrototypeAgent:
                 bootstrap_obs,
                 horde_discounts,
             )
-            new_horde_state = horde_result.state
+            # The learner keeps the demon's configured trace decay so a zero
+            # bootstrap can still be separated from eligibility. A stored
+            # zero-discount trace would otherwise enter the next episode.
+            new_horde_state = self._horde.drop_eligibility_after_zero_discount(
+                horde_result.state,
+                horde_discounts,
+                horde_result.update_applied,
+            )
             horde_tderrs = horde_result.td_errors
 
         # -- Step 12: IA update -----------------------------------------------
@@ -7944,7 +8024,8 @@ class PrototypeAgent:
         """Return candidate subtask specs ranked by current Q-weight importance.
 
         Delegates to :func:`feature_to_subtask_specs` using the threshold,
-        scale, and max-step settings from the first existing subtask spec.
+        scale, and max-step settings from the first existing subtask spec, or
+        that function's defaults when the agent has no subtask specs yet.
 
         Args:
             state: Current agent state.
@@ -7953,7 +8034,13 @@ class PrototypeAgent:
         Returns:
             Tuple of :class:`SubtaskSpec` instances ranked by importance.
         """
-        template = self._config.oak.stomp.subtask_specs[0]
+        specs = self._config.oak.stomp.subtask_specs
+        if len(specs) == 0:
+            return feature_to_subtask_specs(
+                self._oak_component_state(state.oak_state),
+                n_subtasks=n_subtasks,
+            )
+        template = specs[0]
         return feature_to_subtask_specs(
             self._oak_component_state(state.oak_state),
             n_subtasks=n_subtasks,

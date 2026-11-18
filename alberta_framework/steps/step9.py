@@ -25,6 +25,7 @@ floats; legal endpoints stay valid.
 from __future__ import annotations
 
 import functools
+import time
 from dataclasses import asdict, dataclass, field
 from numbers import Integral
 from typing import Any, cast
@@ -84,21 +85,7 @@ _MAX_DREAM_WORK_PER_REAL_STEP = 4_096
 # additionally includes model-based dreaming rollouts, so this module is at
 # least as exposed to the hang as its siblings.
 _STEP9_SEQUENCE_MAX_STEPS = 10_000
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 @dataclass(frozen=True)
@@ -109,7 +96,9 @@ class Step9DreamingConfig:
     fires a fixed dreaming budget: for each dream the agent samples a recent
     anchor observation, picks a random action, queries the world model, and
     applies the imagined update **only** when the model passes two guards:
-    sufficient warm-up data and a low running prediction-error EMA.
+    sufficient warm-up data and a low running prediction-error EMA.  Each
+    dream starts from empty eligibility traces, and the real-experience
+    traces are restored afterwards.
 
     Args:
         control: Step 6 differential SARSA configuration.
@@ -607,8 +596,14 @@ def init_step9_state(
     """Initialize and prime the Step 9 state."""
     control_key, model_key, behavior_key = jr.split(key, 3)
     feature_dim = int(jnp.ravel(initial_observation).shape[0])
-    control_state = agent.init(feature_dim, control_key)
-    control_state, _ = agent.start(control_state, initial_observation)
+    control_init = agent.init(feature_dim, control_key)
+    control_state, _ = agent.start(control_init, initial_observation)
+    # agent.start is jitted, so the host-only lifecycle clocks it carries
+    # come back narrowed to float32; restore the exact init values.
+    control_state = control_state.replace(
+        birth_timestamp=control_init.birth_timestamp,
+        uptime_s=control_init.uptime_s,
+    )
     behavior_model = BehaviorModel(
         BehaviorModelConfig(
             n_actions=agent.config.n_actions,
@@ -639,21 +634,51 @@ def _update_control_with_linear_rng(
     proposed next action.  Select that action explicitly so the advanced key
     can remain linear even when the numerical update is rejected.
     """
-    next_action, next_key = agent.select_action(state, next_observation)
+    # This caller owns the linear reservation contract.  Action selection is
+    # deliberately fail-closed and preserves its key when policy inputs are
+    # invalid, but a rejected Step 9 transaction must still move past the
+    # randomness reserved for that attempt.
+    next_key, _, _, _ = jr.split(state.rng_key, 4)
+    next_action, _ = agent.select_action(state, next_observation)
     advanced_state = state.replace(rng_key=next_key)
     return cast(
         DifferentialSARSAUpdateResult,
-        agent.update(
-            advanced_state,
-            reward,
-            next_observation,
-            next_action=next_action,
-            discount=discount,
+        jax.lax.cond(
+            next_action >= 0,
+            lambda: agent.update(
+                advanced_state,
+                reward,
+                next_observation,
+                next_action=next_action,
+                discount=discount,
+            ),
+            lambda: agent._rejected_update_result(advanced_state),
         ),
     )
 
 
-@functools.partial(jax.jit, static_argnums=(0, 1, 2, 3))
+def _mean_squared_deviation(delta: Array) -> Array:
+    """Return the mean square of one finite residual without a sum overflow.
+
+    ``jnp.mean(delta ** 2)`` adds every square before dividing. A wide finite
+    residual can overflow that sum even though the mean is a finite float32
+    value. The direct mean is kept whenever it is already finite, so ordinary
+    residuals stay bit-identical. Only an overflowing reduction is rebuilt
+    from a power-of-two scaling.
+    """
+
+    squares = delta * delta
+    direct = jnp.mean(squares)
+    peak = jnp.max(jnp.abs(delta))
+    safe_peak = jnp.where(peak > 0.0, peak, jnp.asarray(1.0, dtype=jnp.float32))
+    _, exponent = jnp.frexp(safe_peak)
+    scaled = jnp.ldexp(delta, -exponent)
+    count = jnp.asarray(delta.shape[0], dtype=jnp.float32)
+    scaled_mean = jnp.sum(scaled * scaled) / count
+    stable = jnp.ldexp(scaled_mean, exponent + exponent)
+    return jnp.where(jnp.isfinite(direct), direct, stable)
+
+
 def step9_update(
     config: Step9DreamingConfig,
     agent: DifferentialSARSAAgent,
@@ -672,6 +697,42 @@ def step9_update(
     predicted transition is numerically finite AND every rollout control
     transaction applies.
     """
+    result = _step9_update(config, agent, model, buffer, state, reward, next_observation)
+    # The update is jitted, so the host-only lifecycle clocks come back
+    # narrowed to float32. One foreground transition advances neither clock,
+    # so restore the exact incoming values on the returned state.
+    new_state = result.state
+    return Step9DreamingUpdateResult(
+        state=new_state.replace(
+            control_state=new_state.control_state.replace(
+                birth_timestamp=state.control_state.birth_timestamp,
+                uptime_s=state.control_state.uptime_s,
+            ),
+            world_model_state=new_state.world_model_state.replace(
+                learner_state=new_state.world_model_state.learner_state.replace(
+                    birth_timestamp=state.world_model_state.learner_state.birth_timestamp,
+                    uptime_s=state.world_model_state.learner_state.uptime_s,
+                ),
+            ),
+        ),
+        real_control_result=result.real_control_result,
+        real_model_result=result.real_model_result,
+        dream_td_errors=result.dream_td_errors,
+        dream_accepted=result.dream_accepted,
+    )
+
+
+@functools.partial(jax.jit, static_argnums=(0, 1, 2, 3))
+def _step9_update(
+    config: Step9DreamingConfig,
+    agent: DifferentialSARSAAgent,
+    model: ActionConditionedWorldModel,
+    buffer: RecentObservationBuffer,
+    state: Step9DreamingState,
+    reward: Array,
+    next_observation: Array,
+) -> Step9DreamingUpdateResult:
+    """Jitted body of :func:`step9_update`."""
     real_discount = jnp.asarray(config.model_gamma, dtype=jnp.float32)
     real_model_result = model.update(
         state.world_model_state,
@@ -747,8 +808,8 @@ def step9_update(
                 anchor_obs,
             )
             prediction = model.predict(model_state, anchor_obs, behavior_sample.action)
-            transition_magnitude = jnp.mean(
-                (prediction.next_observation - anchor_obs) ** 2
+            transition_magnitude = _mean_squared_deviation(
+                prediction.next_observation - anchor_obs
             )
             surprise = transition_magnitude + jnp.abs(prediction.reward)
             utility = jnp.abs(prediction.reward)
@@ -797,8 +858,13 @@ def step9_update(
         selected_index = selection.selected_indices[0]
         anchor_obs = candidate_anchors[selected_index]
         action = candidate_actions[selected_index]
+        # A dream starts from empty eligibility: the real traces must neither
+        # receive imagined TD errors nor absorb imagined gradients that the
+        # next real TD error would then credit.
         initial_control_state = ctrl_state.replace(
-            rng_key=control_rollout_key
+            rng_key=control_rollout_key,
+            q_trace_weights=jnp.zeros_like(ctrl_state.q_trace_weights),
+            q_trace_bias=jnp.zeros_like(ctrl_state.q_trace_bias),
         )
         initial_behavior_state = behavior_state.replace(
             rng_key=behavior_rollout_key
@@ -879,6 +945,12 @@ def step9_update(
         restored = rollout_ctrl.replace(
             last_observation=control_after_real.last_observation,
             last_action=control_after_real.last_action,
+            epsilon=control_after_real.epsilon,
+            step_count=control_after_real.step_count,
+            step_words=control_after_real.step_words,
+            q_trace_weights=ctrl_state.q_trace_weights,
+            q_trace_bias=ctrl_state.q_trace_bias,
+            previous_discount=ctrl_state.previous_discount,
         )
         next_ctrl = cast(
             DifferentialSARSAState,
@@ -905,11 +977,18 @@ def step9_update(
             accepted,
         )
 
-    (final_ctrl, final_behavior), (dream_td_errors, dream_accepted) = jax.lax.scan(
-        dream_step,
-        (control_after_real, behavior_after_real),
-        jnp.arange(config.planning_budget, dtype=jnp.int32),
-    )
+    if config.planning_budget == 0:
+        # A zero-length scan still traces its body. Skip it so disabled planning
+        # never constructs the candidate or rollout arrays for unused axes.
+        final_ctrl, final_behavior = control_after_real, behavior_after_real
+        dream_td_errors = jnp.empty((0,), dtype=jnp.float32)
+        dream_accepted = jnp.empty((0,), dtype=jnp.bool_)
+    else:
+        (final_ctrl, final_behavior), (dream_td_errors, dream_accepted) = jax.lax.scan(
+            dream_step,
+            (control_after_real, behavior_after_real),
+            jnp.arange(config.planning_budget, dtype=jnp.int32),
+        )
 
     new_state = Step9DreamingState(
         control_state=final_ctrl,
@@ -1012,6 +1091,7 @@ def run_step9_scan(
             result.dream_accepted,
         )
 
+    t0 = time.time()
     final_state, (
         real_td_errors,
         average_rewards,
@@ -1021,6 +1101,25 @@ def run_step9_scan(
         dream_td_errors,
         dream_accepted,
     ) = jax.lax.scan(scan_step, state, (rewards, next_observations))
+    elapsed = 0.0
+    if not isinstance(real_td_errors, jax.core.Tracer):
+        jax.block_until_ready(real_td_errors)  # type: ignore[no-untyped-call]
+        elapsed = time.time() - t0
+    # Preserve the host-only lifecycle clocks at the batch boundary. Control
+    # uptime is kept exact, not advanced by the scan's wall time, as in
+    # run_step7_scan.
+    final_state = final_state.replace(
+        control_state=final_state.control_state.replace(
+            birth_timestamp=state.control_state.birth_timestamp,
+            uptime_s=state.control_state.uptime_s,
+        ),
+        world_model_state=final_state.world_model_state.replace(
+            learner_state=final_state.world_model_state.learner_state.replace(
+                birth_timestamp=state.world_model_state.learner_state.birth_timestamp,
+                uptime_s=state.world_model_state.learner_state.uptime_s + elapsed,
+            ),
+        ),
+    )
     return Step9ArrayResult(
         state=final_state,
         real_td_errors=real_td_errors,
@@ -1052,7 +1151,7 @@ def run_step9_smoke(
     _preflight_step9_resources(cfg)
     _preflight_step9_smoke_resources(cfg, steps)
     agent, model, buffer = make_step9_components(cfg)
-    data_key, state_key = jr.split(jr.key(seed))
+    data_key, state_key = jr.split(jr.key(seed, impl="threefry2x32"))
     observations = jr.normal(
         data_key,
         (steps + 1, cfg.observation_dim),

@@ -40,35 +40,36 @@ class _HostileInt(int):
     @property
     def __class__(self) -> type[int]:  # pragma: no cover
         type(self).calls += 1
-        raise AssertionError("class hook")
+        raise AssertionError("HostileInt.__class__ must not be called")
 
     def __int__(self) -> int:  # pragma: no cover
         type(self).calls += 1
-        raise AssertionError("int hook")
+        raise AssertionError("HostileInt.__int__ must not be called")
 
     def __index__(self) -> int:  # pragma: no cover
         type(self).calls += 1
-        raise AssertionError("index hook")
-
-    def __repr__(self) -> str:  # pragma: no cover
-        type(self).calls += 1
-        raise AssertionError("repr hook")
-
-    def __float__(self) -> float:  # type: ignore[override]
-        type(self).calls += 1
-        raise AssertionError("HostileFloat hook must not leak via !r")
-
-
-class _HostileInt(int):
-    calls = 0
-
-    def __int__(self) -> int:
-        type(self).calls += 1
-        raise AssertionError("HostileInt.__int__ must not be called")
+        raise AssertionError("HostileInt.__index__ must not be called")
 
     def __repr__(self) -> str:  # pragma: no cover
         type(self).calls += 1
         raise AssertionError("HostileInt.__repr__ must not be called")
+
+
+def test_hostile_int_traps_every_documented_coercion_hook() -> None:
+    """Guard against a second definition shadowing the stronger traps.
+
+    A duplicate ``_HostileInt`` used to shadow this class while trapping only
+    ``__int__`` and ``__repr__``, so the ``__class__`` and ``__index__`` traps
+    never ran -- and ``__index__`` is precisely the hook the house integer
+    gates reach for.
+    """
+    for hook in ("__class__", "__int__", "__index__", "__repr__"):
+        assert hook in vars(_HostileInt), hook
+
+    _HostileInt.calls = 0
+    with pytest.raises(AssertionError, match=r"HostileInt\.__int__"):
+        int(_HostileInt(4))
+    assert _HostileInt.calls == 1
 
 
 def test_rejects_string_subclass_for_feature_dim() -> None:
@@ -339,6 +340,38 @@ def test_collect_ceiling_length_still_succeeds(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.parametrize(
+    "stream",
+    [
+        NonlinearFeatureDiscoveryStream(feature_dim=4, latent_scale=3e38),
+        NonlinearFeatureDiscoveryStream(feature_dim=4, linear_scale=3e38),
+        NonlinearFeatureDiscoveryStream(feature_dim=4, noise_std=3e38),
+        InteractionFeatureDiscoveryStream(feature_dim=4, feature_std=3e38),
+        InteractionFeatureDiscoveryStream(feature_dim=4, noise_std=3e38),
+    ],
+)
+def test_collect_rejects_samples_that_overflow_from_finite_scales(
+    stream: NonlinearFeatureDiscoveryStream | InteractionFeatureDiscoveryStream,
+) -> None:
+    """Each scale is a valid float32, but the sampled data leaves float32."""
+    from alberta_framework.streams.feature_discovery import collect_feature_discovery_stream
+
+    with pytest.raises(ValueError, match="finite"):
+        collect_feature_discovery_stream(stream, 3, jr.key(0))
+
+
+def test_collect_leaves_traced_outputs_to_the_caller() -> None:
+    """The host-side gate must not concretize values under an outer transform."""
+    from alberta_framework.streams.feature_discovery import collect_feature_discovery_stream
+
+    stream = NonlinearFeatureDiscoveryStream(feature_dim=2, n_tasks=1, n_latents=1)
+    observations, targets = jax.jit(
+        lambda key: collect_feature_discovery_stream(stream, 2, key)
+    )(jr.key(0))
+    assert observations.shape == (2, 2)
+    assert targets.shape == (2, 1)
+
+
+@pytest.mark.parametrize(
     "factory", [NonlinearFeatureDiscoveryStream, InteractionFeatureDiscoveryStream]
 )
 def test_init_requires_scalar_typed_threefry_key(
@@ -367,6 +400,61 @@ def test_eager_and_jit_transactions_match_and_validate_static_contracts(
 
     with pytest.raises(ValueError, match="idx"):
         stream.step(state, jnp.asarray(0.0, dtype=jnp.float32))
+
+
+def test_overflowing_pair_product_keeps_the_finite_target() -> None:
+    stream = InteractionFeatureDiscoveryStream(
+        feature_dim=2,
+        n_tasks=1,
+        n_contexts=1,
+        context_length=1,
+        active_pairs_per_context=1,
+        feature_std=np.float32(1.0e20),
+        linear_scale=0.0,
+        noise_std=0.0,
+        include_squares=False,
+    )
+    state = stream.init(jr.key(0))
+    weight = jnp.asarray(np.float32(1.0e-20))
+    state = state.replace(
+        context_weights=jnp.full_like(state.context_weights, weight),
+        linear_weights=jnp.zeros_like(state.linear_weights),
+    )
+    idx = jnp.asarray(0, dtype=jnp.int32)
+    timestep, _next_state = stream.step(state, idx)
+    compiled, _compiled_state = jax.jit(stream.step)(state, idx)
+    observation = np.asarray(timestep.observation)
+    with np.errstate(over="ignore"):
+        raw_pair = observation[0] * observation[1]
+    assert observation.tobytes().hex() == "3a23dae0a3550be0"
+    assert not np.isfinite(raw_pair)
+    expected = np.array([0x602F35C5], dtype=np.uint32).view(np.float32)
+    np.testing.assert_array_equal(np.asarray(timestep.target), expected)
+    np.testing.assert_array_equal(np.asarray(compiled.target), expected)
+    negative, _negative_state = stream.step(
+        state.replace(context_weights=-state.context_weights),
+        idx,
+    )
+    np.testing.assert_array_equal(np.asarray(negative.target), -expected)
+
+    ordinary = InteractionFeatureDiscoveryStream(
+        feature_dim=2,
+        n_tasks=1,
+        n_contexts=1,
+        context_length=1,
+        active_pairs_per_context=1,
+        feature_std=1.0,
+        linear_scale=0.0,
+        noise_std=0.0,
+    )
+    ordinary_state = ordinary.init(jr.key(0))
+    ordinary_step, _ordinary_next = ordinary.step(ordinary_state, idx)
+    features = ordinary_step.observation
+    legacy = ordinary_state.context_weights[0] @ (
+        features[ordinary_state.pair_left] * features[ordinary_state.pair_right]
+    )
+    legacy = legacy + ordinary_state.linear_weights @ features
+    np.testing.assert_array_equal(np.asarray(ordinary_step.target), np.asarray(legacy))
 
 
 def test_step_rejects_wrong_state_array_before_jax_computation() -> None:

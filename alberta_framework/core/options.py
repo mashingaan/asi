@@ -49,7 +49,7 @@ from alberta_framework.core.normalizers import (
 )
 from alberta_framework.core.types import LMSState
 
-STOMP_STATE_SCHEMA = "alberta.stomp-state.v2"
+STOMP_STATE_SCHEMA = "alberta.stomp-state.v3"
 STOMP_LIFETIME_COUNTER_NBYTES = 12
 STOMP_LIFETIME_COUNTER_DELTA_NBYTES = 8
 
@@ -79,6 +79,19 @@ def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _IN
     if not minimum <= canonical <= maximum:
         raise ValueError(f"{name} must be an integer in [{minimum}, {maximum}]")
     return canonical
+
+
+def _require_concrete_finite(name: str, value: Array) -> Array:
+    """Reject non-finite values at an eager, state-committing boundary.
+
+    Traced inputs pass through because runtime gates remain authoritative
+    under ``jax.jit`` and ``jax.lax.scan``.
+    """
+    if not isinstance(value, jax.core.Tracer) and not bool(
+        np.all(np.isfinite(np.asarray(value)))
+    ):
+        raise ValueError(f"{name} must contain only finite values")
+    return value
 
 
 def _validate_hidden_sizes(sizes: object) -> tuple[int, ...]:
@@ -112,9 +125,13 @@ def _stomp_direct_array_scalars(config: STOMPConfig) -> int:
         base_learner_scalars
         + 2 * n_options * n_actions * observation_dim
         + n_options * observation_dim * observation_dim
-        + 11 * n_options
+        # Per-option scalars now include previous_discounts alongside the
+        # model EMAs, completions, and average rewards. The trailing scalar
+        # count includes base_previous_discount, the discount into the base
+        # decision state that will be trained by its next update.
+        + 12 * n_options
         + 2 * observation_dim
-        + 15
+        + 16
     )
 
 
@@ -253,11 +270,16 @@ class IntraOptionPoliciesState:
         traces: Accumulating eligibility traces; same shape as ``q_weights``.
         average_rewards: Per-option differential reward rates; shape
             ``(n_options,)``.
+        previous_discounts: Per-option discount of the transition that
+            produced the stored traces (shape ``(n_options,)``). The trace
+            decay on an update uses this prior discount, not the current
+            transition's discount; see :func:`_update_intra_option_policy`.
     """
 
     q_weights: Float[Array, "n_options n_actions obs_dim"]
     traces: Float[Array, "n_options n_actions obs_dim"]
     average_rewards: Float[Array, " n_options"]
+    previous_discounts: Float[Array, " n_options"]
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +353,13 @@ class STOMPState:
         base_learner_state: Extended Q-function state (MultiHeadMLPLearner
             with ``n_heads = K + N``).
         base_average_reward: Scalar continuing reward rate for base agent.
+        base_previous_discount: Discount of the last applied base transition,
+            into the current base decision state. The next base update
+            decays the stored traces by it (Sutton & Barto, 2nd ed.,
+            Sections 12.7-12.8). Only the
+            bootstrap uses the current transition's discount. A fresh state
+            stores ``1.0``; its traces are zero. On option termination the
+            stored value becomes the option's cumulative discount.
         base_last_obs: Most recent observation seen by the base agent.
         base_last_action: Last extended action index taken (0..K+N-1).
         last_primitive_action: Primitive action most recently selected for
@@ -357,6 +386,7 @@ class STOMPState:
 
     base_learner_state: MultiHeadMLPState
     base_average_reward: Float[Array, ""]
+    base_previous_discount: Float[Array, ""]
     base_last_obs: Float[Array, " obs_dim"]
     base_last_action: Int[Array, ""]
     last_primitive_action: Int[Array, ""]
@@ -530,6 +560,7 @@ def _stomp_static_dispatch_contract(
         (state.option_policies.q_weights, (n_options, n_primitive_actions, observation_dim)),
         (state.option_policies.traces, (n_options, n_primitive_actions, observation_dim)),
         (state.option_policies.average_rewards, (n_options,)),
+        (state.option_policies.previous_discounts, (n_options,)),
         (state.option_models.cumreward_ema, (n_options,)),
         (state.option_models.env_return_ema, (n_options,)),
         (state.option_models.duration_ema, (n_options,)),
@@ -542,6 +573,7 @@ def _stomp_static_dispatch_contract(
     )
     scalar_float32 = (
         state.base_average_reward,
+        state.base_previous_discount,
         state.option_cumreward,
         state.option_env_cumreward,
         state.option_baseline_mass,
@@ -765,6 +797,8 @@ def replace_dispatched_primitive_action(
         & (state.option_baseline_mass >= 0.0)
         & (state.option_discount >= 0.0)
         & (state.option_discount <= 1.0)
+        & (state.base_previous_discount >= 0.0)
+        & (state.base_previous_discount <= 1.0)
         & jnp.all(state.option_models.duration_ema >= 0.0)
         & jnp.all(state.option_models.baseline_mass_ema >= 0.0)
         & jnp.all(state.option_models.discount_ema >= 0.0)
@@ -977,6 +1011,58 @@ def _q_values_for_obs(q_weights: Array, observation: Array) -> Array:
     return q_weights @ observation
 
 
+def _discounted_bootstrap(discount: Array, value: Array) -> Array:
+    """Discard an unused bootstrap before scaling, including an overflowed Q.
+
+    Terminal rewards still train the current state when finite next-state
+    inputs overflow the value prediction. Positive discounts retain the raw
+    prediction; input and source-state validity gates remain the caller's job.
+    """
+    return discount * jnp.where(discount == 0.0, jnp.zeros_like(value), value)
+
+
+def _decay_inactive_base_traces(
+    state: MultiHeadMLPState,
+    active_action: Array,
+    decay: float,
+) -> MultiHeadMLPState:
+    """Apply the base trace decay to every head except the updated one.
+
+    The base learner pre-scales all head traces by the prior transition discount
+    before its update, and then applies its per-head gamma*lamda decay only
+    to the active head's trace: inactive heads are masked back to their
+    discount-scaled input trace. Without this step an inactive head's trace
+    misses the lam factor entirely, so it is over-credited by lam**-k after
+    k inactive steps. The active head is left untouched: its trace already
+    carries discount * lam plus the current gradient.
+    """
+    lam = jnp.asarray(decay, dtype=jnp.float32)
+    scaled_traces = tuple(
+        (
+            jnp.where(
+                head_index == active_action,
+                w_trace,
+                jnp.where(lam == 0.0, jnp.zeros_like(w_trace), lam * w_trace),
+            ),
+            jnp.where(
+                head_index == active_action,
+                b_trace,
+                jnp.where(lam == 0.0, jnp.zeros_like(b_trace), lam * b_trace),
+            ),
+        )
+        for head_index, (w_trace, b_trace) in enumerate(state.head_traces)
+    )
+    return state.replace(head_traces=scaled_traces)
+
+
+_GUMBEL_TIE_BREAK_SCALE = jnp.asarray(1.0e-6, dtype=jnp.float32)
+
+
+def _center_q_values(q_values: Array) -> Array:
+    """Center finite Q values before float32 Gumbel noise is added."""
+    return q_values - jnp.max(q_values)
+
+
 def _select_action_epsilon_greedy(
     q_weights: Array,
     observation: Array,
@@ -987,7 +1073,10 @@ def _select_action_epsilon_greedy(
     """ε-greedy action selection with Gumbel tie-breaking."""
     key, explore_key, noise_key = jr.split(key, 3)
     q_vals = _q_values_for_obs(q_weights, observation)
-    greedy = jnp.argmax(q_vals + 1e-6 * jr.gumbel(noise_key, (n_actions,))).astype(jnp.int32)
+    noisy = _center_q_values(q_vals) + _GUMBEL_TIE_BREAK_SCALE * jr.gumbel(
+        noise_key, (n_actions,)
+    )
+    greedy = jnp.argmax(noisy).astype(jnp.int32)
     random_action = jr.randint(explore_key, (), 0, n_actions).astype(jnp.int32)
     explore = jr.uniform(key) < jnp.asarray(epsilon, dtype=jnp.float32)
     action = jnp.where(explore, random_action, greedy)
@@ -1002,7 +1091,10 @@ def _select_action_epsilon_greedy_from_q(
 ) -> tuple[Array, Array]:
     """ε-greedy action selection from pre-computed Q values."""
     key, explore_key, noise_key = jr.split(key, 3)
-    greedy = jnp.argmax(q_vals + 1e-6 * jr.gumbel(noise_key, (n_actions,))).astype(jnp.int32)
+    noisy = _center_q_values(q_vals) + _GUMBEL_TIE_BREAK_SCALE * jr.gumbel(
+        noise_key, (n_actions,)
+    )
+    greedy = jnp.argmax(noisy).astype(jnp.int32)
     random_action = jr.randint(explore_key, (), 0, n_actions).astype(jnp.int32)
     explore = jr.uniform(key) < jnp.asarray(epsilon, dtype=jnp.float32)
     action = jnp.where(explore, random_action, greedy)
@@ -1024,7 +1116,9 @@ def _select_action_epsilon_greedy_from_q_masked(
 
     n_actions = q_vals.shape[0]
     key, explore_key, noise_key = jr.split(key, 3)
-    noisy = q_vals + 1e-6 * jr.gumbel(noise_key, (n_actions,))
+    eligible_q = jnp.where(action_mask, q_vals, -jnp.inf)
+    centered_q = eligible_q - jnp.max(eligible_q)
+    noisy = centered_q + _GUMBEL_TIE_BREAK_SCALE * jr.gumbel(noise_key, (n_actions,))
     masked_noisy = jnp.where(action_mask, noisy, -jnp.inf)
     greedy = jnp.argmax(masked_noisy).astype(jnp.int32)
     eligible_count = jnp.sum(action_mask.astype(jnp.int32))
@@ -1042,14 +1136,12 @@ def _select_action_epsilon_greedy_from_q_masked(
 
 
 def _epsilon_greedy_action_probabilities(q_values: Array, epsilon: Array) -> Array:
-    """Return epsilon-greedy probabilities with uniform tie handling."""
+    """Return probabilities of the centered float32 Gumbel-max selector."""
     q = jnp.asarray(q_values, dtype=jnp.float32)
     n_actions = q.shape[0]
     eps = jnp.asarray(epsilon, dtype=jnp.float32)
-    max_q = jnp.max(q)
-    greedy_mask = jnp.isclose(q, max_q, atol=1e-6, rtol=0.0).astype(jnp.float32)
-    n_greedy = jnp.maximum(jnp.sum(greedy_mask), jnp.array(1.0, dtype=jnp.float32))
-    return eps / n_actions + (1.0 - eps) * greedy_mask / n_greedy
+    greedy = jax.nn.softmax(_center_q_values(q) / _GUMBEL_TIE_BREAK_SCALE)
+    return eps / n_actions + (1.0 - eps) * greedy
 
 
 def _clipped_epsilon_greedy_importance_ratio(
@@ -1080,6 +1172,48 @@ def _clipped_epsilon_greedy_importance_ratio(
     return jnp.minimum(ratio, jnp.asarray(clip, dtype=jnp.float32))
 
 
+def _finite_cancelled_td(
+    reward: Array,
+    baseline: Array,
+    bootstrap: Array,
+    prediction: Array,
+) -> Array:
+    """Keep the historical sum unless that partial sum overflows.
+
+    ``((reward - baseline) + bootstrap) - prediction`` is the ordinary
+    association. When ``reward - baseline + bootstrap`` is non-finite but
+    ``bootstrap - prediction`` cancels, the rearranged error can still be
+    finite. A TD error that remains outside float32 stays non-finite so the
+    caller rejects the update.
+    """
+    direct_partial = reward - baseline + bootstrap
+    direct_td = direct_partial - prediction
+    recovered_td = reward - baseline + (bootstrap - prediction)
+    return jnp.where(jnp.isfinite(direct_partial), direct_td, recovered_td)
+
+
+def _finite_cancelled_target(
+    reward: Array,
+    baseline: Array,
+    bootstrap: Array,
+) -> Array:
+    """Keep the historical target unless that partial sum overflows.
+
+    ``reward - baseline + bootstrap`` is the ordinary association. When
+    ``reward - baseline`` overflows float32 but the baseline and bootstrap
+    cancel, the rearranged ``reward - (baseline - bootstrap)`` can still be
+    finite. A target that remains outside float32 stays non-finite so the
+    caller rejects the update.
+    """
+    direct_target = reward - baseline + bootstrap
+    recovered_target = reward - (baseline - bootstrap)
+    return jnp.where(
+        jnp.isfinite(direct_target) | ~jnp.isfinite(recovered_target),
+        direct_target,
+        recovered_target,
+    )
+
+
 def _differential_q_update(
     q_weights: Array,
     traces: Array,
@@ -1104,7 +1238,7 @@ def _differential_q_update(
 
     q_prev = q_weights[last_action] @ last_obs
     q_next = jnp.max(_q_values_for_obs(q_weights, next_obs))
-    td_error = reward - average_reward + q_next - q_prev
+    td_error = _finite_cancelled_td(reward, average_reward, q_next, q_prev)
 
     action_mask = jax.nn.one_hot(last_action, n_actions, dtype=jnp.float32)
     new_traces = lam * traces + action_mask[:, None] * last_obs[None, :]
@@ -1189,7 +1323,13 @@ def _differential_semidp_q_update(
     q_prev = q_weights[last_action] @ last_obs
     q_next = jnp.max(_q_values_for_obs(q_weights, next_obs))
     # The discounted reward and baseline must use the same γ powers.
-    td_error = reward - average_reward * baseline_coefficient + gamma_o * q_next - q_prev
+    # Pass those products in so a finite sum keeps this association.
+    td_error = _finite_cancelled_td(
+        reward,
+        average_reward * baseline_coefficient,
+        gamma_o * q_next,
+        q_prev,
+    )
 
     action_mask = jax.nn.one_hot(last_action, n_actions, dtype=jnp.float32)
     new_traces = lam * traces + action_mask[:, None] * last_obs[None, :]
@@ -1246,11 +1386,21 @@ def _update_option_model(
     decay = jnp.asarray(model_decay, dtype=jnp.float32)
     lr = jnp.asarray(model_step_size, dtype=jnp.float32)
 
-    new_cumreward = decay * models.cumreward_ema + (1.0 - decay) * pseudo_return
-    new_env_return = decay * models.env_return_ema + (1.0 - decay) * env_return
-    new_duration = decay * models.duration_ema + (1.0 - decay) * duration
-    new_baseline_mass = decay * models.baseline_mass_ema + (1.0 - decay) * baseline_mass
-    new_discount = decay * models.discount_ema + (1.0 - decay) * discount
+    # An EMA blended against its initial value is biased toward that value, and
+    # planning consumes these the moment n_completions reaches 1. Seed each EMA
+    # with the first observed completion so a one-sample model reports that
+    # sample exactly, instead of (1 - decay) * sample for the outcome terms and
+    # decay * 1.0 for the discount (which would bootstrap through a terminal).
+    unseeded = models.n_completions == 0
+
+    def _blend(previous: Array, observed: Array) -> Array:
+        return jnp.where(unseeded, observed, decay * previous + (1.0 - decay) * observed)
+
+    new_cumreward = _blend(models.cumreward_ema, pseudo_return)
+    new_env_return = _blend(models.env_return_ema, env_return)
+    new_duration = _blend(models.duration_ema, duration)
+    new_baseline_mass = _blend(models.baseline_mass_ema, baseline_mass)
+    new_discount = _blend(models.discount_ema, discount)
 
     predicted_delta = models.next_state_weights[option_idx] @ start_obs
     actual_delta = end_obs - start_obs
@@ -1330,6 +1480,7 @@ def _reset_linear_stomp_feature_axes(
             option_policies.traces,
         ),
         average_rewards=option_policies.average_rewards,
+        previous_discounts=option_policies.previous_discounts,
     )
     model_axis_mask = selected[None, :, None] | selected[None, None, :]
     scrubbed_models = OptionModelsState(
@@ -1367,23 +1518,32 @@ def _update_intra_option_policy(
     """Update one intra-option Q-function with a transition discount.
 
     ``terminated`` is the option's own termination decision (goal, duration,
-    or environmental termination).  It always zeros the bootstrap.  Otherwise
-    the supplied transition discount controls both bootstrapping and trace
-    carry, so fractional continuation is not silently promoted to one.
+    or environmental termination).  It zeros the bootstrap only.  The supplied
+    transition discount bootstraps this step's TD error and becomes the
+    next step's prior discount, but it must not decay the incoming trace:
+    the trace is built from earlier states, so it decays by the discount of
+    the transition *into* the current state (``previous_discounts``, carried
+    from the previous call), giving ``e_t = gamma_t * lambda * e_{t-1} +
+    phi_t``.  Decaying by the current discount instead would turn the
+    terminating step into TD(0) exactly where sparse pseudo-reward needs
+    multi-step credit: a zero terminating discount would erase the carried
+    trace before the goal step's TD error is applied.  The caller clears
+    the stored trace after this update when the option's lifecycle ends.
     """
     q_i = option_policies.q_weights[option_idx]
     traces_i = option_policies.traces[option_idx]
     avg_r_i = option_policies.average_rewards[option_idx]
+    previous_discount = option_policies.previous_discounts[option_idx]
     transition_discount = jnp.asarray(discount, dtype=jnp.float32)
     bootstrap_discount = jnp.where(terminated, 0.0, transition_discount).astype(jnp.float32)
 
     q_prev = q_i[last_intra_action] @ last_obs
-    q_next = jnp.max(_q_values_for_obs(q_i, next_obs)) * bootstrap_discount
-    td_error = pseudo_reward - avg_r_i + q_next - q_prev
+    q_next = _discounted_bootstrap(bootstrap_discount, jnp.max(_q_values_for_obs(q_i, next_obs)))
+    td_error = _finite_cancelled_td(pseudo_reward, avg_r_i, q_next, q_prev)
 
     alpha = jnp.asarray(step_size, dtype=jnp.float32)
     beta = jnp.asarray(avg_reward_step_size, dtype=jnp.float32)
-    lam = jnp.asarray(trace_decay, dtype=jnp.float32) * bootstrap_discount
+    lam = jnp.asarray(trace_decay, dtype=jnp.float32) * previous_discount
     rho = jnp.asarray(importance_ratio, dtype=jnp.float32)
 
     action_mask = jax.nn.one_hot(last_intra_action, n_primitive_actions, dtype=jnp.float32)
@@ -1395,9 +1555,12 @@ def _update_intra_option_policy(
         & jnp.isfinite(jnp.asarray(pseudo_reward, dtype=jnp.float32))
         & jnp.all(jnp.isfinite(next_obs))
         & jnp.isfinite(transition_discount)
+        & jnp.isfinite(previous_discount)
         & jnp.isfinite(rho)
         & (transition_discount >= 0.0)
         & (transition_discount <= 1.0)
+        & (previous_discount >= 0.0)
+        & (previous_discount <= 1.0)
         & (last_intra_action >= 0)
         & (last_intra_action < n_primitive_actions)
         & jnp.all(jnp.isfinite(q_i))
@@ -1422,12 +1585,16 @@ def _update_intra_option_policy(
     new_q_weights = option_policies.q_weights.at[option_idx].set(new_q_i)
     new_traces = option_policies.traces.at[option_idx].set(new_traces_i)
     new_avg_rewards = jnp.where(option_mask, new_avg_r_i, option_policies.average_rewards)
+    new_previous_discounts = option_policies.previous_discounts.at[option_idx].set(
+        jnp.where(update_applied, transition_discount, previous_discount)
+    )
 
     return (
         IntraOptionPoliciesState(
             q_weights=new_q_weights,
             traces=new_traces,
             average_rewards=new_avg_rewards,
+            previous_discounts=new_previous_discounts,
         ),
         jnp.where(update_applied, td_error, jnp.zeros_like(td_error)),
         update_applied,
@@ -1725,9 +1892,13 @@ class STOMPAgent:
         )
         values_valid = (
             _all_floating_leaves_finite(state)
+            & jnp.all(state.option_policies.previous_discounts >= 0.0)
+            & jnp.all(state.option_policies.previous_discounts <= 1.0)
             & (state.option_baseline_mass >= 0.0)
             & (state.option_discount >= 0.0)
             & (state.option_discount <= 1.0)
+            & (state.base_previous_discount >= 0.0)
+            & (state.base_previous_discount <= 1.0)
             & jnp.all(state.option_models.duration_ema >= 0.0)
             & jnp.all(state.option_models.baseline_mass_ema >= 0.0)
             & jnp.all(state.option_models.discount_ema >= 0.0)
@@ -1759,7 +1930,21 @@ class STOMPAgent:
         return self._config.to_config()
 
     def init(self, key: Array) -> STOMPState:
-        """Initialize agent state for a given observation dimensionality."""
+        """Initialize agent state for a given observation dimensionality.
+
+        Raises:
+            TypeError: If ``key`` is not a scalar typed JAX PRNG key.  The
+                state contract (``state_valid``) rejects every other key
+                shape, so accepting one here would prime an agent whose every
+                later transaction is silently dropped.
+        """
+        if not (
+            hasattr(key, "shape")
+            and hasattr(key, "dtype")
+            and key.shape == ()
+            and jax.dtypes.issubdtype(key.dtype, jax.dtypes.prng_key)
+        ):
+            raise TypeError("key must be a scalar typed JAX PRNG key")
         obs_dim = self._config.observation_dim
         n_prim = self._config.n_primitive_actions
         n_opt = self._config.n_options
@@ -1775,6 +1960,7 @@ class STOMPAgent:
         return STOMPState(
             base_learner_state=base_learner_state,
             base_average_reward=jnp.array(0.0, dtype=jnp.float32),
+            base_previous_discount=jnp.array(1.0, dtype=jnp.float32),
             base_last_obs=obs_zero,
             base_last_action=jnp.array(0, dtype=jnp.int32),
             last_primitive_action=jnp.array(0, dtype=jnp.int32),
@@ -1783,6 +1969,7 @@ class STOMPAgent:
                 q_weights=option_q_weights,
                 traces=jnp.zeros((n_opt, n_prim, obs_dim), dtype=jnp.float32),
                 average_rewards=jnp.zeros(n_opt, dtype=jnp.float32),
+                previous_discounts=jnp.ones(n_opt, dtype=jnp.float32),
             ),
             option_models=OptionModelsState(
                 cumreward_ema=jnp.zeros(n_opt, dtype=jnp.float32),
@@ -1805,13 +1992,25 @@ class STOMPAgent:
             step_words=jnp.zeros((2,), dtype=jnp.uint32),
         )
 
-    @functools.partial(jax.jit, static_argnums=(0,))
     def start(self, state: STOMPState, initial_observation: Array) -> STOMPState:
         """Prime state and select the first primitive action for dispatch.
 
         Use :meth:`start_with_action` when the caller needs the action
         explicitly. The state also records it in ``last_primitive_action``.
+
+        A concrete non-finite observation is rejected before it can enter
+        persistent state and make every later update fail closed. Traced
+        inputs pass through to the runtime state-finiteness gates.
         """
+        observation = jnp.asarray(initial_observation, dtype=jnp.float32).reshape(
+            (self._config.observation_dim,)
+        )
+        observation = _require_concrete_finite("initial_observation", observation)
+        return self._start(state, observation)
+
+    @functools.partial(jax.jit, static_argnums=(0,))
+    def _start(self, state: STOMPState, initial_observation: Array) -> STOMPState:
+        """Jitted implementation of one checked stream start."""
         cfg = self._config
         obs = jnp.asarray(initial_observation, dtype=jnp.float32).reshape((cfg.observation_dim,))
         key = state.rng_key
@@ -2048,6 +2247,8 @@ class STOMPAgent:
         The returned diagnostics are ``(applied_count, mean_td_error)``.
         Average reward is intentionally not part of the carry: imagined
         outcomes must not update the real experience reward-rate estimate.
+        Likewise each backup is a one-step update from empty eligibility, and
+        the real-experience eligibility traces are restored afterwards.
         """
         cfg = self._config
         completed_mask = (models.n_completions > 0) & extended_action_mask[
@@ -2083,23 +2284,46 @@ class STOMPAgent:
                     next_q,
                     -jnp.inf,
                 )
-                target = (
-                    models.env_return_ema[model_idx]
-                    - average_reward * models.baseline_mass_ema[model_idx]
-                    + models.discount_ema[model_idx] * jnp.max(eligible_next_q)
+                target = _finite_cancelled_target(
+                    models.env_return_ema[model_idx],
+                    average_reward * models.baseline_mass_ema[model_idx],
+                    _discounted_bootstrap(
+                        models.discount_ema[model_idx], jnp.max(eligible_next_q)
+                    ),
                 )
                 targets = (
                     jnp.full(cfg.n_total_actions, jnp.nan, dtype=jnp.float32)
                     .at[option_action]
                     .set(target)
                 )
+                # A Dyna backup is a one-step update at the anchor: start
+                # from empty eligibility so real-experience traces neither
+                # receive the imagined TD error nor absorb its gradient.
+                one_step_state = cast(
+                    MultiHeadMLPState,
+                    current_learner_state.replace(
+                        head_traces=jax.tree_util.tree_map(
+                            jnp.zeros_like, current_learner_state.head_traces
+                        ),
+                        trunk_traces=jax.tree_util.tree_map(
+                            jnp.zeros_like, current_learner_state.trunk_traces
+                        ),
+                    ),
+                )
                 update_result = self._base_learner.update(
-                    current_learner_state,
+                    one_step_state,
                     anchor_observation,
                     targets,
                 )
                 td_error = update_result.errors[option_action]
-                return update_result.state, td_sum + td_error
+                restored_state = cast(
+                    MultiHeadMLPState,
+                    update_result.state.replace(
+                        head_traces=current_learner_state.head_traces,
+                        trunk_traces=current_learner_state.trunk_traces,
+                    ),
+                )
+                return restored_state, td_sum + td_error
 
             planned_state, td_sum = jax.lax.fori_loop(
                 0,
@@ -2243,8 +2467,10 @@ class STOMPAgent:
             bootstrap_obs,
         )
         eligible_next_q = jnp.where(action_mask, next_q_values, -jnp.inf)
-        td_target = (
-            reward - state.base_average_reward + primitive_discount * jnp.max(eligible_next_q)
+        td_target = _finite_cancelled_target(
+            reward,
+            state.base_average_reward,
+            _discounted_bootstrap(primitive_discount, jnp.max(eligible_next_q)),
         )
         targets = (
             jnp.full(
@@ -2259,7 +2485,11 @@ class STOMPAgent:
             MultiHeadMLPState,
             state.base_learner_state.replace(
                 head_traces=jax.tree_util.tree_map(
-                    lambda trace: primitive_discount * trace,
+                    # Decay by the discount into the current state, carried
+                    # from the previous update, not this transition's
+                    # discount: a terminal discount must not erase the
+                    # carried trace before the terminal TD error is applied.
+                    lambda trace: state.base_previous_discount * trace,
                     state.base_learner_state.head_traces,
                 )
             ),
@@ -2268,6 +2498,13 @@ class STOMPAgent:
             trace_adjusted_state,
             state.base_last_obs,
             targets,
+        )
+        base_update = base_update.replace(
+            state=_decay_inactive_base_traces(
+                base_update.state,
+                state.base_last_action,
+                cfg.base_trace_decay,
+            )
         )
         base_td = base_update.errors[state.base_last_action]
         new_average_reward = (
@@ -2299,6 +2536,7 @@ class STOMPAgent:
         proposed_state = STOMPState(
             base_learner_state=new_base_state,
             base_average_reward=new_average_reward,
+            base_previous_discount=primitive_discount,
             base_last_obs=decision_obs,
             base_last_action=next_action,
             last_primitive_action=next_action,
@@ -2744,23 +2982,41 @@ class STOMPAgent:
         ) -> tuple[MultiHeadMLPState, Array, Array, Array]:
             next_q_vals = self._base_learner.predict(state.base_learner_state, bootstrap_obs)
             eligible_next_q = jnp.where(action_mask, next_q_vals, -jnp.inf)
-            max_next_q = base_discount * jnp.max(eligible_next_q)
-            td_target = base_reward - state.base_average_reward * base_baseline_mass + max_next_q
+            max_next_q = _discounted_bootstrap(base_discount, jnp.max(eligible_next_q))
+            td_target = _finite_cancelled_target(
+                base_reward,
+                state.base_average_reward * base_baseline_mass,
+                max_next_q,
+            )
             targets = (
                 jnp.full(n_total, jnp.nan, dtype=jnp.float32)
                 .at[state.base_last_action]
                 .set(td_target)
             )
+            # Decay the stored traces by the discount into the state being
+            # trained, carried from the previous base update. The current
+            # primitive or option transition's discount bootstraps the TD
+            # target and becomes the prior discount on the next base update.
+            # Decaying by the current discount instead would erase
+            # the carried trace on a terminal step (discount zero) before
+            # the terminal TD error is applied, turning it into TD(0).
             trace_adjusted_state = cast(
                 MultiHeadMLPState,
                 state.base_learner_state.replace(
                     head_traces=jax.tree_util.tree_map(
-                        lambda trace: base_discount * trace,
+                        lambda trace: state.base_previous_discount * trace,
                         state.base_learner_state.head_traces,
                     )
                 ),
             )
             result = self._base_learner.update(trace_adjusted_state, base_update_obs, targets)
+            result = result.replace(
+                state=_decay_inactive_base_traces(
+                    result.state,
+                    state.base_last_action,
+                    cfg.base_trace_decay,
+                )
+            )
             td_err = result.errors[state.base_last_action]
             new_avg_reward = state.base_average_reward + beta * td_err
             return result.state, new_avg_reward, td_err, result.update_applied
@@ -2912,6 +3168,16 @@ class STOMPAgent:
         proposed_state = STOMPState(
             base_learner_state=new_base_learner_state,
             base_average_reward=new_avg_r,
+            # The stored discount is the semi-MDP transition discount into
+            # the next decision state: this transition's discount for a
+            # primitive step, the option's cumulative discount on lifecycle
+            # end. Mid-option steps perform no base update, so the stored
+            # discount into the option start state is preserved.
+            base_previous_discount=jnp.where(
+                should_update_base,
+                base_discount,
+                state.base_previous_discount,
+            ),
             base_last_obs=decision_obs,
             base_last_action=jnp.where(
                 next_select_extended, extended_action, state.base_last_action
@@ -2943,6 +3209,10 @@ class STOMPAgent:
             transaction_preflight
             & intra_update_applied
             & real_base_update_applied
+            # A NaN target is a skipped head to the generic learner, which
+            # still advances its clock. Reject its nonfinite planning result
+            # before those clock increments can certify a successful backup.
+            & jnp.isfinite(planning_td_error)
             & nested_post_matches
             & proposed_state_valid
         )
@@ -3168,6 +3438,16 @@ class STOMPAgent:
                 scan_extended_action_masks,
             ),
         )
+        # The scan traces the base learner and narrows its host clocks to
+        # float32. Restore the incoming Python values. This scan keeps a
+        # no-timing contract: a rejected or replayed scan returns its input
+        # state exactly, so the host clocks gain no elapsed time here.
+        learner_state = final_state.base_learner_state
+        restored_learner = learner_state.replace(
+            birth_timestamp=state.base_learner_state.birth_timestamp,
+            uptime_s=state.base_learner_state.uptime_s,
+        )
+        final_state = final_state.replace(base_learner_state=restored_learner)
         return STOMPArrayResult(
             state=final_state,
             td_errors=td_errors,
@@ -3272,6 +3552,10 @@ STOMP_STATE_EXPANSION_FIELDS = (
 #: Exact-lifetime fields introduced by ``STOMP_STATE_SCHEMA`` v2.
 STOMP_STATE_LIFETIME_FIELDS = ("step_words",)
 
+#: Base trace-discount field introduced by ``STOMP_STATE_SCHEMA`` v3.
+#: Payloads written before prior-discount tracking lack this key.
+STOMP_STATE_PREVIOUS_DISCOUNT_FIELDS = ("base_previous_discount",)
+
 
 def measure_stomp_state_nbytes(state: STOMPState) -> int:
     """Measure STOMP-owned arrays plus its nested base-learner arrays."""
@@ -3367,6 +3651,9 @@ def load_stomp_state_with_migration(payload: dict[str, Any]) -> STOMPState:
       zeros — any option mid-flight at checkpoint time restarts its
       environment-return and baseline-mass accumulation, since the old
       format never recorded those quantities.
+    * ``base_previous_discount`` becomes scalar ``1.0`` when missing — the
+      continuing-stream default, since the old format never recorded the
+      discount of its last transition.
 
     Everything present in the payload is required: missing pre-expansion
     fields or unknown keys raise ``ValueError`` (fail-closed) rather than
@@ -3395,10 +3682,14 @@ def load_stomp_state_with_migration(payload: dict[str, Any]) -> STOMPState:
     missing_state_fields = state_field_names - set(data)
     pre_lifetime_fields = set(STOMP_STATE_LIFETIME_FIELDS)
     pre_expansion_fields = set(STOMP_STATE_EXPANSION_FIELDS) | pre_lifetime_fields
+    pre_previous_discount_fields = set(STOMP_STATE_PREVIOUS_DISCOUNT_FIELDS)
     allowed_missing_state_fields: tuple[set[str], ...] = (
         set(),
+        pre_previous_discount_fields,
         pre_lifetime_fields,
+        pre_lifetime_fields | pre_previous_discount_fields,
         pre_expansion_fields,
+        pre_expansion_fields | pre_previous_discount_fields,
     )
     if missing_state_fields not in allowed_missing_state_fields:
         raise ValueError(
@@ -3417,7 +3708,7 @@ def load_stomp_state_with_migration(payload: dict[str, Any]) -> STOMPState:
     missing_model_fields = model_field_names - set(models)
     expected_missing_model_fields = (
         set(STOMP_OPTION_MODEL_EXPANSION_FIELDS)
-        if missing_state_fields == pre_expansion_fields
+        if pre_expansion_fields <= missing_state_fields
         else set()
     )
     if missing_model_fields != expected_missing_model_fields:
@@ -3440,6 +3731,15 @@ def load_stomp_state_with_migration(payload: dict[str, Any]) -> STOMPState:
         field.name
         for field in dataclasses.fields(IntraOptionPoliciesState)  # type: ignore[arg-type]
     }
+    # Payloads written before prior-discount tracking lack previous_discounts;
+    # their stored traces were decayed by the then-current discount, so the
+    # neutral continuing default (1.0) is the only principled fill. Traces
+    # are zero on a fresh option, where the fill value is irrelevant.
+    if set(policies) == policy_field_names - {"previous_discounts"}:
+        n_policy_options = jnp.asarray(policies["average_rewards"]).shape[0]
+        policies["previous_discounts"] = jnp.ones(
+            (n_policy_options,), dtype=jnp.float32
+        )
     if set(policies) != policy_field_names:
         raise ValueError(
             f"STOMP option-policy payload fields {sorted(policies)} != {sorted(policy_field_names)}"
@@ -3451,6 +3751,17 @@ def load_stomp_state_with_migration(payload: dict[str, Any]) -> STOMPState:
             data[name] = jnp.asarray(data[name], dtype=jnp.float32)
         else:
             data[name] = jnp.array(0.0, dtype=jnp.float32)
+
+    # Payloads written before base prior-discount tracking lack
+    # base_previous_discount; their stored traces were decayed by the
+    # then-current discount, so the neutral continuing default (1.0) is the
+    # only principled fill, matching the previous_discounts fill above.
+    if "base_previous_discount" in data:
+        data["base_previous_discount"] = jnp.asarray(
+            data["base_previous_discount"], dtype=jnp.float32
+        )
+    else:
+        data["base_previous_discount"] = jnp.array(1.0, dtype=jnp.float32)
 
     base_learner = data["base_learner_state"]
     if not isinstance(base_learner, MultiHeadMLPState):
@@ -3522,6 +3833,7 @@ __all__ = [
     "STOMP_OPTION_MODEL_EXPANSION_FIELDS",
     "STOMP_STATE_EXPANSION_FIELDS",
     "STOMP_STATE_LIFETIME_FIELDS",
+    "STOMP_STATE_PREVIOUS_DISCOUNT_FIELDS",
     "SubtaskSpec",
     "check_option_terminated",
     "compute_pseudo_reward",

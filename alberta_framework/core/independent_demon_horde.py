@@ -82,6 +82,21 @@ _ACTUAL_INT_TYPES = frozenset(
 _ACTUAL_REAL_TYPES = _ACTUAL_INT_TYPES | frozenset(
     {float, *(np.dtype(code).type for code in "efdg")}
 )
+_SERIALIZED_FIELDS = frozenset(
+    {
+        "type",
+        "horde_spec",
+        "hidden_sizes",
+        "optimizer",
+        "bounder",
+        "normalizer",
+        "head_optimizer",
+        "sparsity",
+        "leaky_relu_slope",
+        "use_layer_norm",
+        "trace_mode",
+    }
+)
 
 
 def _require_int32(name: str, value: object, *, minimum: int, maximum: int = _INT32_MAX) -> int:
@@ -292,6 +307,45 @@ def _extract_mean_step_size(
     return jnp.array(0.0, dtype=jnp.float32)
 
 
+def _finite_layer_norm(values: Array) -> Array:
+    """Preserve parameterless layer norm when only its reductions overflow."""
+    mean = jnp.mean(values)
+    variance = jnp.var(values)
+    direct = (values - mean) / jnp.sqrt(variance + 1e-5)
+    reduction_overflowed = (
+        (~jnp.isfinite(mean) | ~jnp.isfinite(variance))
+        & jnp.all(jnp.isfinite(values))
+    )
+
+    def scaled_layer_norm(finite_values: Array) -> Array:
+        scale = jnp.max(jnp.abs(finite_values))
+        _, exponent = jnp.frexp(scale)
+        scaled = jnp.ldexp(finite_values, -exponent)
+        centered = scaled - jnp.mean(scaled)
+        scaled_variance = jnp.mean(centered * centered)
+        positive_variance = scaled_variance > 0.0
+        safe_variance = jnp.where(
+            positive_variance,
+            scaled_variance,
+            jnp.ones_like(scaled_variance),
+        )
+        contrast = centered * jax.lax.rsqrt(safe_variance)
+        constant = jnp.ldexp(centered, exponent) * jax.lax.rsqrt(
+            jnp.asarray(1e-5, dtype=finite_values.dtype)
+        )
+        return jnp.where(positive_variance, contrast, constant)
+
+    return cast(
+        Array,
+        jax.lax.cond(
+            reduction_overflowed,
+            scaled_layer_norm,
+            lambda _: direct,
+            values,
+        ),
+    )
+
+
 def _forward_mlp(
     weights: tuple[Array, ...],
     biases: tuple[Array, ...],
@@ -309,13 +363,31 @@ def _forward_mlp(
     for i in range(n_layers - 1):
         x = weights[i] @ x + biases[i]
         if use_layer_norm:
-            mean = jnp.mean(x)
-            var = jnp.var(x)
-            x = (x - mean) / jnp.sqrt(var + 1e-5)
+            x = _finite_layer_norm(x)
         x = jnp.where(x >= 0, x, leaky_relu_slope * x)
     # Output layer (no activation)
     x = weights[-1] @ x + biases[-1]
     return jnp.squeeze(x)
+
+
+def _finite_cancelled_gvf_td(
+    cumulant: Array,
+    bootstrap: Array,
+    terminal: Array,
+    prediction: Array,
+) -> Array:
+    """Keep ``(c + bootstrap + (1 - gamma) z) - V`` unless that sum overflows.
+
+    When the cumulant and the bootstrap are both huge, their sum can leave
+    float32 before the current prediction cancels the bootstrap. The
+    rearranged error ``c + (bootstrap - V) + (1 - gamma) z`` can still be
+    finite. A TD error that remains outside float32 stays non-finite so the
+    caller rejects the update. A finite sum keeps the left-to-right rounding.
+    """
+    direct_partial = cumulant + bootstrap + terminal
+    direct_td = direct_partial - prediction
+    recovered_td = cumulant + (bootstrap - prediction) + terminal
+    return jnp.where(jnp.isfinite(direct_partial), direct_td, recovered_td)
 
 
 # =============================================================================
@@ -398,6 +470,9 @@ class IndependentDemonHorde:
         if type(trace_mode) is not TraceMode:
             raise ValueError("trace_mode must be a TraceMode")
         self._horde_spec = horde_spec
+        self._terminal_rewards = jnp.array(
+            [demon.terminal_reward for demon in horde_spec.demons], dtype=jnp.float32
+        )
         self._hidden_sizes = hidden_sizes
         self._optimizer: AnyOptimizer = (
             optimizer if optimizer is not None else LMS(step_size=step_size)
@@ -478,7 +553,11 @@ class IndependentDemonHorde:
         )
 
         config = _read_mapping("config", config)
-        config.pop("type", None)
+        if set(config) != _SERIALIZED_FIELDS:
+            raise ValueError("config fields do not match the IndependentDemonHorde schema")
+        marker = config.pop("type")
+        if type(marker) is not str or marker != "IndependentDemonHorde":
+            raise ValueError("config type is invalid")
 
         horde_spec = HordeSpec.from_config(config.pop("horde_spec"))
         optimizer = optimizer_from_config(config.pop("optimizer"))
@@ -670,14 +749,16 @@ class IndependentDemonHorde:
         self,
         demon_state: MLPLearnerState,
         observation: Array,
-        target: Array,
+        cumulant: Array,
+        bootstrap: Array,
+        terminal: Array,
         gamma_lamda: Array,
         active: Array,
     ) -> tuple[MLPLearnerState, Array, Array, Array, Array]:
         """Run a single demon's update step.
 
-        Returns ``(new_state, prediction, error, mean_step_size)``. When
-        ``active`` is ``False`` the demon's parameters, traces, and
+        Returns ``(new_state, prediction, error, mean_step_size, commit)``.
+        When ``active`` is ``False`` the demon's parameters, traces, and
         optimizer states are preserved unchanged; ``error`` and
         ``mean_step_size`` are returned as NaN to flag inactivity.
         Non-finite proposed weights (ObGD ``0 * inf``) are also held.
@@ -712,7 +793,10 @@ class IndependentDemonHorde:
             slope,
             ln,
         )
-        error = jnp.where(active, target - prediction_val, 0.0)
+        finite_error = _finite_cancelled_gvf_td(
+            cumulant, bootstrap, terminal, prediction_val
+        )
+        error = jnp.where(active, finite_error, 0.0)
 
         def pred_fn(weights: tuple[Array, ...], biases: tuple[Array, ...]) -> Array:
             return _forward_mlp(weights, biases, obs, slope, ln)
@@ -764,6 +848,14 @@ class IndependentDemonHorde:
             new_traces.append(new_bt)
 
         # 4. Per-parameter optimizer step from traces
+        all_params: list[Array] = []
+        for i in range(n_layers):
+            all_params.extend((demon_state.params.weights[i], demon_state.params.biases[i]))
+        direct_steps = self._optimizer.gradient_update_returns_delta() or (
+            self._head_optimizer is not None
+            and self._head_optimizer.gradient_update_returns_delta()
+        )
+        step_error = jnp.ones_like(error) if direct_steps else error
         n_trace_entries = len(new_traces)
         all_steps: list[Array] = []
         new_opt_states: list[Any] = []
@@ -780,30 +872,31 @@ class IndependentDemonHorde:
                 demon_state.optimizer_states[j],
                 new_traces[j],
                 error=error,
+                param=all_params[j],
             )
+            if direct_steps and not opt.gradient_update_returns_delta():
+                step = error * step
             all_steps.append(step)
             new_opt_states.append(new_opt)
             optimizer_updates_applied.append(optimizer_update_applied)
 
         # 5. Optional bounding (per-demon)
         if self._bounder is not None:
-            all_params: list[Array] = []
-            for i in range(n_layers):
-                all_params.append(demon_state.params.weights[i])
-                all_params.append(demon_state.params.biases[i])
-            bounded_steps, bound_scale = self._bounder.bound(
-                tuple(all_steps), error, tuple(all_params)
+            # ``Bounder.bound`` returns ``(steps, metric)``; the metric is a
+            # reporting scalar (ObGD's step scale, AGC's clipped-unit fraction)
+            # and must never touch the eligibility traces, which decay by
+            # gamma * lambda alone.
+            bounded_steps, _bound_metric = self._bounder.bound(
+                tuple(all_steps), step_error, tuple(all_params)
             )
             all_steps = list(bounded_steps)
-            # Scale traces so future updates reflect the effective step
-            new_traces = [bound_scale * t for t in new_traces]
 
         # 6. Apply: param += error * step
         new_weights: list[Array] = []
         new_biases: list[Array] = []
         for i in range(n_layers):
-            new_weights.append(demon_state.params.weights[i] + error * all_steps[2 * i])
-            new_biases.append(demon_state.params.biases[i] + error * all_steps[2 * i + 1])
+            new_weights.append(demon_state.params.weights[i] + step_error * all_steps[2 * i])
+            new_biases.append(demon_state.params.biases[i] + step_error * all_steps[2 * i + 1])
 
         new_params = MLPParams(
             weights=tuple(new_weights),
@@ -891,7 +984,7 @@ class IndependentDemonHorde:
         # MultiHeadMLPLearner's NaN convention).
         reported_error = jnp.where(
             commit,
-            target - prediction_val,
+            error,
             jnp.where(active, 0.0, jnp.nan),
         )
         reported_mean_ss = jnp.where(
@@ -936,10 +1029,12 @@ class IndependentDemonHorde:
     ) -> HordeUpdateResult:
         """Update every demon's network given observation, cumulants, next obs.
 
-        Computes per-demon TD targets ``r + gamma * V(s')`` using each
-        demon's own gamma, then drives every demon's independent MLP with
-        that target. NaN cumulants suppress the update on the affected
-        demon (its params, traces, and optimizer states are preserved).
+        Computes per-demon TD targets
+        ``r + gamma * V(s') + (1 - gamma) * z`` using each demon's own
+        gamma and terminal pseudo-reward, then drives every demon's
+        independent MLP with that target. NaN cumulants suppress the
+        update on the affected demon (its params, traces, and optimizer
+        states are preserved).
 
         Args:
             state: Current state.
@@ -970,11 +1065,15 @@ class IndependentDemonHorde:
             [self._predict_single(state.demon_states[i], next_observation) for i in range(n_demons)]
         )
 
-        # 2. TD targets: r + gamma * V(s'). gamma=0 must not multiply inf V(s').
+        # 2. TD targets: r + gamma * V(s') + (1 - gamma) * z. gamma=0 must not
+        # multiply inf V(s'); z is the demon's terminal pseudo-reward.
         bootstrap = jnp.where(gammas == 0.0, 0.0, gammas * next_preds)
-        targets = cumulants + bootstrap
+        terminal = (1.0 - gammas) * self._terminal_rewards
+        targets = cumulants + bootstrap + terminal
 
-        # 3. NaN means inactive; other non-finite values are rejected heads.
+        # 3. NaN means inactive. An overflowing target sum is not rejected
+        # here: the demon cancels that sum against V(s) and still rejects a
+        # TD error or weight step that remains outside float32.
         requested_mask = ~jnp.isnan(cumulants)
         checked_demon_states = tuple(
             demon_state.replace(  # type: ignore[attr-defined]
@@ -1003,9 +1102,8 @@ class IndependentDemonHorde:
             )
         )
         active_mask = (
-            requested_mask & jnp.isfinite(cumulants) & jnp.isfinite(targets) & global_inputs_valid
+            requested_mask & jnp.isfinite(cumulants) & global_inputs_valid
         )
-        safe_targets = jnp.where(active_mask, targets, 0.0)
 
         # 4. Per-demon update
         new_demon_states: list[MLPLearnerState] = []
@@ -1018,7 +1116,9 @@ class IndependentDemonHorde:
             new_ds, pred_i, err_i, mss_i, commit_i = self._update_single(
                 state.demon_states[i],
                 observation,
-                safe_targets[i],
+                cumulants[i],
+                bootstrap[i],
+                terminal[i],
                 gamma_lamda_i,
                 active_mask[i],
             )
@@ -1167,9 +1267,24 @@ def run_independent_horde_learning_loop(
             updates_applied,
         ),
     ) = jax.lax.scan(step_fn, state, (observations, cumulants, next_observations))
+    # Traced calls defer execution; concrete results must finish before timing.
+    if not isinstance(per_demon_metrics, jax.core.Tracer):
+        per_demon_metrics.block_until_ready()
     elapsed = time.time() - t0
+    # The scan traces the horde and demon clocks and narrows them to float32.
+    # Restore the incoming Python values. Add this scan's time to the horde's
+    # host uptime, not to a narrowed device value.
+    demon_states = tuple(
+        demon.replace(  # type: ignore[attr-defined]
+            birth_timestamp=original.birth_timestamp,
+            uptime_s=original.uptime_s,
+        )
+        for demon, original in zip(final_state.demon_states, state.demon_states)
+    )
     final_state = final_state.replace(  # type: ignore[attr-defined]
-        uptime_s=final_state.uptime_s + elapsed
+        birth_timestamp=state.birth_timestamp,
+        uptime_s=state.uptime_s + elapsed,
+        demon_states=demon_states,
     )
 
     return IndependentDemonHordeLearningResult(  # type: ignore[call-arg]

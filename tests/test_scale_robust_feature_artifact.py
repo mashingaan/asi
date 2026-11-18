@@ -412,14 +412,15 @@ def test_calibration_record_is_hash_bound_and_marks_missing_primitives():
     ]
 
 
-def test_source_fingerprint_covers_exactly_five_pinned_sources():
-    assert set(current_source_fingerprint()) == {
-        "alberta_framework/core/interaction_features.py",
-        "alberta_framework/streams/gauntlet.py",
-        "alberta_framework/evaluation/scale_robust_feature.py",
-        "alberta_framework/evaluation/scale_robust_feature_artifact.py",
-        "alberta_framework/evaluation/scale_robust_feature_cli.py",
-    }
+def test_source_fingerprint_covers_the_registered_source_inventory():
+    from alberta_framework.evaluation.evidence_manifest import EVIDENCE_SPECS
+
+    registered = next(
+        spec.source_paths
+        for spec in EVIDENCE_SPECS
+        if spec.name == "scale_robust_pair_features"
+    )
+    assert set(current_source_fingerprint()) == {path.as_posix() for path in registered}
 
 
 def test_pair_descriptor_count_uses_only_unique_relevant_context_products():
@@ -992,6 +993,29 @@ def test_unknown_scientific_key_fails_even_when_rehashed(
     assert any("unknown keys" in error for error in validation.errors)
 
 
+def test_type_punned_gate_values_fail_even_when_rehashed(
+    accepted_artifact: dict[str, object],
+):
+    """Python equality treats True == 1.0 and 30 == 30.0; the validator must not."""
+    changed = copy.deepcopy(accepted_artifact)
+    check = _acceptance_checks(changed)[
+        "all_seed_primary_pre_final_d_context_noninferior_to_no_retention"
+    ]
+    assert float(check["actual"]).is_integer() and float(check["threshold"]).is_integer()
+    check["actual"] = int(check["actual"])  # JSON 4 in place of 4.0
+    check["threshold"] = bool(check["threshold"]) if check["threshold"] in (0.0, 1.0) else int(
+        check["threshold"]
+    )
+    changed["scientific_payload"]["thresholds"]["minimum_seed_count"] = 30.0
+    _rehash(changed)
+    validation = validate_evidence_artifact(changed)
+    assert not validation.valid
+    assert not validation.accepted
+    errors = validation.errors
+    assert any("acceptance does not match recomputed gate" in error for error in errors)
+    assert any("thresholds are not the frozen v2 thresholds" in error for error in errors)
+
+
 def test_primitive_tamper_fails_internal_binding_even_when_rehashed(
     accepted_artifact: dict[str, object],
 ):
@@ -1031,6 +1055,20 @@ def test_source_hash_tamper_fails_current_source_binding_even_when_rehashed(
     hashes = provenance["source_sha256"]
     path = next(iter(hashes))
     hashes[path] = "0" * 64
+    _rehash(changed)
+    validation = validate_evidence_artifact(changed)
+    assert not validation.valid
+
+
+def test_registered_measurement_helper_hash_is_bound(
+    accepted_artifact: dict[str, object],
+):
+    helper = "alberta_framework/evaluation/_measurement_validation.py"
+    changed = copy.deepcopy(accepted_artifact)
+    provenance = changed["scientific_payload"]["source_provenance"]
+    hashes = provenance["source_sha256"]
+    assert helper in hashes
+    hashes[helper] = "0" * 64
     _rehash(changed)
     validation = validate_evidence_artifact(changed)
     assert not validation.valid
@@ -1396,3 +1434,39 @@ def test_cli_rejects_injected_noncanonical_schedule_before_build(
     )
     assert code == 2
     assert not output.exists()
+
+
+def test_bool_punned_phase_index_fails_even_when_rehashed(
+    accepted_artifact: dict[str, object],
+):
+    """``True == 1`` must not let a boolean stand in for phase index 1."""
+    changed = copy.deepcopy(accepted_artifact)
+    phase = changed["scientific_payload"]["seed_records"][0]["conditions"][CONDITION_PRIMARY][
+        "phase_windows"
+    ][1]
+    assert phase["phase_index"] == 1
+    phase["phase_index"] = True
+    _rehash(changed)
+    validation = validate_evidence_artifact(changed)
+    assert not validation.valid
+    assert not validation.accepted
+    assert any("phase_windows[1].phase_index" in error for error in validation.errors)
+
+
+def test_overflowing_json_integer_is_invalid_not_a_crash(
+    accepted_artifact: dict[str, object],
+    tmp_path: Path,
+):
+    """A JSON integer beyond float range must fail closed, not raise OverflowError."""
+    changed = copy.deepcopy(accepted_artifact)
+    phase = changed["scientific_payload"]["seed_records"][0]["conditions"][CONDITION_PRIMARY][
+        "phase_windows"
+    ][1]
+    phase["tail_squared_error_sum"] = 10**400
+    _rehash(changed)
+    validation = validate_evidence_artifact(changed)
+    assert not validation.valid
+    assert not validation.accepted
+    path = tmp_path / "overflow.json"
+    path.write_text(artifact_json(changed), encoding="utf-8")
+    assert scale_robust_feature_cli.main(["--verify", str(path)]) == 2

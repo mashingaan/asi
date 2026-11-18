@@ -60,20 +60,9 @@ from alberta_framework.core.types import TimeStep
 from alberta_framework.streams.base import ScanStream  # noqa: F401  (re-exported)
 
 _INT32_MAX = 2**31 - 1
+_FLOAT32_MAX = np.finfo(np.float32).max
 _ACTUAL_INT_TYPES: frozenset[type] = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
+    {int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")}
 )
 _ACTUAL_FLOAT_TYPES: frozenset[type] = frozenset(
     {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
@@ -224,6 +213,26 @@ def _require_state_array(
     return array
 
 
+def _require_typed_threefry_key(value: object, *, name: str) -> Array:
+    """Require one typed scalar Threefry key without accepting legacy words."""
+    try:
+        key = jnp.asarray(value)
+        implementation = str(jr.key_impl(value))  # type: ignore[arg-type]
+        words = jr.key_data(value)  # type: ignore[arg-type]
+    except Exception as error:
+        raise TypeError(
+            f"{name} must be a typed scalar threefry2x32 key"
+        ) from error
+    if (
+        key.shape != ()
+        or implementation != "threefry2x32"
+        or words.shape != (2,)
+        or words.dtype != jnp.uint32
+    ):
+        raise TypeError(f"{name} must be a typed scalar threefry2x32 key")
+    return key
+
+
 def _require_builtin_int(
     value: object,
     *,
@@ -370,7 +379,8 @@ class ClassicalConditioningStream:
         iti_max: Maximum ITI (steps, inclusive).
         noise_std: Std of Gaussian observation noise, canonicalized to
             float32. Positive values below the float32 subnormal range
-            become exact zero.
+            become exact zero. Draws whose noisy observation exceeds the
+            float32 range saturate to its signed finite limit.
         distractor_prob: Per-step probability that an idle distractor
             fires.
         phases: Tuple of ``PavlovianPhase``.
@@ -573,9 +583,7 @@ class ClassicalConditioningStream:
         """Validate static state structure before indexed JAX operations."""
         if type(state) is not PavlovianState:
             raise TypeError("state must be an actual PavlovianState")
-        key = jnp.asarray(state.key)
-        if key.shape != () or not jnp.issubdtype(key.dtype, jax.dtypes.prng_key):
-            raise TypeError("state.key must be a scalar PRNG key")
+        _require_typed_threefry_key(state.key, name="state.key")
         for name, value, shape in (
             (
                 "cs_active_steps_remaining",
@@ -625,11 +633,7 @@ class ClassicalConditioningStream:
         Returns:
             Initial ``PavlovianState``.
         """
-        key_array = jnp.asarray(key)
-        if key_array.shape != () or not jnp.issubdtype(
-            key_array.dtype, jax.dtypes.prng_key
-        ):
-            raise TypeError("key must be a scalar PRNG key")
+        key_array = _require_typed_threefry_key(key, name="key")
         key, k_iti = jr.split(key_array)
         iti = jr.randint(k_iti, (), self._iti_min, self._iti_max + 1)
         return PavlovianState(
@@ -714,7 +718,12 @@ class ClassicalConditioningStream:
         # ------------------------------------------------------------------
         # 2. Decide whether a new trial starts this step
         # ------------------------------------------------------------------
-        any_cs_active = jnp.any(cs_pre > 0)
+        # Decay current CS active counters (don't go below zero). A counter
+        # of 1 marks the CS's last "on" step, already emitted; the CS is off
+        # this step, so activity is judged on the decayed counter, the same
+        # value the observation reports.
+        decayed_cs = jnp.maximum(cs_pre - 1, 0)
+        any_cs_active = jnp.any(decayed_cs > 0)
         us_in_flight = us_pending_pre >= 0
         idle = (~any_cs_active) & (~us_in_flight)
         iti_done = iti_pre <= 0
@@ -751,9 +760,6 @@ class ClassicalConditioningStream:
         # ------------------------------------------------------------------
         # 5. Update CS / US / ITI counters
         # ------------------------------------------------------------------
-        # Decay current CS active counters (don't go below zero).
-        decayed_cs = jnp.maximum(cs_pre - 1, 0)
-
         # On trial start, replace any (zero) decayed counters with full
         # activation. We assume a new trial can only start when no CS is
         # active, so no overwrite of an active counter occurs.
@@ -817,7 +823,11 @@ class ClassicalConditioningStream:
         noise = self._noise_std * jr.normal(
             k_noise, (self.feature_dim,), dtype=jnp.float32
         )
-        observation = (clean_obs + noise).astype(jnp.float32)
+        observation = jnp.clip(
+            (clean_obs + noise).astype(jnp.float32),
+            -_FLOAT32_MAX,
+            _FLOAT32_MAX,
+        )
 
         target = jnp.where(us_fires, jnp.float32(1.0), jnp.float32(0.0))
 

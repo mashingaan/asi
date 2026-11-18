@@ -936,6 +936,19 @@ def test_update_requires_start_and_valid_transition_scalars() -> None:
         )
 
 
+def test_start_rejects_finite_observation_that_overflows_running_state() -> None:
+    """Do not dispatch an action after the retained Welford state overflows."""
+    agent = RecurrentTraceActorCriticAgent(_small_config())
+    state = agent.init(feature_dim=2, key=jr.key(0))
+    observation = jnp.full((2,), jnp.finfo(jnp.float32).max)
+
+    with pytest.raises(
+        jax.errors.JaxRuntimeError,
+        match="observation normalization produced non-finite state",
+    ):
+        agent.start(state, observation)
+
+
 def test_jitted_public_update_enforces_dynamic_lifecycle_and_discount_checks() -> None:
     """The complete public boundary must retain its checks under an outer JIT."""
     agent = RecurrentTraceActorCriticAgent(_small_config())
@@ -1161,7 +1174,9 @@ def test_counters_and_welford_moments_saturate_without_wrap_eager_or_jit() -> No
         _assert_tree_finite(result)
 
 
-def test_action_sampling_uses_tempered_logits_directly() -> None:
+def test_action_sampling_uses_high_dynamic_range_tempered_logits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = _small_config(temperature=0.37)
     agent = RecurrentTraceActorCriticAgent(config)
     state = agent.init(feature_dim=2, key=jr.key(33))
@@ -1176,13 +1191,28 @@ def test_action_sampling_uses_tempered_logits_directly() -> None:
     )
     sampling_key = jr.key(34)
     state = state.replace(actor_params=actor_params, rng_key=sampling_key)
-    action, next_key, probabilities = agent.select_action(state)
+    original_categorical = jr.categorical
+    observed_modes: list[object] = []
+
+    def recording_categorical(
+        key: jax.Array,
+        sampling_logits: jax.Array,
+        **kwargs: object,
+    ) -> jax.Array:
+        observed_modes.append(kwargs.get("mode"))
+        return original_categorical(key, sampling_logits, **kwargs)
+
+    monkeypatch.setattr(jr, "categorical", recording_categorical)
+    with jax.disable_jit():
+        action, next_key, probabilities = agent.select_action(state)
     expected_key, sample_key = jr.split(sampling_key)
-    expected_action = jr.categorical(
+    expected_action = original_categorical(
         sample_key,
         logits / config.temperature,
+        mode="high",
     ).astype(jnp.int32)
 
+    assert observed_modes == ["high"]
     assert jnp.array_equal(action, expected_action)
     assert jnp.array_equal(jr.key_data(next_key), jr.key_data(expected_key))
     assert jnp.allclose(
@@ -2078,6 +2108,83 @@ def test_config_rejects_hostile_numeric_and_serialized_container_hooks() -> None
         RecurrentTraceActorCriticConfig.from_config({**payload, "unknown": 1})
 
 
+@pytest.mark.parametrize(
+    "field_name",
+    sorted(set(_small_config().to_config()) - {"rtrl_taylor_correction"}),
+)
+def test_from_config_rejects_missing_serialized_field(field_name: str) -> None:
+    payload = _small_config().to_config()
+    del payload[field_name]
+    with pytest.raises(ValueError, match=f"missing fields: {field_name}"):
+        RecurrentTraceActorCriticConfig.from_config(payload)
+    with pytest.raises(ValueError, match=f"missing fields: {field_name}"):
+        RecurrentTraceActorCriticAgent.from_config({"config": payload})
+
+
+def test_from_config_keeps_omitted_defaults_and_pre_taylor_payloads() -> None:
+    payload = _small_config().to_config()
+    assert not {"adaptive_obgd", "beta2", "epsilon"} & set(payload)
+    del payload["rtrl_taylor_correction"]
+    assert RecurrentTraceActorCriticConfig.from_config(payload) == _small_config()
+
+
+def test_update_decays_traces_with_previous_discount() -> None:
+    """Eligibility traces decay with the incoming discount gamma_t.
+
+    The current call's discount is gamma_{t+1} (the TD bootstrap discount);
+    the traces accumulated so far belong to the transition into the current
+    state and must decay with the prior accepted transition's discount.
+    A probe update from a zeroed-trace copy isolates the gradient term, so
+    the carried traces must satisfy ``new = d1 * lam * old + probe`` exactly.
+    """
+    d1, d2 = 0.9, 0.1
+    config = _small_config(actor_lamda=1.0, critic_lamda=1.0, gamma=d1)
+    agent = RecurrentTraceActorCriticAgent(config)
+    state = agent.init(2, jr.key(7))
+    state, _, _ = agent.start(
+        state,
+        jnp.asarray((0.4, -0.2), dtype=jnp.float32),
+    )
+    observation = jnp.asarray((-0.1, 0.6), dtype=jnp.float32)
+    reward = jnp.asarray(0.3, dtype=jnp.float32)
+    first = agent.update(
+        state,
+        reward,
+        observation,
+        discount=jnp.asarray(d1, dtype=jnp.float32),
+    )
+    assert bool(first.update_applied)
+    state1 = first.state
+    zeroed = state1.replace(
+        actor_traces=jax.tree.map(jnp.zeros_like, state1.actor_traces),
+        critic_traces=jax.tree.map(jnp.zeros_like, state1.critic_traces),
+    )
+    second = agent.update(
+        state1,
+        reward,
+        observation,
+        discount=jnp.asarray(d2, dtype=jnp.float32),
+    )
+    probe = agent.update(
+        zeroed,
+        reward,
+        observation,
+        discount=jnp.asarray(d2, dtype=jnp.float32),
+    )
+    assert bool(second.update_applied)
+    assert bool(probe.update_applied)
+    for carried, decayed, gradient in (
+        (state1.actor_traces, second.state.actor_traces, probe.state.actor_traces),
+        (state1.critic_traces, second.state.critic_traces, probe.state.critic_traces),
+    ):
+        expected = jax.tree.map(
+            lambda old, grad: d1 * old + grad,
+            carried,
+            gradient,
+        )
+        _assert_tree_all_close(decayed, expected)
+
+
 def test_state_resource_budget_is_exact_and_init_preflights_before_rng(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2086,9 +2193,9 @@ def test_state_resource_budget_is_exact_and_init_preflights_before_rng(
     assert budget == {
         "parameter_scalars": 124,
         "sensitivity_scalars_per_network": 36,
-        "float32_state_scalars": 343,
-        "state_scalars": 349,
-        "state_nbytes": 1397,
+        "float32_state_scalars": 344,
+        "state_scalars": 350,
+        "state_nbytes": 1401,
     }
     state = RecurrentTraceActorCriticAgent(config).init(2, jr.key(2))
     leaves = jax.tree.leaves(state)
@@ -2101,6 +2208,20 @@ def test_state_resource_budget_is_exact_and_init_preflights_before_rng(
     monkeypatch.setattr(recurrent_trace_module.jr, "split", forbidden_split)
     with pytest.raises(ValueError, match="derived"):
         RecurrentTraceActorCriticAgent(config).init(2**31 - 1, jr.key(0))
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        jr.key(3, impl="rbg"),
+        jr.key_data(jr.key(3, impl="threefry2x32")),
+    ],
+)
+def test_init_rejects_keys_outside_scalar_threefry_state_budget(key: Array) -> None:
+    agent = RecurrentTraceActorCriticAgent(_small_config())
+
+    with pytest.raises(ValueError, match="typed scalar threefry2x32 key"):
+        agent.init(2, key)
 
 
 def test_canonical_discrete_architecture_defaults_and_core_export() -> None:
@@ -2200,6 +2321,53 @@ def test_reference_dense_rtu_and_live_sparse_feedforward_initialization() -> Non
     normalized = parameterless_layer_norm(inputs, epsilon=1e-8)
     assert jnp.allclose(jnp.mean(normalized), 0.0, atol=1e-6)
     assert jnp.allclose(jnp.mean(jnp.square(normalized)), 1.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("magnitude", [7e37, 1e38, 3e38])
+def test_parameterless_layer_norm_preserves_large_finite_contrast(
+    magnitude: float,
+) -> None:
+    inputs = jnp.asarray(
+        (magnitude,) * 4 + (-magnitude,) * 4,
+        dtype=jnp.float32,
+    )
+
+    normalized = parameterless_layer_norm(inputs, epsilon=1e-8)
+    compiled = jax.jit(parameterless_layer_norm)(inputs, epsilon=1e-8)
+
+    assert bool(jnp.all(jnp.isfinite(normalized)))
+    expected = jnp.asarray((1.0,) * 4 + (-1.0,) * 4, dtype=jnp.float32)
+    np.testing.assert_allclose(normalized, expected, rtol=1e-6)
+    np.testing.assert_allclose(compiled, expected, rtol=1e-6)
+
+
+@pytest.mark.parametrize("epsilon", [1e-5, 1e-8])
+@pytest.mark.parametrize("scale", [1e-22, 1e-25])
+def test_parameterless_layer_norm_preserves_tiny_finite_gradients(
+    epsilon: float,
+    scale: float,
+) -> None:
+    inputs = jnp.asarray((-3.0, -1.0, 2.0, 4.0), dtype=jnp.float32) * scale
+    cotangent = jnp.asarray((0.5, -2.0, 1.5, 3.0), dtype=jnp.float32)
+
+    def weighted_norm(values: Array) -> Array:
+        return jnp.sum(cotangent * parameterless_layer_norm(values, epsilon))
+
+    def direct_weighted_norm(values: Array) -> Array:
+        centered = values - jnp.mean(values, keepdims=True)
+        variance = jnp.mean(jnp.square(centered), keepdims=True)
+        normalized = centered * jax.lax.rsqrt(
+            variance + jnp.asarray(epsilon, values.dtype)
+        )
+        return jnp.sum(cotangent * normalized)
+
+    gradient = jax.grad(weighted_norm)(inputs)
+    compiled_gradient = jax.jit(jax.grad(weighted_norm))(inputs)
+    expected_gradient = jax.grad(direct_weighted_norm)(inputs)
+
+    assert bool(jnp.all(jnp.isfinite(gradient)))
+    np.testing.assert_array_equal(gradient, expected_gradient)
+    np.testing.assert_array_equal(compiled_gradient, expected_gradient)
 
 
 def test_initialized_radii_respect_small_configured_interval() -> None:
@@ -2446,3 +2614,32 @@ def test_state_resource_budget_matches_optional_state_trees(
     budget = config.state_resource_budget(7)
     assert budget["state_scalars"] == sum(int(leaf.size) for leaf in leaves)
     assert budget["state_nbytes"] == sum(int(leaf.nbytes) for leaf in leaves)
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("alpha,kappa,signal", [(1e30, 1e10, 1.0), (1e20, 1e20, -1e10)])
+def test_obgd_finite_bound_overflow_retains_step(
+    compiled: bool, alpha: float, kappa: float, signal: float
+) -> None:
+    config = _small_config(actor_alpha=alpha, actor_kappa=kappa)
+    traces = {"weight": jnp.ones(1, dtype=jnp.float32)}
+    update = jax.jit(obgd_update, static_argnames=("alpha", "kappa")) if compiled else obgd_update
+    result = update(
+        traces, jnp.asarray(signal, dtype=jnp.float32),
+        alpha=config.actor_alpha, kappa=config.actor_kappa,
+    )
+    expected_step = 1.0 / float(np.float32(kappa)) / max(abs(signal), 1.0)
+    assert bool(result.update_applied)
+    np.testing.assert_allclose(result.step_size, expected_step, rtol=3e-6, atol=0.0)
+    np.testing.assert_allclose(
+        result.updates["weight"], [expected_step * signal], rtol=3e-6, atol=0.0
+    )
+
+
+@pytest.mark.parametrize("alpha,kappa", [(0.0, 2.0), (0.5, 0.0)])
+def test_obgd_zero_factors_keep_unbounded_rule(alpha: float, kappa: float) -> None:
+    traces = {"weight": jnp.asarray([2.0], dtype=jnp.float32)}
+    result = obgd_update(traces, jnp.asarray(3.0), alpha=alpha, kappa=kappa)
+    assert bool(result.update_applied)
+    assert float(result.scale) == 1.0
+    assert float(result.step_size) == alpha
+    np.testing.assert_array_equal(result.updates["weight"], [alpha * 6.0])

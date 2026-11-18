@@ -287,6 +287,13 @@ def _positive_jax_float32(value: int | float) -> bool:
     return bool(np.isfinite(converted) and converted > 0.0)
 
 
+def _below_one_jax_float32(value: int | float) -> bool:
+    """Return whether an open ``[0, 1)`` bound still holds after float32 rounding."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        converted = np.float32(value)
+    return bool(converted < np.float32(1.0))
+
+
 def _validated_action(value: Any) -> int:
     """Validate a scalar integer action before any host-side conversion."""
     array = np.asarray(value)
@@ -623,6 +630,7 @@ class ForagerFeatureConfig:
             or not _finite_jax_float32(decay)
             or decay < 0.0
             or decay >= 1.0
+            or not _below_one_jax_float32(decay)
             for decay in self.reward_trace_decays
         ):
             raise ValueError("reward_trace_decays must lie in [0, 1)")
@@ -977,6 +985,7 @@ class AlbertaForagerConfig:
             or not math.isfinite(self.actor_epsilon)
             or not _finite_jax_float32(self.actor_epsilon)
             or not 0.0 <= self.actor_epsilon < 1.0
+            or not _below_one_jax_float32(self.actor_epsilon)
         ):
             raise ValueError("actor_epsilon must be finite and lie in [0, 1)")
         positive_finite = {
@@ -1009,6 +1018,7 @@ class AlbertaForagerConfig:
                 or not math.isfinite(self.td_error_normalizer_decay)
                 or not _finite_jax_float32(self.td_error_normalizer_decay)
                 or not 0.0 <= self.td_error_normalizer_decay < 1.0
+                or not _below_one_jax_float32(self.td_error_normalizer_decay)
             )
         ):
             raise ValueError("td_error_normalizer_decay must be finite and lie in [0, 1)")
@@ -1045,6 +1055,7 @@ class AlbertaForagerConfig:
             or not math.isfinite(self.recurrent_scale)
             or not _finite_jax_float32(self.recurrent_scale)
             or not 0.0 <= self.recurrent_scale < 1.0
+            or not _below_one_jax_float32(self.recurrent_scale)
         ):
             raise ValueError("recurrent_scale must be finite and lie in [0, 1)")
         if (
@@ -3987,39 +3998,23 @@ def summarize_forager_runs(
     def method_signature(run: ForagerRunResult) -> str:
         metadata = run.agent_metadata
         stable_metadata = {
-            "config": metadata.get("config"),
-            "result_source": metadata.get("result_source"),
-            "source_repository": metadata.get("source_repository"),
-            "source_commit": metadata.get("source_commit"),
-            "config_path": metadata.get("config_path"),
-            "attestation_state": metadata.get("attestation_state"),
-            "official_foragax_evidence": metadata.get(
-                "official_foragax_evidence"
-            ),
-            "protocol_attested": metadata.get("protocol_attested"),
-            "runtime_profile_id": metadata.get("runtime_profile_id"),
-            "environment_runtime_profile_sha256": metadata.get(
-                "environment_runtime_profile_sha256"
-            ),
-            "environment_rng_schedule": metadata.get(
-                "environment_rng_schedule"
-            ),
-            "environment_rng_schedule_sha256": metadata.get(
-                "environment_rng_schedule_sha256"
-            ),
-            "paper_search_oracle": metadata.get("paper_search_oracle"),
-            "random_backend": metadata.get("random_backend"),
-            "runner_kind": (
+            key: value
+            for key, value in metadata.items()
+            if key
+            not in {"seed", "name", "privileged", "runner", "raw_metric_trace"}
+        }
+        stable_metadata["runner"] = {
+            "kind": (
                 metadata.get("runner", {}).get("kind")
                 if isinstance(metadata.get("runner"), Mapping)
                 else None
             ),
-            "runner_batch_mode": (
+            "batch_mode": (
                 metadata.get("runner", {}).get("batch_mode")
                 if isinstance(metadata.get("runner"), Mapping)
                 else None
             ),
-            "runner_rounding_contract": (
+            "rounding_contract": (
                 metadata.get("runner", {}).get("rounding_contract")
                 if isinstance(metadata.get("runner"), Mapping)
                 else None

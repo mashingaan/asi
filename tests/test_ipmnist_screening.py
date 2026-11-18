@@ -28,6 +28,8 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     PROXY_N_TASKS,
     SCREENING_REGISTRY,
     SHARD_SCHEMA,
+    SHARD_SCHEMA_V3,
+    SUMMARY_SCHEMA_V3,
     AdamCBPState,
     CBPState,
     EMANormState,
@@ -52,6 +54,7 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _make_rff_rls_learner,
     _make_sgd_ema_norm_learner,
     _make_sgd_momentum_gate_learner,
+    _make_shiftnorm_gated_l2init_learner,
     _make_sigma0_gated_l2init_learner,
     _make_snr_ema_norm_learner,
     _make_upgd_alpha_utility_learner,
@@ -107,6 +110,88 @@ from alberta_framework.core.normalizers import EMANormalizer
 SMALL = IPMNISTConfig(
     n_tasks=3, task_length=30, input_dim=12, hidden1=8, hidden2=6, n_classes=5
 )
+
+
+def test_zero_utility_decay_does_not_multiply_inf_utility() -> None:
+    """utility_decay=0 times poisoned utility EMA is 0*inf = NaN without a skip."""
+    params = {
+        "w": jnp.asarray([[1.0, -0.5], [0.25, 0.5]], dtype=jnp.float32),
+        "b": jnp.asarray([0.1, -0.2], dtype=jnp.float32),
+    }
+    poisoned = {name: jnp.full_like(value, jnp.inf) for name, value in params.items()}
+    grads = {name: jnp.ones_like(value) for name, value in params.items()}
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+
+    new_utility, gate = _upgd_utility_and_gate(
+        params,
+        grads,
+        poisoned,
+        jnp.asarray(3, dtype=jnp.int32),
+        0.0,
+    )
+    for name in params:
+        assert bool(jnp.all(jnp.isfinite(new_utility[name])))
+        assert bool(jnp.all(jnp.isfinite(gate[name])))
+        np.testing.assert_allclose(
+            np.asarray(new_utility[name]),
+            np.asarray(-grads[name] * params[name]),
+            atol=1e-6,
+        )
+
+def test_zero_lion_beta_does_not_multiply_inf_momentum() -> None:
+    """lion_beta1/beta2=0 times poisoned momentum is 0*inf = NaN without a skip."""
+    from alberta_framework.benchmarks.ipmnist_screening import (
+        LionGateState,
+        _init_input_norm_state,
+    )
+
+    params = init_mlp_params(jr.key(0), SMALL)
+    hp = dict(screening_spec("lion_gate").hyperparameters)
+    hp["lion_beta1"] = 0.0
+    hp["lion_beta2"] = 0.0
+    _, step_fn = _make_lion_gate_learner(hp)
+    state = LionGateState(  # type: ignore[call-arg]
+        utility={name: jnp.zeros_like(value) for name, value in params.items()},
+        step=jnp.asarray(2, dtype=jnp.int32),
+        momentum={name: jnp.full_like(value, jnp.inf) for name, value in params.items()},
+        norm=_init_input_norm_state(params),
+    )
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+    x = jr.normal(jr.key(1), (SMALL.input_dim,))
+    y = jnp.asarray(0, dtype=jnp.int32)
+    new_params, new_state, _ = step_fn(params, state, x, y, jr.key(2))
+    for name in params:
+        assert bool(jnp.all(jnp.isfinite(new_state.momentum[name])))
+        assert bool(jnp.all(jnp.isfinite(new_params[name])))
+
+
+def test_zero_rms_rho_does_not_multiply_inf_second_moment() -> None:
+    """rms_rho=0 times poisoned second-moment EMA is 0*inf = NaN without a skip."""
+    from alberta_framework.benchmarks.ipmnist_screening import (
+        NormRMSGateState,
+        _init_input_norm_state,
+    )
+
+    params = init_mlp_params(jr.key(0), SMALL)
+    hp = dict(screening_spec("norm_rmsprop_gate").hyperparameters)
+    hp["rms_rho"] = 0.0
+    _, step_fn = _make_norm_rmsprop_gate_learner(hp)
+    state = NormRMSGateState(  # type: ignore[call-arg]
+        utility={name: jnp.zeros_like(value) for name, value in params.items()},
+        step=jnp.asarray(2, dtype=jnp.int32),
+        v={name: jnp.full_like(value, jnp.inf) for name, value in params.items()},
+        norm=_init_input_norm_state(params),
+    )
+    raw = jnp.asarray(0.0, dtype=jnp.float32) * jnp.asarray(jnp.inf, dtype=jnp.float32)
+    assert not bool(jnp.isfinite(raw))
+    x = jr.normal(jr.key(1), (SMALL.input_dim,))
+    y = jnp.asarray(0, dtype=jnp.int32)
+    new_params, new_state, _ = step_fn(params, state, x, y, jr.key(2))
+    for name in params:
+        assert bool(jnp.all(jnp.isfinite(new_state.v[name])))
+        assert bool(jnp.all(jnp.isfinite(new_params[name])))
 
 
 def _test_source_provenance(
@@ -484,6 +569,29 @@ class TestIDBDCombo:
 
         np.testing.assert_array_equal(guarded.log_alpha["w1"], state.log_alpha["w1"])
         assert bool(jnp.all(jnp.isfinite(guarded.log_alpha["w1"])))
+
+    def test_utility_clock_saturates_at_int32_max(self) -> None:
+        """UPGD bias clocks must not wrap; modulo event schedules stay plain +1."""
+        int32_max = np.iinfo(np.int32).max
+        wrapped = jnp.array(int32_max, dtype=jnp.int32) + jnp.array(1, dtype=jnp.int32)
+        assert int(wrapped) == -int32_max - 1
+
+        params = init_mlp_params(jr.key(0), SMALL)
+        hp = dict(UPGD_W_PROTOCOL_HYPERPARAMETERS)
+        hp.update({"meta_step_size": 0.0, "initial_step_size": hp["step_size"]})
+        init_fn, _ = _make_upgd_idbd_learner(hp)
+        state = init_fn(params).replace(step=jnp.asarray(int32_max, dtype=jnp.int32))
+        grads = {name: 0.01 * jnp.ones_like(value) for name, value in params.items()}
+        noise = {name: jnp.zeros_like(value) for name, value in params.items()}
+        new_params, new_state = upgd_idbd_update(params, state, grads, noise, hp)
+        assert int(new_state.step) == int32_max
+        for name in params:
+            assert bool(jnp.all(jnp.isfinite(new_params[name])))
+            assert bool(jnp.all(jnp.isfinite(new_state.utility[name])))
+
+        source = Path("alberta_framework/benchmarks/ipmnist_screening.py").read_text()
+        assert "next_step = state.step + jnp.asarray(1, dtype=jnp.int32)" in source
+        assert "new_step = state.step + jnp.asarray(1, dtype=jnp.int32)" in source
 
 
 class TestAutostepCombo:
@@ -1090,6 +1198,58 @@ class TestSmokeRuns:
         assert np.all(result.per_task_plasticity <= 1.0)
 
 
+# The 44 arms outputs/ipmnist_screening/summary.json retains, pinned here so the
+# completeness check below cannot be redefined by editing the published summary.
+# shards/ also keeps explored arms that never entered the roster; only these arms
+# and their shards are required to be present and exact.
+RETAINED_CAMPAIGN_ROSTER: tuple[str, ...] = (
+    "sigma0_ndecay099",
+    "upgd_ema_norm",
+    "sigma0_gate_beta05",
+    "sigma0_eps1e6",
+    "sigma0_eps1e4",
+    "upgd_ema_norm_sigma0",
+    "sigma0_localgate",
+    "sigma0_gate_beta2",
+    "upgd_ema_norm_wd0005",
+    "sigma0_ndecay09999",
+    "upgd_ema_norm_lr0003",
+    "sgd_ema_norm",
+    "sigma0_hidden_norm",
+    "adamw_cbp_ema_norm",
+    "adamw_cbp_r3e4",
+    "adamw_cbp",
+    "adamw_cbp_m50",
+    "adamw_cbp_m200",
+    "adamw_cbp_noreset",
+    "adamw_cbp_r3e5",
+    "upgd_w_wd0005",
+    "upgd_l2init",
+    "upgd_idbd",
+    "upgd_w_control",
+    "upgd_alpha_utility",
+    "upgd_w_udecay099999",
+    "upgd_w_localgate",
+    "upgd_idbd_meta1e2",
+    "upgd_cbp",
+    "upgd_w_udecay0999",
+    "upgd_w_sigma005",
+    "upgd_ema_norm_lr003",
+    "guarded_cbp_adam",
+    "upgd_w_wclip_k2",
+    "upgd_w_wclip_k2_wd0",
+    "upgd_w_sigma02",
+    "upgd_w_wd002",
+    "upgd_w_fade_head",
+    "adamw_control",
+    "upgd_w_wclip_k1_wd0",
+    "upgd_w_sigma0",
+    "upgd_w_wclip_k1",
+    "upgd_autostep",
+    "upgd_w_idbd_swift",
+)
+
+
 class TestShardsAndMerge:
     def _make_shard(self, tmp_path, small_data, config_name, seed):
         x, y = small_data
@@ -1151,6 +1311,35 @@ class TestShardsAndMerge:
         path.write_text(json.dumps(payload), encoding="utf-8")
 
         with pytest.raises(ValueError, match=rf"config: missing field\(s\) \['{omitted}'\]"):
+            load_shard(path)
+
+    def test_load_shard_rejects_legacy_shard_without_a_config_object(
+        self, tmp_path
+    ) -> None:
+        """The legacy v1 path indexes the config before validating it. An
+        artifact missing that key must follow the loader's ValueError
+        contract instead of raising an uncaught KeyError."""
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        del payload["config"]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="config must be an object"):
+            load_shard(path)
+
+    @pytest.mark.parametrize("schema", [[], {}])
+    def test_load_shard_rejects_unhashable_schema_as_value_error(
+        self, tmp_path, schema
+    ) -> None:
+        """A JSON array or object is untrusted input; testing it against the
+        supported-schema set must not surface an uncaught TypeError from
+        hashing an unhashable value."""
+        path = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["schema"] = schema
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="not a supported"):
             load_shard(path)
 
     @pytest.mark.parametrize("location", ["top-level", "nested"])
@@ -1344,7 +1533,7 @@ class TestShardsAndMerge:
             load_shard(path)
 
         assert str(exc_info.value) == (
-            f"{path}: noise_mode must be 'step' or 'pool', got 'teleport'"
+            f"{path}: noise_mode must be 'step', 'pool', or 'gradual', got 'teleport'"
         )
 
     @pytest.mark.parametrize("noise_mode", [None, True, 0, [], {}])
@@ -1511,7 +1700,7 @@ class TestShardsAndMerge:
             (
                 "upgd_w_control",
                 "teleport",
-                "noise_mode must be 'step' or 'pool'",
+                "noise_mode must be 'step', 'pool', or 'gradual'",
             ),
             (
                 "upgd_idbd",
@@ -1845,6 +2034,101 @@ class TestShardsAndMerge:
         ):
             merge_shards([p0, p1, p2], control_name="upgd_w_control", slope_window=2)
 
+    def test_merge_rejects_registry_contradicting_base_learner(self, tmp_path):
+        """An arm that consistently misreports its learner must not rank.
+
+        The campaign's live format is v1, and ``load_shard`` cross-checks the
+        registered arm only for source-bound v2/v3 shards.  Every seed of a v1
+        arm can therefore agree on a learner its registry entry never
+        registered, and the merged summary publishes the recorded
+        ``base_learner`` as the arm's identity.
+        """
+        control = self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.5)
+        winner = self._write_inband_shard(tmp_path, "upgd_l2init", 0, 0.9)
+        payload = json.loads(winner.read_text(encoding="utf-8"))
+        payload["base_learner"] = "adamw"
+        winner.write_text(json.dumps(payload), encoding="utf-8")
+
+        with pytest.raises(ValueError, match=r"registered arm registers 'upgd_w'"):
+            merge_shards(
+                [control, winner], control_name="upgd_w_control", slope_window=2
+            )
+
+    def _write_inband_arm_with_hyperparameters(self, tmp_path, hyperparameters):
+        """Write a paired two-seed v1 batch whose winner records ``hyperparameters``."""
+        paths = [
+            self._write_inband_shard(tmp_path, "upgd_w_control", 0, 0.50),
+            self._write_inband_shard(tmp_path, "upgd_w_control", 1, 0.50),
+        ]
+        for seed in (0, 1):
+            winner = self._write_inband_shard(tmp_path, "upgd_l2init", seed, 0.56)
+            payload = json.loads(winner.read_text(encoding="utf-8"))
+            payload["hyperparameters"] = dict(hyperparameters)
+            winner.write_text(json.dumps(payload), encoding="utf-8")
+            paths.append(winner)
+        return paths
+
+    def test_merge_rejects_registry_contradicting_hyperparameters(self, tmp_path):
+        """An arm whose seeds agree on forged hyperparameters must not rank.
+
+        The campaign's live format is v1, and ``load_shard`` checks the
+        registered hyperparameters only for source-bound v2/v3 shards.  Every
+        seed of a v1 arm can therefore agree on values its registry entry never
+        registered; within-arm agreement is not registry agreement, and the
+        merged summary would publish the forged values as the arm's identity.
+        """
+        registered = SCREENING_REGISTRY["upgd_l2init"].hyperparameters
+        paths = self._write_inband_arm_with_hyperparameters(
+            tmp_path, {**registered, "step_size": 0.5, "noise_std": 0.5}
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"'upgd_l2init' seed 0 records hyperparameters "
+                r"\{'noise_std': 0\.5, 'step_size': 0\.5\}, but its registered arm "
+                r"registers \{'noise_std': 0\.1, 'step_size': 0\.01\}; refusing to "
+                r"publish an arm identity the registry does not support"
+            ),
+        ):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_rejects_unregistered_hyperparameter_key(self, tmp_path):
+        registered = SCREENING_REGISTRY["upgd_l2init"].hyperparameters
+        assert "forged_gain" not in registered
+        paths = self._write_inband_arm_with_hyperparameters(
+            tmp_path, {**registered, "forged_gain": 1.0}
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                r"'upgd_l2init' seed 0 records hyperparameter\(s\) \['forged_gain'\], "
+                r"but its registered arm registers only .*; refusing to publish an "
+                r"arm identity the registry does not support"
+            ),
+        ):
+            merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+
+    def test_merge_accepts_registered_hyperparameter_subset(self, tmp_path):
+        """Retained v1 shards may record a strict subset of the registered keys.
+
+        The registry later gained inert keys, so an exact-set rule would reject
+        retained shards whose recorded values all match the registry exactly.
+        """
+        registered = SCREENING_REGISTRY["upgd_l2init"].hyperparameters
+        subset = {
+            name: value for name, value in registered.items() if name != "noise_std"
+        }
+        assert set(subset) < set(registered)
+        paths = self._write_inband_arm_with_hyperparameters(tmp_path, subset)
+
+        summary = merge_shards(paths, control_name="upgd_w_control", slope_window=2)
+        result = next(
+            entry for entry in summary["results"] if entry["config_name"] == "upgd_l2init"
+        )
+        assert result["hyperparameters"] == subset
+
     def test_merge_rejects_environment_drift_and_records_environment(
         self, tmp_path, small_data
     ):
@@ -2058,6 +2342,56 @@ class TestShardsAndMerge:
         with pytest.raises(ValueError, match="hyperparameters must exactly match"):
             validate_proxy([upgd, changed_path], tmp_path)
 
+    def test_current_stored_summary_reconstructs_from_retained_shards(self) -> None:
+        """The stored campaign summary must re-derive from the shards on disk.
+
+        ``summary.json`` is the published measurement record, and the champion
+        number quoted across the retained reports comes from it.  Its siblings
+        are pinned the same way (``frontier_results.json`` and the ceiling
+        summary), but the record itself was not: a drifted artifact or a
+        changed merge could pass unnoticed.  The retained roster is pinned in
+        this file, not read from the summary, so a coherently edited summary
+        (a dropped row plus a matching shard count) fails the completeness
+        check instead of redefining it.  Only the run stamp and the keys added
+        after this payload was written may differ.
+        """
+        campaign = Path(__file__).resolve().parents[1] / "outputs" / "ipmnist_screening"
+        expected = json.loads((campaign / "summary.json").read_text(encoding="utf-8"))
+        retained = set(RETAINED_CAMPAIGN_ROSTER)
+        paths = []
+        shard_configs = []
+        for path in sorted((campaign / "shards").glob("*.json")):
+            shard = json.loads(path.read_text(encoding="utf-8"))
+            config_name = shard.get("config_name")
+            assert isinstance(config_name, str), f"shard {path.name} has no config_name"
+            if config_name in retained:
+                paths.append(path)
+                shard_configs.append(config_name)
+        # The directory also keeps shards of explored arms that never entered
+        # the roster; only the retained roster must be complete and exact here.
+        assert len(paths) == expected["n_shards"]
+        assert set(shard_configs) == retained
+
+        actual = merge_shards(
+            paths,
+            control_name=expected["control_name"],
+            slope_window=expected["slope_window"],
+        )
+
+        # Current code writes these two keys; the retained v1 payload predates
+        # them.  Assert the exact difference, so that a further new key has to
+        # be a deliberate decision here instead of a silent exemption.
+        assert set(actual) - set(expected) == {"environment", "noise_pool_steps"}
+        assert set(expected) - set(actual) == set()
+
+        actual.pop("environment")
+        actual.pop("noise_pool_steps")
+        # created_unix records when the campaign ran, not what it measured.
+        actual.pop("created_unix")
+        expected.pop("created_unix")
+
+        assert actual == expected
+
 
 class TestPoolConfirmation:
     """Screening-only pool-noise mode for full-protocol confirmation runs."""
@@ -2173,6 +2507,313 @@ class TestPoolConfirmation:
         )
         path = tmp_path / "pool.json"
         path.write_text(json.dumps(_bound_shard_payload(pool)), encoding="utf-8")
+        with pytest.raises(ValueError, match="noise_mode"):
+            validate_proxy([path], tmp_path)
+
+
+class TestGradualConfirmation:
+    """Screening-only deterministic gradual-change protocol (#1569).
+
+    ``noise_mode="gradual"`` deterministically ramps the input mapping from
+    the previous task's permutation to the current one across the first
+    ``noise_gradual_steps`` steps of each task. It draws no additional RNG
+    keys, records its window in a v3 shard schema, and never merges with
+    exact step-mode shards.
+    """
+
+    def test_gradual_window_one_collapses_to_step_bitwise(self, small_data):
+        """Mechanism-off reduction: window 1 is the exact abrupt protocol."""
+        x, y = small_data
+        step = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=7, config=SMALL
+        )
+        gradual = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=7, config=SMALL,
+            noise_mode="gradual", noise_gradual_steps=1,
+        )
+        assert gradual.noise_mode == "gradual"
+        assert gradual.noise_gradual_steps == 1
+        np.testing.assert_array_equal(gradual.per_task_accuracy, step.per_task_accuracy)
+        np.testing.assert_array_equal(gradual.per_task_loss, step.per_task_loss)
+        np.testing.assert_array_equal(
+            gradual.per_task_plasticity, step.per_task_plasticity
+        )
+
+    def test_gradual_is_deterministic_and_differs_from_step(self, small_data):
+        x, y = small_data
+        first = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=7, config=SMALL,
+            noise_mode="gradual", noise_gradual_steps=8,
+        )
+        second = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=7, config=SMALL,
+            noise_mode="gradual", noise_gradual_steps=8,
+        )
+        np.testing.assert_array_equal(first.per_task_loss, second.per_task_loss)
+        np.testing.assert_array_equal(first.per_task_accuracy, second.per_task_accuracy)
+        step = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=7, config=SMALL
+        )
+        assert not np.array_equal(first.per_task_loss, step.per_task_loss)
+
+    @pytest.mark.parametrize(
+        "noise_gradual_steps", [None, True, False, np.int64(8), 8.0, "8", 0, -1]
+    )
+    def test_gradual_rejects_noncanonical_window_before_data_setup(
+        self, noise_gradual_steps: object
+    ) -> None:
+        with pytest.raises(ValueError, match="noise_gradual_steps.*built-in integer >= 1"):
+            run_screening_config(
+                np.empty((1, 1), dtype=np.float32),
+                np.empty((1,), dtype=np.int32),
+                screening_spec("upgd_w_control"),
+                seed=0,
+                config=SMALL,
+                noise_mode="gradual",
+                noise_gradual_steps=noise_gradual_steps,  # type: ignore[arg-type]
+            )
+
+    def test_gradual_ramp_values_are_pinned(self):
+        """The per-task ramp is exactly (i + 1) / window capped at 1.0.
+
+        This pins the transition inputs independently of any trajectory
+        outcome: the alpha sequence, its length, its float32 dtype, the
+        exact 1.0 boundary, and the window-1 mechanism-off reduction.
+        Entries at or past the cap are exactly 1.0 (the minimum guarantees
+        it regardless of backend), and a power-of-two window divides
+        exactly, so those pins are bitwise; a non-power-of-two window may
+        pick up one float32 ulp from XLA's reciprocal-multiply lowering,
+        so its pin is tolerance-based.
+        """
+        ramp = ipmnist_screening._gradual_ramp(SMALL.task_length, 8)
+        assert isinstance(ramp, jax.Array)
+        assert ramp.dtype == jnp.float32
+        assert ramp.shape == (SMALL.task_length,)
+        expected = np.minimum(
+            (np.arange(SMALL.task_length, dtype=np.float64) + 1.0) / 8.0, 1.0
+        )
+        np.testing.assert_array_equal(np.asarray(ramp, dtype=np.float64), expected)
+        # The transition completes exactly on step `window` ...
+        assert float(ramp[7]) == 1.0
+        assert float(ramp[6]) == 7.0 / 8.0
+        # ... every entry from `window` on holds the pure current mapping ...
+        assert np.all(np.asarray(ramp[8:]) == np.float32(1.0))
+        # ... and window 1 stays the exact mechanism-off reduction.
+        one = ipmnist_screening._gradual_ramp(SMALL.task_length, 1)
+        np.testing.assert_array_equal(np.asarray(one), np.ones(SMALL.task_length))
+        # A window equal to the task length still reaches exactly 1.0 on
+        # its final step; one step earlier the alpha is 29/30 up to one
+        # float32 ulp (XLA lowers the division as a reciprocal multiply).
+        full = ipmnist_screening._gradual_ramp(SMALL.task_length, SMALL.task_length)
+        assert float(full[-1]) == 1.0
+        assert full.shape == (SMALL.task_length,)
+        np.testing.assert_allclose(
+            np.asarray(full, dtype=np.float64),
+            (np.arange(SMALL.task_length, dtype=np.float64) + 1.0) / 30.0,
+            rtol=2e-7,
+            atol=0.0,
+        )
+
+    def test_gradual_window_may_equal_but_not_exceed_task_length(self, small_data):
+        """Window == task_length completes the transition; +1 never does.
+
+        The ramp has exactly task_length entries, so a longer window would
+        end the task below alpha 1.0 and the next task would restart the
+        interpolation from the pure previous permutation — a cross-task
+        discontinuity. It is rejected before any data is touched.
+        """
+        x, y = small_data
+        full = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=3, config=SMALL,
+            noise_mode="gradual", noise_gradual_steps=SMALL.task_length,
+        )
+        assert full.noise_gradual_steps == SMALL.task_length
+        with pytest.raises(ValueError, match="noise_gradual_steps.*task_length"):
+            run_screening_config(
+                x, y, screening_spec("upgd_w_control"), seed=3, config=SMALL,
+                noise_mode="gradual", noise_gradual_steps=SMALL.task_length + 1,
+            )
+
+    def test_gradual_window_above_task_length_rejected_before_data_setup(self):
+        with pytest.raises(ValueError, match="noise_gradual_steps.*task_length"):
+            run_screening_config(
+                np.empty((1, 1), dtype=np.float32),
+                np.empty((1,), dtype=np.int32),
+                screening_spec("upgd_w_control"),
+                seed=0,
+                config=SMALL,
+                noise_mode="gradual",
+                noise_gradual_steps=SMALL.task_length + 1,
+            )
+
+    def test_gradual_result_rejects_window_above_task_length(self):
+        spec = screening_spec("upgd_w_control")
+        with pytest.raises(ValueError, match="noise_gradual_steps.*task_length"):
+            ipmnist_screening.ScreeningRunResult(
+                config_name=spec.name,
+                base_learner=spec.base_learner,
+                hyperparameters=dict(spec.hyperparameters),
+                seed=0,
+                config=SMALL,
+                per_task_accuracy=np.zeros(SMALL.n_tasks),
+                per_task_loss=np.zeros(SMALL.n_tasks),
+                per_task_plasticity=np.zeros(SMALL.n_tasks),
+                wall_clock_seconds=0.0,
+                noise_mode="gradual",
+                noise_gradual_steps=SMALL.task_length + 1,
+            )
+
+    @pytest.mark.parametrize("noise_gradual_steps", [8, True, np.int64(8)])
+    def test_step_result_rejects_recorded_gradual_window(
+        self, noise_gradual_steps: object
+    ) -> None:
+        spec = screening_spec("upgd_w_control")
+        with pytest.raises(ValueError, match="noise_gradual_steps"):
+            ipmnist_screening.ScreeningRunResult(
+                config_name=spec.name,
+                base_learner=spec.base_learner,
+                hyperparameters=dict(spec.hyperparameters),
+                seed=0,
+                config=SMALL,
+                per_task_accuracy=np.zeros(SMALL.n_tasks),
+                per_task_loss=np.zeros(SMALL.n_tasks),
+                per_task_plasticity=np.zeros(SMALL.n_tasks),
+                wall_clock_seconds=0.0,
+                noise_gradual_steps=noise_gradual_steps,  # type: ignore[arg-type]
+            )
+
+    def test_gradual_rejected_for_receipt_mechanisms(self, small_data):
+        x, y = small_data
+        with pytest.raises(ValueError, match="gradual"):
+            run_screening_config(
+                x, y, screening_spec("cchain_projective_only"), seed=0, config=SMALL,
+                noise_mode="gradual", noise_gradual_steps=8,
+            )
+
+    def test_gradual_shard_records_mode_and_window(self, tmp_path, small_data):
+        x, y = small_data
+        gradual = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=0, config=SMALL,
+            noise_mode="gradual", noise_gradual_steps=8,
+        )
+        payload = _bound_shard_payload(gradual)
+        assert payload["schema"] == SHARD_SCHEMA_V3
+        assert payload["noise_mode"] == "gradual"
+        assert payload["noise_gradual_steps"] == 8
+        assert payload["noise_pool_steps"] is None
+        path = tmp_path / "gradual.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        loaded = load_shard(path)
+        assert loaded["schema"] == SHARD_SCHEMA_V3
+        assert loaded["noise_mode"] == "gradual"
+        assert loaded["noise_gradual_steps"] == 8
+
+    def test_step_shard_keeps_v2_schema_without_gradual_field(
+        self, tmp_path, small_data
+    ):
+        x, y = small_data
+        exact = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=0, config=SMALL
+        )
+        payload = _bound_shard_payload(exact)
+        assert payload["schema"] == SHARD_SCHEMA
+        assert "noise_gradual_steps" not in payload
+        path = tmp_path / "step.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assert load_shard(path)["schema"] == SHARD_SCHEMA
+
+    def test_v3_shard_rejects_non_gradual_mode(self, tmp_path, small_data):
+        """A tampered v3 shard with step mode and a null window is rejected.
+
+        The v3 schema exists to mark gradual-protocol shards, so the schema
+        and the noise mode must be bound in both directions on load: a
+        step-mode payload that claims the v3 schema (with the v3-exact key
+        set including ``noise_gradual_steps: null``) must not validate,
+        otherwise a ``SUMMARY_SCHEMA_V3`` summary could be produced with no
+        gradual window.
+        """
+        x, y = small_data
+        exact = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=0, config=SMALL
+        )
+        payload = _bound_shard_payload(exact)
+        assert payload["schema"] == SHARD_SCHEMA
+        tampered = dict(payload)
+        tampered["schema"] = SHARD_SCHEMA_V3
+        tampered["noise_gradual_steps"] = None
+        path = tmp_path / "v3-step.json"
+        path.write_text(json.dumps(tampered), encoding="utf-8")
+        with pytest.raises(ValueError, match="gradual"):
+            load_shard(path)
+        with pytest.raises(ValueError, match="gradual"):
+            merge_shards([path, path])
+
+    def test_gradual_and_step_shards_never_merge(self, tmp_path, small_data):
+        x, y = small_data
+        exact = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=0, config=SMALL
+        )
+        gradual = run_screening_config(
+            x, y, screening_spec("upgd_w_localgate"), seed=0, config=SMALL,
+            noise_mode="gradual", noise_gradual_steps=8,
+        )
+        p_exact = tmp_path / "exact.json"
+        p_gradual = tmp_path / "gradual.json"
+        p_exact.write_text(json.dumps(_bound_shard_payload(exact)), encoding="utf-8")
+        p_gradual.write_text(
+            json.dumps(_bound_shard_payload(gradual)), encoding="utf-8"
+        )
+        # A gradual run writes the v3 schema, so the schema-homogeneity gate
+        # refuses the batch before the noise-mode gate is reached; either way
+        # exact and gradual shards never rank together.
+        with pytest.raises(ValueError, match="multiple shard schemas"):
+            merge_shards([p_exact, p_gradual])
+
+    def test_gradual_shards_reject_inconsistent_windows(self, tmp_path, small_data):
+        x, y = small_data
+        wide = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=0, config=SMALL,
+            noise_mode="gradual", noise_gradual_steps=8,
+        )
+        narrow = run_screening_config(
+            x, y, screening_spec("upgd_w_localgate"), seed=0, config=SMALL,
+            noise_mode="gradual", noise_gradual_steps=4,
+        )
+        p_wide = tmp_path / "wide.json"
+        p_narrow = tmp_path / "narrow.json"
+        p_wide.write_text(json.dumps(_bound_shard_payload(wide)), encoding="utf-8")
+        p_narrow.write_text(
+            json.dumps(_bound_shard_payload(narrow)), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="noise_gradual_steps"):
+            merge_shards([p_wide, p_narrow])
+
+    def test_gradual_summary_records_window(self, tmp_path, small_data):
+        x, y = small_data
+        shards = []
+        for seed in (0, 1):
+            result = run_screening_config(
+                x, y, screening_spec("upgd_w_control"), seed=seed, config=SMALL,
+                noise_mode="gradual", noise_gradual_steps=8,
+            )
+            path = tmp_path / f"gradual-{seed}.json"
+            path.write_text(
+                json.dumps(_bound_shard_payload(result)), encoding="utf-8"
+            )
+            shards.append(path)
+        summary = merge_shards(shards, slope_window=2)
+        assert summary["schema"] == SUMMARY_SCHEMA_V3
+        assert summary["noise_mode"] == "gradual"
+        assert summary["noise_gradual_steps"] == 8
+
+    def test_validate_proxy_rejects_gradual_shards(self, tmp_path, small_data):
+        x, y = small_data
+        gradual = run_screening_config(
+            x, y, screening_spec("upgd_w_control"), seed=0, config=SMALL,
+            noise_mode="gradual", noise_gradual_steps=8,
+        )
+        path = tmp_path / "gradual.json"
+        path.write_text(json.dumps(_bound_shard_payload(gradual)), encoding="utf-8")
         with pytest.raises(ValueError, match="noise_mode"):
             validate_proxy([path], tmp_path)
 
@@ -4244,6 +4885,139 @@ class TestGatedL2Init:
             np.testing.assert_array_equal(np.asarray(p_a[n]), np.asarray(p_b[n]), err_msg=n)
 
 
+class TestShiftnormGatedL2Init:
+    """``sigma0_shiftnorm_d099_gated_l2init``: the gated-L2-init pull term
+    of ``sigma0_ndecay099_gated_l2init`` transplanted onto the
+    shift-triggered re-conditioning champion body (see
+    :func:`alberta_framework.benchmarks.ipmnist_screening._make_shiftnorm_gated_l2init_learner`)."""
+
+    def test_registry_binds_ema_frozen_probe_input(self):
+        spec = screening_spec("sigma0_shiftnorm_d099_gated_l2init")
+        assert spec.frozen_probe_input is _ema_frozen_probe_input
+
+    def test_pull_scale_zero_reduces_to_shiftnorm_champion_bitwise(self):
+        """``l2init_pull_scale=0`` delegates to the champion factory's own
+        step, so the trajectory equals ``sigma0_shiftnorm_d099``
+        bit-for-bit (same normalizer, same gate, same decay)."""
+        hp = dict(screening_spec("sigma0_shiftnorm_d099_gated_l2init").hyperparameters)
+        hp["l2init_pull_scale"] = 0.0
+        init_fn, step_fn = _make_shiftnorm_gated_l2init_learner(hp)
+        champion = screening_spec("sigma0_shiftnorm_d099")
+        init_ref, step_ref = champion.factory(champion.hyperparameters)
+        params = init_mlp_params(jr.key(29), SMALL)
+        s_ours = init_fn(params)
+        s_ref = init_ref(params)
+        p_ours = p_ref = params
+        key = jr.key(43)
+        for i in range(5):
+            x = jr.normal(jr.fold_in(key, i), (SMALL.input_dim,)) + 0.1
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            p_ours, s_ours, _ = step_fn(p_ours, s_ours, x, y, jr.key(600 + i))
+            p_ref, s_ref, _ = step_ref(p_ref, s_ref, x, y, jr.key(600 + i))
+            for n in p_ours:
+                np.testing.assert_array_equal(
+                    np.asarray(p_ours[n]), np.asarray(p_ref[n]), err_msg=n
+                )
+
+    def test_registered_pull_scale_hand_computed(self):
+        """The registered arm equals a hand-computed shift-normalize ->
+        grad -> gate -> ``w*(1-lr*wd) - lr*pull_scale*(1-gate)*(w-w0) -
+        lr*(1-gate)*grad`` trajectory."""
+        hp = screening_spec("sigma0_shiftnorm_d099_gated_l2init").hyperparameters
+        assert hp["l2init_pull_scale"] == 0.01
+        init_fn, step_fn = _make_shiftnorm_gated_l2init_learner(hp)
+        params = init_mlp_params(jr.key(14), SMALL)
+        w0 = {n: v for n, v in params.items()}
+        state = init_fn(params)
+        ref_params = params
+        ref_utility = {n: jnp.zeros_like(v) for n, v in params.items()}
+        norm_state = EMANormState(
+            mean=jnp.zeros(SMALL.input_dim),
+            var=jnp.ones(SMALL.input_dim),
+            count=jnp.zeros(SMALL.input_dim),
+        )
+        fast_mean = jnp.zeros(SMALL.input_dim)
+        key = jr.key(15)
+        for i in range(4):
+            x = jr.normal(jr.fold_in(key, i), (SMALL.input_dim,)) * 2.0 + 0.5
+            y = jnp.array(i % SMALL.n_classes, jnp.int32)
+            params, state, _ = step_fn(params, state, x, y, jr.key(500 + i))
+            x_norm, norm_state, fast_mean, _ = shift_adaptive_normalize(
+                norm_state,
+                fast_mean,
+                x,
+                decay=hp["norm_decay"],
+                fast_decay=hp["fast_decay"],
+                epsilon=hp["norm_epsilon"],
+                shift_k=hp["shift_k"],
+                shift_delta=hp["shift_delta"],
+                shift_refractory=hp["shift_refractory"],
+            )
+            _, grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+                ref_params, x_norm, y
+            )
+            beta = hp["utility_decay"]
+            ref_utility = {
+                n: beta * ref_utility[n] + (1.0 - beta) * (-grads[n] * ref_params[n])
+                for n in ref_params
+            }
+            count = i + 1
+            bias_correction = 1.0 - beta**count
+            global_max = jnp.max(
+                jnp.stack([jnp.max(ref_utility[n]) for n in sorted(ref_params)])
+            )
+            new_ref: dict[str, jnp.ndarray] = {}
+            for n in ref_params:
+                gate = jax.nn.sigmoid((ref_utility[n] / bias_correction) / global_max)
+                pull = hp["l2init_pull_scale"] * (1.0 - gate) * (ref_params[n] - w0[n])
+                new_ref[n] = (
+                    ref_params[n] * (1.0 - hp["step_size"] * hp["weight_decay"])
+                    - hp["step_size"] * pull
+                    - hp["step_size"] * (grads[n] * (1.0 - gate))
+                )
+            ref_params = new_ref
+            for n in ref_params:
+                # Independently reordered floating-point ops can diverge by
+                # a few ULP; the bit-exact contract lives in
+                # test_pull_scale_zero_reduces_to_shiftnorm_champion_bitwise.
+                np.testing.assert_allclose(
+                    np.asarray(params[n]),
+                    np.asarray(ref_params[n]),
+                    atol=1e-6,
+                    rtol=1e-5,
+                    err_msg=n,
+                )
+
+    def test_nonzero_pull_diverges_from_champion_and_stays_finite(self, small_data):
+        """The registered arm's trajectory differs from the champion's and
+        remains finite over a tiny-protocol smoke run."""
+        x, y = small_data
+        champion = run_screening_config(
+            x, y, screening_spec("sigma0_shiftnorm_d099"), seed=19, config=SMALL
+        )
+        result = run_screening_config(
+            x, y, screening_spec("sigma0_shiftnorm_d099_gated_l2init"), seed=19, config=SMALL
+        )
+        assert np.all(np.isfinite(result.per_task_accuracy))
+        assert np.all(np.isfinite(result.per_task_loss))
+        assert not np.array_equal(result.per_task_loss, champion.per_task_loss)
+
+    def test_key_is_unused_for_no_extra_randomness(self):
+        """The arm draws no perturbation noise (noise_std=0 by inheritance
+        from ``_sigma0_ext_hp``): different RNG keys must still reach an
+        identical result."""
+        params = init_mlp_params(jr.key(3), SMALL)
+        x = jr.normal(jr.key(90), (SMALL.input_dim,))
+        y = jnp.array(2, jnp.int32)
+        spec = screening_spec("sigma0_shiftnorm_d099_gated_l2init")
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
+        state = init_fn(params)
+        p_a, _, _ = step_fn(params, state, x, y, jr.key(0))
+        p_b, _, _ = step_fn(params, state, x, y, jr.key(987654))
+        for n in params:
+            np.testing.assert_array_equal(np.asarray(p_a[n]), np.asarray(p_b[n]), err_msg=n)
+
+
 class TestComparisonArms:
     """Reviewer comparison rows: published plasticity mechanisms behind the
     champion's EMA input conditioning (decay 0.99) on a plain-SGD base — no
@@ -5045,6 +5819,62 @@ class TestDiscoveredRuleFactoryWave2:
         assert float(new_state.nb_count[2]) == pytest.approx(1.0)
         assert all(bool(jnp.isfinite(m)) for m in metrics)
 
+    def test_compiled_nb_vote_reports_the_reference_ensemble_accuracy(self) -> None:
+        """Compiled discovered-rule NB vote must not flip screening accuracy.
+
+        Regression for the screening twin of SlopDotCash/asi#2886: with
+        ``flag_nb_member`` on, ``_make_discovered_rule_learner`` feeds
+        ``log_softmax(nb_ll / float(input_dim))`` into the combined vote that
+        becomes ``metrics[0]`` (the arm's online accuracy). For a
+        non-power-of-two feature count the quotient is an inexact reciprocal
+        multiply; past ``|nb_ll / scale| ~ 2**31`` the compiled vote is
+        all-``-inf`` while eager stays finite, so ``argmax`` is 0 and the
+        reported accuracy is silently 0. The screening runner jits the step,
+        so the probe is per-row ``jax.jit(step_fn)``. Independent float64
+        ``nb_ll`` identifies the vote winner without the production helper.
+        """
+        import dataclasses as _dc
+
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _DISCOVERED_NB_VAR_FLOOR,
+            _make_discovered_rule_learner,
+        )
+
+        init_fn, step_fn = _make_discovered_rule_learner(
+            self._hp(flag_nb_member=1.0)
+        )
+        config, params = self._setup(seed=23)
+        state = init_fn(params)
+        n_features = config.input_dim
+        n_classes = config.n_classes
+        x_mean_gap = 100.0
+        obs_value = 5.0e3
+        nb_var = jnp.full((n_classes, n_features), _DISCOVERED_NB_VAR_FLOOR)
+        nb_mean = jnp.asarray(
+            np.tile(
+                np.arange(n_classes, dtype=np.float64) * x_mean_gap,
+                (n_features, 1),
+            ).T,
+            dtype=jnp.float32,
+        )
+        x = jnp.full((n_features,), obs_value, dtype=jnp.float32)
+        y = jnp.asarray(n_classes - 1, dtype=jnp.int32)
+        extreme_state = _dc.replace(state, nb_mean=nb_mean, nb_var=nb_var)
+
+        x64 = np.asarray(x, dtype=np.float64)
+        mean64 = np.asarray(nb_mean, dtype=np.float64)
+        var64 = float(_DISCOVERED_NB_VAR_FLOOR)
+        nb_ll64 = -0.5 * np.sum(
+            np.log(var64) + (x64[None, :] - mean64) ** 2 / var64, axis=1
+        )
+        scale = float(n_features)
+        assert int(np.argmax(nb_ll64 / scale)) == int(y)
+        assert np.min(np.abs(nb_ll64)) / scale > 2.0**31
+
+        _, _, metrics = jax.jit(step_fn)(params, extreme_state, x, y, jr.key(0))
+        assert bool(jnp.isfinite(metrics[0]))
+        assert float(metrics[0]) == 1.0
+
     def test_rls_head_updates_and_shift_reset_p(self):
         import dataclasses as _dc
 
@@ -5111,6 +5941,45 @@ class TestDiscoveredRuleFactoryWave2:
         _, state_unc, _ = step_fn(params, uncertain, x, y, jr.key(0))
         assert float(state_unc.norm.mean[0]) > float(state_conf.norm.mean[0])
         assert float(state_unc.kalman_p[0]) < 10.0
+
+
+@pytest.mark.parametrize(
+    "arm", ["rls_head_resid_l1_preset005", "rls_head_l1_preset005"]
+)
+def test_rls_head_plasticity_scores_the_post_update_model(arm: str) -> None:
+    hp = screening_spec(arm).hyperparameters
+    init_fn, step_fn = screening_spec(arm).factory(hp)
+    params = init_mlp_params(jr.key(0), SMALL)
+    state = init_fn(params)
+    step = jax.jit(step_fn)
+    rng = np.random.default_rng(0)
+    gaps = []
+    for t in range(20):
+        x = jnp.asarray(rng.uniform(-1.0, 1.0, SMALL.input_dim).astype(np.float32))
+        y = jnp.asarray(int(rng.integers(0, SMALL.n_classes)), dtype=jnp.int32)
+        x_norm = shift_adaptive_normalize(
+            state.norm,
+            state.fast_mean,
+            x,
+            decay=hp["norm_decay"],
+            fast_decay=hp["fast_decay"],
+            epsilon=hp["norm_epsilon"],
+            shift_k=hp["shift_k"],
+            shift_delta=hp["shift_delta"],
+            shift_refractory=hp["shift_refractory"],
+        )[0]
+        new_params, new_state, (_, loss, plasticity) = step(params, state, x, y, jr.key(t))
+        m = new_params["w2"].shape[1] + 1
+        a1 = jax.nn.relu(x_norm @ new_params["w1"] + new_params["b1"])
+        a2 = jax.nn.relu(a1 @ new_params["w2"] + new_params["b2"])
+        phi_after = jnp.concatenate([a2 / math.sqrt(m), jnp.ones((1,), jnp.float32)])
+        err_after = jax.nn.one_hot(y, SMALL.n_classes) - new_state.wout.T @ phi_after
+        loss_after = 0.5 * jnp.sum(err_after * err_after)
+        expected = jnp.clip(1.0 - loss_after / jnp.maximum(loss, 1e-8), 0.0, 1.0)
+        gaps.append(abs(float(plasticity) - float(expected)))
+        params, state = new_params, new_state
+    # Float32 rounding stays near 1e-7; scoring the pre-update body drifts to ~1e-3.
+    assert max(gaps) < 1e-5, max(gaps)
 
 
 class TestRLSHead:
@@ -5265,6 +6134,29 @@ class TestRLSHead:
         with pytest.raises(ValueError, match="residual"):
             self._factory(gate_scale=0.0)
 
+    def test_resid_newton_without_whiten_is_rejected(self):
+        """``resid_newton=1`` is read only inside the ``resid_whiten > 0``
+        branch, so without whitening it is a dead knob: a 12-step run with
+        ``resid_newton=1.0, resid_whiten=0.0`` reproduced the plain residual
+        incumbent bit-for-bit (max param and readout diff 0.0), while the
+        whitened pair diverged.  Fail closed like the neighbouring
+        composition guards instead of silently running the incumbent."""
+        with pytest.raises(ValueError, match="resid_newton"):
+            self._factory(head_resid=1.0, resid_newton=1.0)
+
+    def test_resid_newton_without_residual_body_is_rejected(self):
+        with pytest.raises(ValueError, match="resid_newton"):
+            self._factory(head_resid=0.0, resid_newton=1.0)
+
+    def test_resid_newton_with_whiten_is_accepted(self):
+        """The one live composition: whitening selects the preconditioner
+        and ``resid_newton`` picks its Newton direction."""
+        init_fn, _step_fn = self._factory(
+            head_resid=1.0, resid_whiten=1.0, resid_newton=1.0
+        )
+        params = init_mlp_params(jr.key(5), SMALL)
+        init_fn(params)
+
     def test_gate_off_two_step_plain_sgd_and_identical_head(self):
         """The ablation does only decayed SGD on the residual body.
 
@@ -5398,7 +6290,9 @@ class TestRLSHead:
                     np.asarray(getattr(gated_state.norm, field)),
                     f"gated norm.{field}",
                 )
-            for actual, expected in zip(plain_metrics, gated_metrics):
+            # Accuracy and loss are pre-update; plasticity scores each arm's own
+            # post-update body, which the gate is allowed to change.
+            for actual, expected in zip(plain_metrics[:2], gated_metrics[:2]):
                 np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
             assert int(plain_state.step) == 0
             for name in sorted(params):
@@ -5847,6 +6741,121 @@ class TestRLSHead:
             "rls_head_resid_l1_preset005_nogate"
         ).hyperparameters
         assert nogate_hp == {**incumbent_hp, "gate_scale": 0.0}
+
+
+class TestRLSHeadCombo:
+    """Composition pin for ``rls_head_l0999_preset005_pcap``: the two
+    wave-2 wind-up salvages composed on the forgetting-0.999 RLS head.
+
+    Each guard was screened alone (detector-driven P reset at 0.05:
+    0.86484; P trace cap 1e4: 0.86608); the composition is a separate
+    registry arm.  Its reduction pins: the same factory fed the combo
+    hyperparameters with the cap disabled (0) follows
+    ``rls_head_l0999_preset005`` bit-for-bit, with the reset made
+    untriggerable (2.0) follows ``rls_head_l0999_pcap`` bit-for-bit, and
+    with both inert follows the plain ``rls_head_l0999`` head bit-for-bit.
+    """
+
+    def _factory(self, **overrides):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_learner,
+            _rls_head_hp,
+        )
+
+        return _make_rls_head_learner(_rls_head_hp(**overrides))
+
+    def _stream(self, n_steps=12, seed=3):
+        key = jr.key(seed)
+        xs, ys = [], []
+        for step in range(n_steps):
+            key, kx = jr.split(key)
+            xs.append(
+                jr.uniform(kx, (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+                * (1.0 + step % 3)
+            )
+            ys.append(jnp.array(step % SMALL.n_classes, jnp.int32))
+        return xs, ys
+
+    def _run_pair(self, factory_a, factory_b, n_steps=12):
+        params = init_mlp_params(jr.key(5), SMALL)
+        params_a = params_b = params
+        state_a, state_b = factory_a[0](params), factory_b[0](params)
+        xs, ys = self._stream(n_steps=n_steps)
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            params_a, state_a, m_a = factory_a[1](
+                params_a, state_a, x, y, jr.key(step)
+            )
+            params_b, state_b, m_b = factory_b[1](
+                params_b, state_b, x, y, jr.key(step)
+            )
+            for n in params:
+                np.testing.assert_array_equal(
+                    np.asarray(params_a[n]), np.asarray(params_b[n])
+                )
+            np.testing.assert_array_equal(
+                np.asarray(state_a.p), np.asarray(state_b.p)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(state_a.wout), np.asarray(state_b.wout)
+            )
+            for a, b in zip(m_a, m_b):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_registry_config(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_learner,
+            _rls_head_frozen_probe_input,
+            _rls_head_hp,
+        )
+
+        spec = screening_spec("rls_head_l0999_preset005_pcap")
+        assert spec.base_learner == "upgd_w"
+        assert spec.mechanism == "rls_readout"
+        assert spec.factory is _make_rls_head_learner
+        assert spec.frozen_probe_input is _rls_head_frozen_probe_input
+        assert spec.noise_update is None
+        assert spec.hyperparameters == _rls_head_hp(
+            rls_lambda=0.999, rls_reset_frac=0.05, rls_p_trace_cap=1e4
+        )
+        # Every other constant is verbatim the plain l0999 head arm.
+        base = screening_spec("rls_head_l0999").hyperparameters
+        hp = spec.hyperparameters
+        assert set(hp) == set(base)
+        for k in base:
+            if k not in ("rls_reset_frac", "rls_p_trace_cap"):
+                assert hp[k] == base[k], k
+
+    def test_cap_off_reduces_to_preset_parent_bitwise(self):
+        combo = self._factory(
+            rls_lambda=0.999, rls_reset_frac=0.05, rls_p_trace_cap=0.0
+        )
+        parent = self._factory(rls_lambda=0.999, rls_reset_frac=0.05)
+        self._run_pair(combo, parent)
+
+    def test_reset_off_reduces_to_pcap_parent_bitwise(self):
+        combo = self._factory(
+            rls_lambda=0.999, rls_reset_frac=2.0, rls_p_trace_cap=1e4
+        )
+        parent = self._factory(rls_lambda=0.999, rls_p_trace_cap=1e4)
+        self._run_pair(combo, parent)
+
+    def test_both_inert_reduces_to_plain_head_bitwise(self):
+        combo = self._factory(
+            rls_lambda=0.999, rls_reset_frac=2.0, rls_p_trace_cap=0.0
+        )
+        plain = self._factory(rls_lambda=0.999)
+        self._run_pair(combo, plain)
+
+    def test_combo_smoke_runs_finite(self, small_data):
+        x, y = small_data
+        result = run_screening_config(
+            x, y, screening_spec("rls_head_l0999_preset005_pcap"),
+            seed=2, config=SMALL,
+        )
+        acc = np.asarray(result.per_task_accuracy)
+        assert np.all(np.isfinite(acc))
+        assert np.all((acc >= 0.0) & (acc <= 1.0))
+        assert np.all(np.isfinite(np.asarray(result.per_task_loss)))
 
 
 class TestRLSHeadL2Init:
@@ -6450,3 +7459,2770 @@ class TestNBEnsemble:
             assert np.all(np.isfinite(np.asarray(result.per_task_loss))), name
             plas = np.asarray(result.per_task_plasticity)
             assert np.all((plas >= 0.0) & (plas <= 1.0)), name
+
+
+class TestNBEnsembleCombo:
+    """Composition pin for ``nb_ensemble_nbreset_rls3``: probe (b) NB resets
+    and probe (c) linear-RLS third member composed on the base ensemble.
+
+    Each flag was screened alone (nbreset +0.0018, rls3 +0.0001 over
+    ``nb_ensemble_champion``); the composition is a separate registry arm.
+    Its reduction pin: the same factory fed the combo hyperparameters with
+    both mechanism flags at 0 follows ``nb_ensemble_champion`` bit-for-bit.
+    """
+
+    def _hp(self, **overrides):
+        from alberta_framework.benchmarks.ipmnist_screening import _nb_ensemble_hp
+
+        return _nb_ensemble_hp(**overrides)
+
+    def _factory(self, **overrides):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_nb_ensemble_learner,
+        )
+
+        return _make_nb_ensemble_learner(self._hp(**overrides))
+
+    def _stream(self, n_steps=12, seed=3):
+        key = jr.key(seed)
+        xs, ys = [], []
+        for step in range(n_steps):
+            key, kx = jr.split(key)
+            xs.append(
+                jr.uniform(kx, (SMALL.input_dim,), jnp.float32, -1.0, 1.0)
+                * (1.0 + step % 3)
+            )
+            ys.append(jnp.array(step % SMALL.n_classes, jnp.int32))
+        return xs, ys
+
+    def test_registry_config(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_nb_ensemble_learner,
+        )
+
+        spec = screening_spec("nb_ensemble_nbreset_rls3")
+        assert spec.mechanism == "transient_ensemble"
+        assert spec.factory is _make_nb_ensemble_learner
+        assert spec.noise_update is None
+        hp = spec.hyperparameters
+        assert hp["ens_nb_reset"] == 1.0
+        assert hp["ens_use_rls"] == 1.0
+        # Every other constant is verbatim the base ensemble arm.
+        base = screening_spec("nb_ensemble_champion").hyperparameters
+        assert set(hp) == set(base)
+        for k in base:
+            if k not in ("ens_nb_reset", "ens_use_rls"):
+                assert hp[k] == base[k], k
+
+    def test_inert_flags_reduce_to_base_ensemble_bitwise(self):
+        combo = screening_spec("nb_ensemble_nbreset_rls3").hyperparameters
+        inert = {**combo, "ens_nb_reset": 0.0, "ens_use_rls": 0.0}
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_nb_ensemble_learner,
+        )
+
+        base_init, base_step = self._factory()
+        combo_init, combo_step = _make_nb_ensemble_learner(inert)
+        params = init_mlp_params(jr.key(5), SMALL)
+        base_params, combo_params = params, params
+        base_state, combo_state = base_init(params), combo_init(params)
+        xs, ys = self._stream()
+        for step, (x, y) in enumerate(zip(xs, ys)):
+            base_params, base_state, m_base = base_step(
+                base_params, base_state, x, y, jr.key(step)
+            )
+            combo_params, combo_state, m_combo = combo_step(
+                combo_params, combo_state, x, y, jr.key(step)
+            )
+            for n in params:
+                np.testing.assert_array_equal(
+                    np.asarray(combo_params[n]), np.asarray(base_params[n])
+                )
+            np.testing.assert_array_equal(
+                np.asarray(combo_state.member_acc), np.asarray(base_state.member_acc)
+            )
+            for a, b in zip(m_combo, m_base):
+                np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+    def test_combo_carries_both_mechanisms(self):
+        ens_init, _ = self._factory(ens_nb_reset=1.0, ens_use_rls=1.0)
+        params = init_mlp_params(jr.key(3), SMALL)
+        state = ens_init(params)
+        assert state.rls is not None
+        assert state.member_acc.shape == (3,)
+        assert state.det_norm is not None
+        assert state.det_fast is not None
+
+    def test_combo_smoke_runs_finite(self, small_data):
+        x, y = small_data
+        result = run_screening_config(
+            x, y, screening_spec("nb_ensemble_nbreset_rls3"), seed=2, config=SMALL
+        )
+        acc = np.asarray(result.per_task_accuracy)
+        assert np.all(np.isfinite(acc))
+        assert np.all((acc >= 0.0) & (acc <= 1.0))
+        assert np.all(np.isfinite(np.asarray(result.per_task_loss)))
+
+
+class TestRLSHeadIdentMap:
+    """The online permutation-identifier arms (V7/V8 chain).
+
+    House convention: every new arm ships its bit-exact reduction pin in the
+    suite.  The mechanism was implemented before these tests (the pin was
+    verified by hand during development); the tests freeze it.
+    """
+
+    @staticmethod
+    def _ident_spec(**overrides):
+        spec = screening_spec("rls_head_resid_identmap200_r")
+        return replace(
+            spec,
+            name=spec.name + "_test",
+            hyperparameters={**spec.hyperparameters, **overrides},
+        )
+
+    def test_reduction_pin_bitwise(self, small_data):
+        """``ident_match_at = 0`` delegates verbatim to the incumbent."""
+        x, y = small_data
+        incumbent = run_screening_config(
+            x, y, screening_spec("rls_head_resid_l1_preset005"),
+            seed=7, config=SMALL,
+        )
+        pinned = run_screening_config(
+            x, y,
+            self._ident_spec(
+                ident_match_at=0.0, ident_match2=0.0, ident_match3=0.0
+            ),
+            seed=7, config=SMALL,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_accuracy),
+            np.asarray(incumbent.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_loss),
+            np.asarray(incumbent.per_task_loss),
+        )
+
+    def test_task0_in_run_null(self, small_data):
+        """Task 0 is bitwise the incumbent's: no reference is frozen yet,
+        so the remap stays identity for the whole first task."""
+        x, y = small_data
+        incumbent = run_screening_config(
+            x, y, screening_spec("rls_head_resid_l1_preset005"),
+            seed=7, config=SMALL,
+        )
+        ident = run_screening_config(
+            x, y,
+            self._ident_spec(
+                ident_match_at=10.0, ident_match2=0.0, ident_match3=0.0
+            ),
+            seed=7, config=SMALL,
+        )
+        assert float(ident.per_task_accuracy[0]) == float(
+            incumbent.per_task_accuracy[0]
+        )
+
+    def test_match_changes_later_tasks(self):
+        """With a reachable match step the Hungarian callback fires inside
+        the scanned loop and the post-boundary trajectory diverges from the
+        incumbent (the mechanism is live, not compiled away).
+
+        ``small_data`` is iid across pixels, which makes a permutation
+        statistically invisible (identical marginals) — the detector
+        correctly never fires there.  This test gives every pixel a distinct
+        marginal mean so boundaries are detectable.
+        """
+        key = jr.key(4321)
+        kx, ky = jr.split(key)
+        offsets = jnp.linspace(-2.0, 2.0, SMALL.input_dim)
+        x = np.asarray(
+            jr.uniform(kx, (64, SMALL.input_dim), jnp.float32, -0.3, 0.3)
+            + offsets[None, :]
+        )
+        y = np.asarray(jr.randint(ky, (64,), 0, SMALL.n_classes))
+        incumbent = run_screening_config(
+            x, y, screening_spec("rls_head_resid_l1_preset005"),
+            seed=7, config=SMALL,
+        )
+        ident = run_screening_config(
+            x, y,
+            self._ident_spec(
+                ident_match_at=10.0, ident_match2=0.0, ident_match3=0.0
+            ),
+            seed=7, config=SMALL,
+        )
+        later = np.asarray(ident.per_task_accuracy[1:])
+        base = np.asarray(incumbent.per_task_accuracy[1:])
+        assert not np.array_equal(later, base)
+        assert np.all(np.isfinite(np.asarray(ident.per_task_accuracy)))
+
+    def test_registry_arms(self):
+        """Pin the current and retained historical identifier arm inventory."""
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            SCREENING_REGISTRY,
+            _make_rls_head_identmap_learner,
+            _rls_head_frozen_probe_input,
+        )
+
+        expected = {
+            **{
+                "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+                f"_polyak_{tag}": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": 0.005625, "anneal_floor": 0.0028125,
+                    "anneal_tau": 1000.0, "polyak_window": window,
+                    "polyak_head_avg": head_avg,
+                }
+                for tag, window, head_avg in (
+                    ("w100h0", 100.0, 0.0), ("w100h1", 100.0, 1.0),
+                    ("w1000h0", 1000.0, 0.0), ("w1000h1", 1000.0, 1.0),
+                )
+            },
+            **{
+                f"rls_head_resid_identmap50_r_idet003_s005625_as{tag}": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": 0.005625, "body_as_meta": meta, "body_as_tau": 1e4,
+                }
+                for tag, meta in (("1e3", 1e-3), ("1e2", 1e-2))
+            },
+            **{
+                f"rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000_{tag}": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": 0.005625, "anneal_floor": 0.0028125,
+                    "anneal_tau": 1000.0, "anneal_peak": peak,
+                }
+                for tag, peak in (("p75", 0.0075), ("p10", 0.01), ("p15", 0.015))
+            },
+            **{
+                f"rls_head_resid_identmap50_r_idet003_s005625_snp_{tag}": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": 0.005625, "snp_shrink": shrink, "snp_sigma": sigma,
+                }
+                for tag, shrink, sigma in (("l08s001", 0.8, 0.01), ("l05s01", 0.5, 0.1))
+            },
+            "rls_head_resid_identmap50_r": {
+                "ident_match_at": 50.0, "ident_match2": 200.0,
+                "ident_match3": 2000.0,
+            },
+            "rls_head_resid_identmap200_r": {
+                "ident_match_at": 200.0, "ident_match2": 500.0,
+                "ident_match3": 2000.0,
+            },
+            "rls_head_resid_identmap50_r_idet003": {
+                "ident_match_at": 50.0, "ident_match2": 200.0,
+                "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+            },
+            "rls_head_resid_identmap50_r_idet003_s005625": {
+                "ident_match_at": 50.0, "ident_match2": 200.0,
+                "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                "step_size": 0.005625,
+            },
+            **{
+                f"rls_head_resid_identmap50_r_idet003_s005625_anneal_{tag}": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": 0.005625, "anneal_floor": floor,
+                    "anneal_tau": tau,
+                }
+                for tag, floor, tau in (
+                    ("f2t250", 0.0028125, 250.0),
+                    ("f2t1000", 0.0028125, 1000.0),
+                    ("f4t250", 0.00140625, 250.0),
+                    ("f4t1000", 0.00140625, 1000.0),
+                    ("f2t2000", 0.0028125, 2000.0),
+                )
+            },
+            **{
+                "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+                f"_pr{tag}": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": 0.005625, "anneal_floor": 0.0028125,
+                    "anneal_tau": 1000.0, "anneal_reset_frac": frac,
+                }
+                for tag, frac in (("25", 0.25), ("50", 0.5))
+            },
+            **{
+                "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+                f"_pr50_{tag}": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": 0.005625, "anneal_floor": 0.0028125,
+                    "anneal_tau": 1000.0, "anneal_reset_frac": f_s,
+                    "anneal_decay_reset_frac": f_d,
+                }
+                for tag, f_s, f_d in (
+                    ("steponly", 0.5, 0.0), ("decayonly", 0.0, 0.5)
+                )
+            },
+            **{
+                "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+                f"_wd{tag}": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": 0.005625, "anneal_floor": 0.0028125,
+                    "anneal_tau": 1000.0, "weight_decay": wd,
+                }
+                for tag, wd in (
+                    ("00084", 0.0084), ("0005", 0.005), ("00025", 0.0025),
+                    ("0001", 0.001), ("0", 0.0),
+                )
+            },
+            **{
+                "rls_head_resid_identmap50_r_idet003_s005625_anneal"
+                f"_{tag}_wd0": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": 0.005625, "anneal_floor": floor,
+                    "anneal_tau": 1000.0, "weight_decay": 0.0,
+                }
+                for tag, floor in (
+                    ("f1t1000", 0.005625), ("f4t1000", 0.00140625),
+                    ("f8t1000", 0.000703125),
+                )
+            },
+            **{
+                f"rls_head_resid_identmap50_r_idet003_s{tag}_anneal_f1t1000_wd0": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": step, "anneal_floor": step,
+                    "anneal_tau": 1000.0, "weight_decay": 0.0,
+                }
+                for tag, step in (
+                    ("004", 0.004), ("0075", 0.0075), ("01", 0.01),
+                    ("0125", 0.0125), ("015", 0.015), ("02", 0.02),
+                    ("03", 0.03), ("04", 0.04), ("05", 0.05),
+                )
+            },
+            **{
+                "rls_head_resid_identmap50_r_idet003_s02_anneal_f1t1000_wd0"
+                f"_wclip{tag}": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": 0.02, "anneal_floor": 0.02,
+                    "anneal_tau": 1000.0, "weight_decay": 0.0,
+                    "body_wclip_kappa": kappa,
+                }
+                for tag, kappa in (("2", 2.0), ("4", 4.0), ("8", 8.0))
+            },
+            **{
+                "rls_head_resid_identmap50_r_idet003_s02_anneal_f1t1000_wd0"
+                f"_{tag}": {
+                    "ident_match_at": 50.0, "ident_match2": 200.0,
+                    "ident_match3": 2000.0, "ident_reset_frac": 0.03,
+                    "step_size": 0.02, "anneal_floor": 0.02,
+                    "anneal_tau": 1000.0, "weight_decay": 0.0,
+                    "rls_ridge_init": ridge,
+                }
+                for tag, ridge in (("r03", 0.3), ("r01", 0.1), ("r003", 0.03))
+            },
+        }
+        expected.update({
+            f"rls_head_resid_identmap{tag}": {
+                "ident_match_at": 50.0, "ident_match2": 200.0, "ident_match3": 2000.0,
+                **overrides,
+            }
+            for tag, overrides in (
+                ("50_r_mom9", {"body_momentum": 0.9}),
+                ("50_r_mom99", {"body_momentum": 0.99}),
+                ("50_r_nogate", {"gate_scale": 0.0}),
+                (
+                    "200_r_nogate",
+                    {
+                        "ident_match_at": 200.0,
+                        "ident_match2": 500.0,
+                        "gate_scale": 0.0,
+                    },
+                ),
+                ("50_r_nogate_idet003", {"gate_scale": 0.0, "ident_reset_frac": 0.03}),
+                (
+                    "50_r_nogate_idet003_s0075",
+                    {
+                        "gate_scale": 0.0,
+                        "ident_reset_frac": 0.03,
+                        "step_size": 0.0075,
+                    },
+                ),
+                (
+                    "50_r_nogate_idet003_s005625",
+                    {
+                        "gate_scale": 0.0,
+                        "ident_reset_frac": 0.03,
+                        "step_size": 0.005625,
+                    },
+                ),
+                ("50_r_idet002", {"ident_reset_frac": 0.02}),
+                ("50_r_idet003_s00421875", {"ident_reset_frac": 0.03, "step_size": 0.00421875}),
+                ("50_r_idet004_s00421875", {"ident_reset_frac": 0.04, "step_size": 0.00421875}),
+                ("50_r_idet003_s0031640625", {"ident_reset_frac": 0.03, "step_size": 0.0031640625}),
+                (
+                    "50_r_idet003_s002373046875",
+                    {
+                        "ident_reset_frac": 0.03,
+                        "step_size": 0.002373046875,
+                    },
+                ),
+                (
+                    "50_r_idet003_s0031640625_r01",
+                    {
+                        "ident_reset_frac": 0.03,
+                        "step_size": 0.0031640625,
+                        "rls_ridge_init": 0.1,
+                    },
+                ),
+                (
+                    "50_r_idet003_s0031640625_r02",
+                    {
+                        "ident_reset_frac": 0.03,
+                        "step_size": 0.0031640625,
+                        "rls_ridge_init": 0.03,
+                    },
+                ),
+                (
+                    "50_r_idet003_s0031640625_r02_preset003",
+                    {
+                        "rls_reset_frac": 0.03,
+                        "ident_reset_frac": 0.03,
+                        "step_size": 0.0031640625,
+                        "rls_ridge_init": 0.03,
+                    },
+                ),
+                (
+                    "50_r_idet003_s0031640625_r02_sgdhead",
+                    {
+                        "ident_reset_frac": 0.03,
+                        "step_size": 0.0031640625,
+                        "rls_ridge_init": 0.03,
+                        "rls_head_sgd": 1.0,
+                        "rls_head_sgd_step": 0.1,
+                    },
+                ),
+            )
+        })
+        expected.update({
+            f"rls_head_resid_identmap50_r_idet003_s0031640625_r02_{suffix}_stable": {
+                "ident_match_at": 50.0, "ident_match2": 200.0, "ident_match3": 2000.0,
+                "ident_reset_frac": 0.03, "step_size": 0.0031640625,
+                "rls_ridge_init": 0.03, selector: value,
+            }
+            for suffix, selector, value in (
+                ("diaghead", "rls_head_diag", 1.0), ("gdiag", "rls_head_gdiag", 1.0),
+                ("blockhead", "rls_head_block", 4.0),
+            )
+        })
+        registered = {
+            name for name in SCREENING_REGISTRY if "identmap" in name
+        }
+        assert registered == set(expected) | {
+            "rls_head_resid_identmap50_r_idet003_s0031640625_r02_l2init",
+        }
+        for name, overrides in expected.items():
+            spec = SCREENING_REGISTRY[name]
+            assert spec.factory is _make_rls_head_identmap_learner
+            assert spec.frozen_probe_input is _rls_head_frozen_probe_input
+            assert spec.hyperparameters["head_resid"] == 1.0
+            assert spec.hyperparameters["rls_lambda"] == 1.0
+            assert spec.hyperparameters["rls_reset_frac"] == overrides.get("rls_reset_frac", 0.05)
+            for key, value in overrides.items():
+                assert spec.hyperparameters[key] == value
+
+
+class TestRLSHeadIdentMapIdet003:
+    """Gated identmap50_r composition at the 0.03 identifier trigger.
+
+    The identifier's own shift-detector trigger (``ident_reset_frac``)
+    was never varied on any gated identifier arm: the 0.03 fraction was
+    probed only on the head's P reset (``rls_reset_frac``, lost) and on
+    the ungated nogate composition (PR #3109's axis).  This class pins
+    the gated composition's bit-exact reductions: trigger restored (0.05)
+    follows the gated identmap50_r composition, and identifier disabled
+    follows the gated non-identifier incumbent.
+    """
+
+    @staticmethod
+    def _spec(**overrides):
+        spec = screening_spec("rls_head_resid_identmap50_r_idet003")
+        return replace(
+            spec,
+            name=spec.name + "_test",
+            hyperparameters={**spec.hyperparameters, **overrides},
+        )
+
+    def test_registry_shape(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            SCREENING_REGISTRY,
+            _make_rls_head_identmap_learner,
+            _rls_head_frozen_probe_input,
+        )
+
+        spec = SCREENING_REGISTRY["rls_head_resid_identmap50_r_idet003"]
+        assert spec.factory is _make_rls_head_identmap_learner
+        assert spec.frozen_probe_input is _rls_head_frozen_probe_input
+        parent = screening_spec("rls_head_resid_identmap50_r")
+        assert set(spec.hyperparameters) == set(parent.hyperparameters) | {
+            "ident_reset_frac"
+        }
+        for key, value in parent.hyperparameters.items():
+            assert spec.hyperparameters[key] == value, key
+        assert spec.hyperparameters["ident_reset_frac"] == 0.03
+        assert spec.hyperparameters["gate_scale"] == 1.0
+        assert spec.hyperparameters["rls_reset_frac"] == 0.05
+
+    def test_ident_frac_restored_pin_bitwise(self, small_data):
+        """``ident_reset_frac = 0.05`` follows the gated composition."""
+        x, y = small_data
+        base = screening_spec("rls_head_resid_identmap50_r")
+        expected = run_screening_config(
+            x, y, base, seed=7, config=SMALL,
+        )
+        pinned = run_screening_config(
+            x, y, self._spec(ident_reset_frac=0.05), seed=7, config=SMALL,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_accuracy),
+            np.asarray(expected.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_loss),
+            np.asarray(expected.per_task_loss),
+        )
+
+    def test_ident_off_pin_bitwise(self, small_data):
+        """Identifier disabled follows the gated incumbent."""
+        x, y = small_data
+        incumbent = screening_spec("rls_head_resid_l1_preset005")
+        expected = run_screening_config(
+            x, y, incumbent, seed=7, config=SMALL,
+        )
+        pinned = run_screening_config(
+            x, y,
+            self._spec(
+                ident_match_at=0.0, ident_match2=0.0, ident_match3=0.0
+            ),
+            seed=7, config=SMALL,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_accuracy),
+            np.asarray(expected.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_loss),
+            np.asarray(expected.per_task_loss),
+        )
+
+    def test_finite_smoke(self, small_data):
+        x, y = small_data
+        result = run_screening_config(
+            x, y,
+            screening_spec("rls_head_resid_identmap50_r_idet003"),
+            seed=7, config=SMALL,
+        )
+        assert np.all(np.isfinite(np.asarray(result.per_task_accuracy)))
+        assert np.all(np.isfinite(np.asarray(result.per_task_loss)))
+
+
+class TestRLSHeadIdentMapIdet003S005625:
+    """Gated idet003 composition at body step size 0.005625.
+
+    The gated idet003 screen (PR #3115) measured the identifier trigger
+    axis peak at 0.03; the ungated chain (PRs #3109-#3111) measured the
+    body step axis improving monotonically from the champion-calibrated
+    0.01 down through 0.005625.  This arm is their composition on the
+    gated chain, the gate + trigger + step triple named unmeasured in
+    the idet002 wave README (PR #3116).  This class pins the bit-exact
+    reductions: step restored (0.01) follows the gated idet003
+    composition, trigger restored (0.05) follows the gated identmap50_r
+    composition at the same step, and identifier disabled follows the
+    gated non-identifier incumbent at the same step.
+    """
+
+    @staticmethod
+    def _spec(**overrides):
+        spec = screening_spec(
+            "rls_head_resid_identmap50_r_idet003_s005625"
+        )
+        return replace(
+            spec,
+            name=spec.name + "_test",
+            hyperparameters={**spec.hyperparameters, **overrides},
+        )
+
+    def test_registry_shape(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            SCREENING_REGISTRY,
+            _make_rls_head_identmap_learner,
+            _rls_head_frozen_probe_input,
+        )
+
+        spec = SCREENING_REGISTRY[
+            "rls_head_resid_identmap50_r_idet003_s005625"
+        ]
+        assert spec.factory is _make_rls_head_identmap_learner
+        assert spec.frozen_probe_input is _rls_head_frozen_probe_input
+        parent = screening_spec("rls_head_resid_identmap50_r")
+        assert set(spec.hyperparameters) == set(parent.hyperparameters) | {
+            "ident_reset_frac"
+        }
+        for key, value in parent.hyperparameters.items():
+            expected = value
+            if key == "step_size":
+                expected = 0.005625
+            assert spec.hyperparameters[key] == expected, key
+        assert spec.hyperparameters["ident_reset_frac"] == 0.03
+        assert spec.hyperparameters["gate_scale"] == 1.0
+        assert spec.hyperparameters["rls_reset_frac"] == 0.05
+
+    def test_step_restored_pin_bitwise(self, small_data):
+        """``step_size = 0.01`` follows the gated idet003 composition."""
+        x, y = small_data
+        base = screening_spec("rls_head_resid_identmap50_r")
+        idet003 = replace(
+            base,
+            name=base.name + "_idet003_test",
+            hyperparameters={**base.hyperparameters, "ident_reset_frac": 0.03},
+        )
+        expected = run_screening_config(
+            x, y, idet003, seed=7, config=SMALL,
+        )
+        pinned = run_screening_config(
+            x, y, self._spec(step_size=0.01), seed=7, config=SMALL,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_accuracy),
+            np.asarray(expected.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_loss),
+            np.asarray(expected.per_task_loss),
+        )
+
+    def test_ident_frac_restored_pin_bitwise(self, small_data):
+        """``ident_reset_frac = 0.05`` follows the gated composition
+        at the same step size."""
+        x, y = small_data
+        base = screening_spec("rls_head_resid_identmap50_r")
+        s005625 = replace(
+            base,
+            name=base.name + "_s005625_test",
+            hyperparameters={**base.hyperparameters, "step_size": 0.005625},
+        )
+        expected = run_screening_config(
+            x, y, s005625, seed=7, config=SMALL,
+        )
+        pinned = run_screening_config(
+            x, y, self._spec(ident_reset_frac=0.05), seed=7, config=SMALL,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_accuracy),
+            np.asarray(expected.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_loss),
+            np.asarray(expected.per_task_loss),
+        )
+
+    def test_ident_off_pin_bitwise(self, small_data):
+        """Identifier disabled follows the gated incumbent at the same
+        step size."""
+        x, y = small_data
+        incumbent = screening_spec("rls_head_resid_l1_preset005")
+        incumbent_s = replace(
+            incumbent,
+            name=incumbent.name + "_s005625_test",
+            hyperparameters={
+                **incumbent.hyperparameters, "step_size": 0.005625,
+            },
+        )
+        expected = run_screening_config(
+            x, y, incumbent_s, seed=7, config=SMALL,
+        )
+        pinned = run_screening_config(
+            x, y,
+            self._spec(
+                ident_match_at=0.0, ident_match2=0.0, ident_match3=0.0
+            ),
+            seed=7, config=SMALL,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_accuracy),
+            np.asarray(expected.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_loss),
+            np.asarray(expected.per_task_loss),
+        )
+
+    def test_finite_smoke(self, small_data):
+        x, y = small_data
+        result = run_screening_config(
+            x, y,
+            screening_spec("rls_head_resid_identmap50_r_idet003_s005625"),
+            seed=7, config=SMALL,
+        )
+        assert np.all(np.isfinite(np.asarray(result.per_task_accuracy)))
+        assert np.all(np.isfinite(np.asarray(result.per_task_loss)))
+
+
+class TestAnnealSweepRegistry:
+    """Anneal schedule sweep arms: registry-only variants of the parent."""
+
+    PARENT = "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+
+    @pytest.mark.parametrize(
+        "tag, floor, tau",
+        [("f2t2000", 0.0028125, 2000.0), ("f4t1000", 0.00140625, 1000.0)],
+    )
+    def test_arm_differs_from_parent_only_in_schedule(self, tag, floor, tau):
+        parent = screening_spec(self.PARENT).hyperparameters
+        arm = screening_spec(
+            f"rls_head_resid_identmap50_r_idet003_s005625_anneal_{tag}"
+        ).hyperparameters
+        assert arm == {**parent, "anneal_floor": floor, "anneal_tau": tau}
+
+    def test_gentler_arm_live_and_distinct(self):
+        """f2t2000 runs the live anneal path and differs from the parent on
+        the shift stream (stays above the parent's step for s > 0)."""
+        x, y = TestRLSHeadIdentMapStepAnneal._offset_data()
+        res = {}
+        for name in (self.PARENT,
+                     "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t2000"):
+            spec = screening_spec(name)
+            spec = replace(spec, hyperparameters={
+                **spec.hyperparameters, "ident_match_at": 10.0,
+                "ident_match2": 0.0, "ident_match3": 0.0,
+                "anneal_tau": spec.hyperparameters["anneal_tau"] / 500.0})
+            res[name] = run_screening_config(x, y, spec, seed=7, config=SMALL)
+        a, b = (np.asarray(r.per_task_loss) for r in res.values())
+        assert np.all(np.isfinite(b)) and not np.array_equal(a, b)
+
+
+class TestRLSHeadIdentMapStepAnneal:
+    """Within-task body step anneal keyed on since_shift (anneal wave).
+
+    The reduction pin runs the LIVE schedule (keys present,
+    ``anneal_floor == step_size``, short tau) on a stream where the
+    detector and identifier fire, and requires bitwise equality with the
+    PARENT.
+    """
+
+    PARENT = "rls_head_resid_identmap50_r_idet003_s005625"
+
+    @staticmethod
+    def _offset_data():
+        key = jr.key(4321)
+        kx, ky = jr.split(key)
+        offsets = jnp.linspace(-2.0, 2.0, SMALL.input_dim)
+        x = np.asarray(
+            jr.uniform(kx, (64, SMALL.input_dim), jnp.float32, -0.3, 0.3)
+            + offsets[None, :]
+        )
+        y = np.asarray(jr.randint(ky, (64,), 0, SMALL.n_classes))
+        return x, y
+
+    @classmethod
+    def _spec(cls, **overrides):
+        spec = screening_spec(cls.PARENT)
+        return replace(
+            spec,
+            name=spec.name + "_anneal_test",
+            hyperparameters={
+                **spec.hyperparameters,
+                "ident_match_at": 10.0, "ident_match2": 0.0,
+                "ident_match3": 0.0, **overrides,
+            },
+        )
+
+    def _run(self, **overrides):
+        x, y = self._offset_data()
+        return run_screening_config(
+            x, y, self._spec(**overrides), seed=7, config=SMALL
+        )
+
+    def test_stream_exercises_identifier(self):
+        """The pin stream really remaps: disabling the identifier moves
+        the parent's trajectory."""
+        parent = self._run()
+        no_ident = self._run(ident_match_at=0.0)
+        assert not np.array_equal(
+            np.asarray(parent.per_task_loss), np.asarray(no_ident.per_task_loss)
+        )
+
+    def test_off_live_path_pin_bitwise(self):
+        """``anneal_floor == step_size`` through the live schedule is the
+        parent bit-exactly."""
+        parent = self._run()
+        off = self._run(anneal_floor=0.005625, anneal_tau=2.0)
+        np.testing.assert_array_equal(
+            np.asarray(off.per_task_accuracy),
+            np.asarray(parent.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(off.per_task_loss), np.asarray(parent.per_task_loss)
+        )
+
+    def test_mechanism_live(self):
+        """A real floor below the step diverges from the parent."""
+        parent = self._run()
+        ann = self._run(anneal_floor=0.00140625, anneal_tau=2.0)
+        assert not np.array_equal(
+            np.asarray(ann.per_task_loss), np.asarray(parent.per_task_loss)
+        )
+        assert np.all(np.isfinite(np.asarray(ann.per_task_loss)))
+
+    def test_rejects_bad_settings(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_identmap_learner,
+        )
+
+        for bad in ({"anneal_floor": 0.0}, {"anneal_floor": 0.01},
+                    {"anneal_tau": 0.0}, {"anneal_tau": float("inf")}):
+            hp = {**self._spec(anneal_floor=0.0028125, anneal_tau=250.0)
+                  .hyperparameters, **bad}
+            with pytest.raises(ValueError):
+                _make_rls_head_identmap_learner(hp)
+
+
+class TestRLSHeadIdentMapPolyak:
+    """Polyak-style body iterate averaging on the anneal_f2t1000 parent.
+
+    The reduction pin runs the LIVE averaging path (``polyak_window = 1``,
+    both head settings) on a stream where the detector fires and the
+    identifier remaps, and requires bitwise equality with the PARENT.
+    """
+
+    PARENT = "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+
+    @classmethod
+    def _spec(cls, **overrides):
+        spec = screening_spec(cls.PARENT)
+        return replace(
+            spec,
+            name=spec.name + "_polyak_test",
+            hyperparameters={
+                **spec.hyperparameters,
+                "ident_match_at": 10.0, "ident_match2": 0.0,
+                "ident_match3": 0.0, "anneal_tau": 2.0, **overrides,
+            },
+        )
+
+    def _run(self, **overrides):
+        x, y = TestRLSHeadIdentMapStepAnneal._offset_data()
+        return run_screening_config(
+            x, y, self._spec(**overrides), seed=7, config=SMALL
+        )
+
+    def test_stream_exercises_identifier(self):
+        parent = self._run()
+        no_ident = self._run(ident_match_at=0.0)
+        assert not np.array_equal(
+            np.asarray(parent.per_task_loss), np.asarray(no_ident.per_task_loss)
+        )
+
+    @pytest.mark.parametrize("head_avg", [0.0, 1.0])
+    def test_window_one_live_path_pin_bitwise(self, head_avg):
+        """``polyak_window = 1`` through the live average is the parent
+        bit-exactly, for both head settings."""
+        parent = self._run()
+        off = self._run(polyak_window=1.0, polyak_head_avg=head_avg)
+        np.testing.assert_array_equal(
+            np.asarray(off.per_task_accuracy),
+            np.asarray(parent.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(off.per_task_loss), np.asarray(parent.per_task_loss)
+        )
+
+    @pytest.mark.parametrize("head_avg", [0.0, 1.0])
+    def test_mechanism_live(self, head_avg):
+        """A real window diverges from the parent and stays finite."""
+        parent = self._run()
+        arm = self._run(polyak_window=8.0, polyak_head_avg=head_avg)
+        assert not np.array_equal(
+            np.asarray(arm.per_task_loss), np.asarray(parent.per_task_loss)
+        )
+        assert np.all(np.isfinite(np.asarray(arm.per_task_loss)))
+        if head_avg == 0.0:
+            np.testing.assert_array_equal(arm.per_task_plasticity, parent.per_task_plasticity)
+
+    def test_avg_resets_at_shift_and_remap(self):
+        """Direct state check: after a remap step the average equals the
+        raw body exactly and the counter is 1."""
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_identmap_learner,
+        )
+
+        x, y = TestRLSHeadIdentMapStepAnneal._offset_data()
+        hp = dict(self._spec(polyak_window=4.0).hyperparameters)
+        init_fn, step_fn = _make_rls_head_identmap_learner(hp)
+        params = init_mlp_params(jr.key(0), SMALL)
+        state = init_fn(params)
+        step_fn = jax.jit(step_fn)
+        saw_reset = saw_avg = False
+        for t in range(x.shape[0]):
+            prev_remap = np.asarray(state.ident.remap)
+            params, state, _ = step_fn(
+                params, state, jnp.asarray(x[t]), jnp.asarray(y[t]), jr.key(t)
+            )
+            reset = int(state.ident.since_shift) == 1 or not np.array_equal(
+                prev_remap, np.asarray(state.ident.remap)
+            )
+            if reset:
+                saw_reset = True
+                assert int(state.avg_n) == 1
+                for k in state.avg:
+                    np.testing.assert_array_equal(
+                        np.asarray(state.avg[k]), np.asarray(params[k])
+                    )
+            elif int(state.avg_n) > 1:
+                saw_avg = True
+        assert saw_reset and saw_avg
+
+    def test_rejects_bad_settings(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_identmap_learner,
+        )
+
+        base = self._spec(polyak_window=100.0).hyperparameters
+        for bad in ({"polyak_window": 0.0}, {"polyak_window": 2.5},
+                    {"polyak_window": float("inf")},
+                    {"polyak_head_avg": 0.5}, {"ident_match_at": 0.0},
+                    {"rls_head_sgd": 1.0}):
+            with pytest.raises(ValueError):
+                _make_rls_head_identmap_learner({**base, **bad})
+        with pytest.raises(ValueError, match="L2-Init"):
+            _make_rls_head_identmap_learner(dict(base), _decay_to_init=True)
+
+
+class TestRLSHeadIdentMapAutostep:
+    """Autostep per-weight body step sizes on idet003_s005625.
+
+    Preregistered in
+    ``outputs/ipmnist_screening/wave_identmap50_r_idet003_s005625_autostep/``.
+    ``body_as_meta = 0`` must reproduce the parent bit-for-bit; a positive
+    meta rate must change the run and keep it finite.
+    """
+
+    PARENT = "rls_head_resid_identmap50_r_idet003_s005625"
+    ARMS = (PARENT + "_as1e3", PARENT + "_as1e2")
+
+    def test_registry_shape(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            SCREENING_REGISTRY,
+            _make_rls_head_identmap_learner,
+        )
+
+        parent = SCREENING_REGISTRY[self.PARENT]
+        for name, meta in zip(self.ARMS, (1e-3, 1e-2), strict=True):
+            spec = SCREENING_REGISTRY[name]
+            assert spec.factory is _make_rls_head_identmap_learner
+            assert set(spec.hyperparameters) == set(parent.hyperparameters) | {
+                "body_as_meta", "body_as_tau"
+            }
+            for key, value in parent.hyperparameters.items():
+                assert spec.hyperparameters[key] == value, key
+            assert spec.hyperparameters["body_as_meta"] == meta
+            assert spec.hyperparameters["body_as_tau"] == 1e4
+
+    @pytest.mark.parametrize("arm", ARMS)
+    def test_meta_zero_pin_bitwise(self, small_data, arm):
+        """``body_as_meta = 0`` reproduces the parent bit-for-bit."""
+        x, y = small_data
+        spec = screening_spec(arm)
+        inert = replace(
+            spec,
+            name=spec.name + "_meta0_test",
+            hyperparameters={**spec.hyperparameters, "body_as_meta": 0.0},
+        )
+        expected = run_screening_config(
+            x, y, screening_spec(self.PARENT), seed=7, config=SMALL,
+        )
+        pinned = run_screening_config(x, y, inert, seed=7, config=SMALL)
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_accuracy),
+            np.asarray(expected.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_loss),
+            np.asarray(expected.per_task_loss),
+        )
+
+    def test_mechanism_live_and_finite(self, small_data):
+        x, y = small_data
+        parent = run_screening_config(
+            x, y, screening_spec(self.PARENT), seed=7, config=SMALL,
+        )
+        result = run_screening_config(
+            x, y, screening_spec(self.ARMS[1]), seed=7, config=SMALL,
+        )
+        assert np.all(np.isfinite(np.asarray(result.per_task_accuracy)))
+        assert np.all(np.isfinite(np.asarray(result.per_task_loss)))
+        assert not np.array_equal(
+            np.asarray(result.per_task_loss), np.asarray(parent.per_task_loss)
+        )
+
+    def test_rejects_invalid(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_learner,
+        )
+
+        hp = dict(screening_spec(self.ARMS[0]).hyperparameters)
+        with pytest.raises(ValueError, match="body_as_meta"):
+            _make_rls_head_learner({**hp, "body_as_meta": -1.0})
+        with pytest.raises(ValueError, match="body_as_tau"):
+            _make_rls_head_learner({**hp, "body_as_tau": 0.5})
+        with pytest.raises(ValueError, match="gated residual body"):
+            _make_rls_head_learner({**hp, "gate_scale": 0.0})
+        with pytest.raises(ValueError, match="fixed-step"):
+            _make_rls_head_learner({**hp, "anneal_floor": 0.0028125, "anneal_tau": 1000.0})
+
+
+class TestRLSHeadIdentMapShrinkPerturb:
+    """Shrink & Perturb at the identifier's first remap (S&P wave).
+
+    The reduction pin runs the LIVE S&P path (keys present,
+    ``snp_shrink = 1, snp_sigma = 0``) on a stream where the identifier
+    provably fires, and requires bitwise equality with the parent.
+    """
+
+    PARENT = "rls_head_resid_identmap50_r_idet003_s005625"
+
+    @staticmethod
+    def _offset_data():
+        key = jr.key(4321)
+        kx, ky = jr.split(key)
+        offsets = jnp.linspace(-2.0, 2.0, SMALL.input_dim)
+        x = np.asarray(
+            jr.uniform(kx, (64, SMALL.input_dim), jnp.float32, -0.3, 0.3)
+            + offsets[None, :]
+        )
+        y = np.asarray(jr.randint(ky, (64,), 0, SMALL.n_classes))
+        return x, y
+
+    @classmethod
+    def _spec(cls, **overrides):
+        spec = screening_spec(cls.PARENT)
+        return replace(
+            spec,
+            name=spec.name + "_snp_test",
+            hyperparameters={
+                **spec.hyperparameters,
+                "ident_match_at": 10.0, "ident_match2": 0.0,
+                "ident_match3": 0.0, **overrides,
+            },
+        )
+
+    def test_off_live_path_pin_bitwise(self):
+        """``snp_shrink = 1, snp_sigma = 0`` through the live path is the
+        parent bit-exactly, on a stream where the remap fires."""
+        x, y = self._offset_data()
+        parent = run_screening_config(x, y, self._spec(), seed=7, config=SMALL)
+        off = run_screening_config(
+            x, y, self._spec(snp_shrink=1.0, snp_sigma=0.0),
+            seed=7, config=SMALL,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(off.per_task_accuracy),
+            np.asarray(parent.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(off.per_task_loss), np.asarray(parent.per_task_loss)
+        )
+
+    def test_helper_identity_bitwise(self):
+        """The body transform at (1, 0) returns every tensor bitwise."""
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _shrink_perturb_body,
+        )
+
+        params = init_mlp_params(jr.key(3), SMALL)
+        out = _shrink_perturb_body(
+            params, jnp.bool_(True), jr.key(9), 1.0, 0.0
+        )
+        for name, value in params.items():
+            np.testing.assert_array_equal(
+                np.asarray(out[name]), np.asarray(value)
+            )
+
+    def test_helper_event_gating(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _shrink_perturb_body,
+        )
+
+        params = init_mlp_params(jr.key(3), SMALL)
+        idle = _shrink_perturb_body(
+            params, jnp.bool_(False), jr.key(9), 0.5, 0.1
+        )
+        fired = _shrink_perturb_body(
+            params, jnp.bool_(True), jr.key(9), 0.5, 0.1
+        )
+        for name in ("w1", "b1", "w2", "b2"):
+            np.testing.assert_array_equal(
+                np.asarray(idle[name]), np.asarray(params[name])
+            )
+            bound = 1.0 / math.sqrt(params[f"w{name[1:]}"].shape[0])
+            delta = np.asarray(fired[name]) - 0.5 * np.asarray(params[name])
+            assert np.all(np.abs(delta) <= 0.1 * bound + 1e-6)
+        for name in params:
+            if name not in ("w1", "b1", "w2", "b2"):
+                np.testing.assert_array_equal(
+                    np.asarray(fired[name]), np.asarray(params[name])
+                )
+
+    def test_mechanism_live(self):
+        """With a real shrink the trajectory diverges from the parent (the
+        event fires inside the scanned loop; on this offset stream the
+        detector already fires during task 0's warm-up)."""
+        x, y = self._offset_data()
+        parent = run_screening_config(x, y, self._spec(), seed=7, config=SMALL)
+        snp = run_screening_config(
+            x, y, self._spec(snp_shrink=0.5, snp_sigma=0.1),
+            seed=7, config=SMALL,
+        )
+        assert not np.array_equal(
+            np.asarray(snp.per_task_loss), np.asarray(parent.per_task_loss)
+        )
+        assert np.all(np.isfinite(np.asarray(snp.per_task_loss)))
+
+    def test_rejects_bad_settings(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_identmap_learner,
+        )
+
+        for bad in (
+            {"snp_shrink": 0.0}, {"snp_shrink": 1.5}, {"snp_shrink": 1e-100},
+            {"snp_sigma": -0.1}, {"snp_sigma": 1e39}, {"ident_match_at": 0.0},
+            {"body_wclip_kappa": 2.0},
+        ):
+            hp = {**self._spec(snp_shrink=0.8, snp_sigma=0.01)
+                  .hyperparameters, **bad}
+            with pytest.raises(ValueError):
+                _make_rls_head_identmap_learner(hp)
+
+
+class TestRLSHeadIdentMapAnnealPeak:
+    """Protect the screened peak mechanism and its parent reduction."""
+
+    @staticmethod
+    def _spec():
+        return TestRLSHeadIdentMapStepAnneal._spec(
+            anneal_floor=0.0028125, anneal_tau=1000.0,
+        )
+
+    def test_peak_reduces_to_parent_and_changes_step_when_enabled(self):
+        x, y = TestRLSHeadIdentMapStepAnneal._offset_data()
+        spec = self._spec()
+
+        def run(arm):
+            return run_screening_config(x, y, arm, seed=7, config=SMALL)
+
+        parent = run(spec)
+        pinned = run(replace(
+            spec, hyperparameters={**spec.hyperparameters, "anneal_peak": 0.005625},
+        ))
+        changed = run(replace(
+            spec, hyperparameters={**spec.hyperparameters, "anneal_peak": 0.015},
+        ))
+        np.testing.assert_array_equal(pinned.per_task_accuracy, parent.per_task_accuracy)
+        np.testing.assert_array_equal(pinned.per_task_loss, parent.per_task_loss)
+        assert not np.array_equal(changed.per_task_loss, parent.per_task_loss)
+        assert np.all(np.isfinite(changed.per_task_loss))
+
+    def test_rejects_bad_settings(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_identmap_learner,
+        )
+
+        base = self._spec().hyperparameters
+        for peak in (0.001, 0.0, -0.01, 1e39, float("inf"), float("nan")):
+            with pytest.raises(ValueError, match="anneal_peak"):
+                _make_rls_head_identmap_learner({**base, "anneal_peak": peak})
+        without_anneal = {key: value for key, value in base.items() if key != "anneal_floor"}
+        with pytest.raises(ValueError, match="anneal_peak"):
+            _make_rls_head_identmap_learner({**without_anneal, "anneal_peak": 0.01})
+        with pytest.raises(ValueError, match="anneal_peak"):
+            _make_rls_head_identmap_learner({
+                **base, "ident_match_at": 0.0, "anneal_peak": 0.01,
+            })
+
+
+class TestPlasticityCounterSaturation:
+    """Per-unit plasticity counters must saturate via the declared helper.
+
+    ``state.silence*`` and ``state.age*``/``cbp.age*`` are ``int32`` lifetime
+    counters that reset to ``0`` on firing/replacement but grow
+    monotonically otherwise. A plain ``+ 1`` wraps ``2147483647 -> -2147483648``;
+    the canonical ``_saturating_int32_counter_increment`` caps at ``2147483647``.
+    """
+
+    def test_plasticity_counters_saturate(self):
+        import jax.numpy as jnp
+
+        from alberta_framework.core.normalizers import (
+            _saturating_int32_counter_increment,
+        )
+
+        int_max = jnp.array(2_147_483_647, dtype=jnp.int32)
+        assert int(_saturating_int32_counter_increment(int_max)) == 2_147_483_647
+        assert int(int_max + jnp.array(1, dtype=jnp.int32)) == -2_147_483_648
+        # silence path: where(fired,0, inc(silence))
+        fired = jnp.array(False)
+        silence = jnp.array(2_147_483_647, dtype=jnp.int32)
+        plain = jnp.where(fired, 0, silence + jnp.array(1, dtype=jnp.int32))
+        safe = jnp.where(fired, 0, _saturating_int32_counter_increment(silence))
+        assert int(plain) == -2_147_483_648
+        assert int(safe) == 2_147_483_647
+
+    def test_helper_is_reused_by_name(self):
+        text = Path("alberta_framework/benchmarks/ipmnist_screening.py").read_text()
+        assert (
+            "from alberta_framework.core.normalizers import _saturating_int32_counter_increment"
+            in text
+        )
+        # per-unit sites must use helper
+        assert "state.silence1 + 1" not in text
+        assert "state.silence2 + 1" not in text
+        assert "state.age1 + 1" not in text
+        assert "cbp.age1 + 1" not in text
+class TestRLSHeadSMPrecond:
+    """Second-moment body preconditioning under the identmap frame
+    (smprecond_r1 preregistration).
+
+    House convention: the bit-exact reduction pin ships with the mechanism,
+    failing-test-first.
+    """
+
+    @staticmethod
+    def _sm_spec(**overrides):
+        spec = screening_spec("rls_head_resid_l1_preset005")
+        return replace(
+            spec,
+            name=spec.name + "_sm_test",
+            hyperparameters={**spec.hyperparameters, **overrides},
+        )
+
+    def test_reduction_pin_bitwise(self, small_data):
+        """``body_sm_decay = 0`` is the incumbent, bit for bit."""
+        x, y = small_data
+        incumbent = run_screening_config(
+            x, y, screening_spec("rls_head_resid_l1_preset005"),
+            seed=7, config=SMALL,
+        )
+        pinned = run_screening_config(
+            x, y,
+            self._sm_spec(
+                body_sm_decay=0.0, body_sm_step=0.001, body_sm_eps=1e-8
+            ),
+            seed=7, config=SMALL,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_accuracy),
+            np.asarray(incumbent.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_loss),
+            np.asarray(incumbent.per_task_loss),
+        )
+
+    def test_mechanism_live_and_finite(self, small_data):
+        """With the second moment enabled the trajectory diverges from the
+        incumbent and stays finite."""
+        x, y = small_data
+        incumbent = run_screening_config(
+            x, y, screening_spec("rls_head_resid_l1_preset005"),
+            seed=7, config=SMALL,
+        )
+        sm = run_screening_config(
+            x, y,
+            self._sm_spec(
+                body_sm_decay=0.999, body_sm_step=0.001, body_sm_eps=1e-8
+            ),
+            seed=7, config=SMALL,
+        )
+        acc = np.asarray(sm.per_task_accuracy)
+        assert np.all(np.isfinite(acc))
+        assert np.all((acc >= 0.0) & (acc <= 1.0))
+        assert not np.array_equal(acc, np.asarray(incumbent.per_task_accuracy))
+
+    def test_requires_gated_residual_body(self):
+        """The preconditioner is registered for the gated residual body only."""
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_learner,
+            _rls_head_hp,
+        )
+
+        with pytest.raises(ValueError):
+            _make_rls_head_learner(
+                _rls_head_hp(
+                    head_resid=0.0, body_sm_decay=0.999,
+                    body_sm_step=0.001, body_sm_eps=1e-8,
+                )
+            )
+        with pytest.raises(ValueError):
+            _make_rls_head_learner(
+                _rls_head_hp(
+                    head_resid=1.0, gate_scale=0.0, body_sm_decay=0.999,
+                    body_sm_step=0.001, body_sm_eps=1e-8,
+                )
+            )
+
+    def test_composes_under_identmap(self, small_data):
+        """The identmap factory passes the sm knobs through to the body:
+        ``ident_match_at = 0`` + inert sm is still the incumbent bitwise."""
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_identmap_learner,
+        )
+
+        x, y = small_data
+        spec = screening_spec("rls_head_resid_identmap50_r")
+        composed = replace(
+            spec,
+            name=spec.name + "_sm_test",
+            hyperparameters={
+                **spec.hyperparameters,
+                "ident_match_at": 0.0, "ident_match2": 0.0,
+                "ident_match3": 0.0, "body_sm_decay": 0.0,
+                "body_sm_step": 0.001, "body_sm_eps": 1e-8,
+            },
+        )
+        assert spec.factory is _make_rls_head_identmap_learner
+        incumbent = run_screening_config(
+            x, y, screening_spec("rls_head_resid_l1_preset005"),
+            seed=7, config=SMALL,
+        )
+        pinned = run_screening_config(x, y, composed, seed=7, config=SMALL)
+        np.testing.assert_array_equal(
+            np.asarray(pinned.per_task_accuracy),
+            np.asarray(incumbent.per_task_accuracy),
+        )
+
+    def test_registry_arms_deregistered(self):
+        """The smprecond_r1 screen arms are deregistered after the failed
+        200-task confirmation (negative result #23); the mechanism and its
+        reduction pins remain."""
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            SCREENING_REGISTRY,
+        )
+
+        assert "rls_head_resid_sm3e4_i50r" not in SCREENING_REGISTRY
+        assert "rls_head_resid_sm1e3_i50r" not in SCREENING_REGISTRY
+
+
+class TestRLSHeadIdentMapAnnealPartialReset:
+    """Partial anneal reset (``anneal_reset_frac``) on anneal_f2t1000.
+
+    Pins: f = 0 is the parent bit-exactly; a deliberate f > 0 moves the
+    trajectory on a stream where the detector fires; invalid f rejected.
+    The pin stream uses a short tau so the clock difference reaches the
+    step within the 64-sample stream.
+    """
+
+    PARENT = "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+    # Reuse the anneal pin stream and helpers (not its tests).
+    _offset_data = staticmethod(TestRLSHeadIdentMapStepAnneal._offset_data)
+    _spec = classmethod(TestRLSHeadIdentMapStepAnneal._spec.__func__)
+    _run = TestRLSHeadIdentMapStepAnneal._run
+
+    def test_stream_fires_detector(self):
+        """The pin stream moves the parent off the no-identifier path."""
+        assert not np.array_equal(
+            np.asarray(self._run().per_task_loss),
+            np.asarray(self._run(ident_match_at=0.0).per_task_loss),
+        )
+
+    def test_registered_arms(self):
+        for tag, frac in (("25", 0.25), ("50", 0.5)):
+            spec = screening_spec(self.PARENT + f"_pr{tag}")
+            assert spec.hyperparameters["anneal_reset_frac"] == frac
+            parent = screening_spec(self.PARENT).hyperparameters
+            rest = dict(spec.hyperparameters)
+            del rest["anneal_reset_frac"]
+            assert rest == parent
+
+    def test_frac_zero_pin_bitwise(self):
+        parent = self._run(anneal_tau=2.0)
+        off = self._run(anneal_tau=2.0, anneal_reset_frac=0.0)
+        np.testing.assert_array_equal(
+            np.asarray(off.per_task_accuracy),
+            np.asarray(parent.per_task_accuracy),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(off.per_task_loss), np.asarray(parent.per_task_loss)
+        )
+
+    def test_deliberate_break_differs(self):
+        parent = self._run(anneal_tau=2.0)
+        on = self._run(anneal_tau=2.0, anneal_reset_frac=0.9)
+        assert not np.array_equal(
+            np.asarray(on.per_task_loss), np.asarray(parent.per_task_loss)
+        )
+
+    @pytest.mark.parametrize("frac", [-0.1, 1.0, 1.5, float("nan")])
+    def test_invalid_frac_rejected(self, frac):
+        # NaN is already refused by the generic finite-number guard.
+        with pytest.raises(ValueError, match="anneal_reset_frac|finite"):
+            self._run(anneal_reset_frac=frac)
+
+    def test_frac_requires_anneal(self):
+        spec = screening_spec(self.PARENT)
+        hp = {k: v for k, v in spec.hyperparameters.items()
+              if k not in ("anneal_floor", "anneal_tau")}
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_identmap_learner,
+        )
+
+        with pytest.raises(ValueError, match="anneal_reset_frac"):
+            _make_rls_head_identmap_learner({**hp, "anneal_reset_frac": 0.5})
+
+
+class TestRLSHeadIdentMapAnnealDecayDecoupled:
+    """Decoupled-decay control (``anneal_decay_reset_frac``) for pr50.
+
+    Pins on the anneal pin stream (short tau so clocks reach the step):
+    f_d == f_s is the coupled partial-reset arm bit-exactly; f_s = f_d = 0
+    is the parent bit-exactly; a deliberate f_d != f_s differs; invalid
+    values rejected.
+    """
+
+    PARENT = "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+    _offset_data = staticmethod(TestRLSHeadIdentMapStepAnneal._offset_data)
+    _spec = classmethod(TestRLSHeadIdentMapStepAnneal._spec.__func__)
+    _run = TestRLSHeadIdentMapStepAnneal._run
+
+    @staticmethod
+    def _same(a, b):
+        np.testing.assert_array_equal(
+            np.asarray(a.per_task_accuracy), np.asarray(b.per_task_accuracy)
+        )
+        np.testing.assert_array_equal(
+            np.asarray(a.per_task_loss), np.asarray(b.per_task_loss)
+        )
+
+    def test_registered_arms(self):
+        pr50 = screening_spec(self.PARENT + "_pr50").hyperparameters
+        for tag, f_s, f_d in (("steponly", 0.5, 0.0), ("decayonly", 0.0, 0.5)):
+            hp = dict(screening_spec(self.PARENT + f"_pr50_{tag}").hyperparameters)
+            assert hp.pop("anneal_decay_reset_frac") == f_d
+            assert hp.pop("anneal_reset_frac") == f_s
+            rest = dict(pr50)
+            del rest["anneal_reset_frac"]
+            assert hp == rest
+
+    def test_matched_fracs_equal_coupled_arm_bitwise(self):
+        coupled = self._run(anneal_tau=2.0, anneal_reset_frac=0.5)
+        matched = self._run(
+            anneal_tau=2.0, anneal_reset_frac=0.5, anneal_decay_reset_frac=0.5
+        )
+        self._same(matched, coupled)
+
+    def test_zero_fracs_equal_parent_bitwise(self):
+        parent = self._run(anneal_tau=2.0)
+        zero = self._run(
+            anneal_tau=2.0, anneal_reset_frac=0.0, anneal_decay_reset_frac=0.0
+        )
+        self._same(zero, parent)
+
+    def test_deliberate_break_differs(self):
+        # Keep the schedules above the common floor long enough for the decay
+        # rates to separate on this short stream.
+        options = dict(anneal_tau=32.0, anneal_reset_frac=0.5, weight_decay=1.0)
+        coupled = self._run(**options)
+        split = self._run(**options, anneal_decay_reset_frac=0.9)
+        assert not np.array_equal(
+            np.asarray(split.per_task_loss), np.asarray(coupled.per_task_loss)
+        )
+
+    @pytest.mark.parametrize("frac", [-0.1, 1.0, 2.0, float("nan")])
+    def test_invalid_frac_rejected(self, frac):
+        with pytest.raises(ValueError, match="anneal_decay_reset_frac|finite"):
+            self._run(anneal_reset_frac=0.5, anneal_decay_reset_frac=frac)
+
+    def test_requires_partial_reset_key(self):
+        with pytest.raises(ValueError, match="anneal_decay_reset_frac"):
+            self._run(anneal_decay_reset_frac=0.5)
+
+
+class TestRLSHeadIdentMapAnnealConstantWeightDecay:
+    """Plain constant weight_decay arms on anneal_f2t1000 (decayonly_fresh).
+
+    The arm differs from the parent only in ``weight_decay``; the registered
+    0.01 override is the parent bit-exactly, a lower value differs, invalid
+    values are rejected.
+    """
+
+    PARENT = "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+    _offset_data = staticmethod(TestRLSHeadIdentMapStepAnneal._offset_data)
+    _spec = classmethod(TestRLSHeadIdentMapStepAnneal._spec.__func__)
+    _run = TestRLSHeadIdentMapStepAnneal._run
+    _same = staticmethod(TestRLSHeadIdentMapAnnealDecayDecoupled._same)
+
+    def test_registered_arms(self):
+        parent = dict(screening_spec(self.PARENT).hyperparameters)
+        assert parent["weight_decay"] == 0.01
+        for tag, wd in (
+            ("00084", 0.0084), ("0005", 0.005), ("00025", 0.0025),
+            ("0001", 0.001), ("0", 0.0),
+        ):
+            hp = dict(screening_spec(self.PARENT + f"_wd{tag}").hyperparameters)
+            assert hp.pop("weight_decay") == wd
+            rest = dict(parent)
+            del rest["weight_decay"]
+            assert hp == rest
+
+    def test_parent_value_equals_parent_bitwise(self):
+        parent = self._run(anneal_tau=2.0)
+        same = self._run(anneal_tau=2.0, weight_decay=0.01)
+        self._same(same, parent)
+
+    def test_lower_decay_differs(self):
+        parent = self._run(anneal_tau=2.0)
+        lower = self._run(anneal_tau=2.0, weight_decay=0.0084)
+        assert not np.array_equal(
+            np.asarray(lower.per_task_loss), np.asarray(parent.per_task_loss)
+        )
+
+    @pytest.mark.parametrize("wd", [-0.01, float("nan"), float("inf")])
+    def test_invalid_weight_decay_rejected(self, wd):
+        with pytest.raises(ValueError, match="weight_decay|finite"):
+            self._run(weight_decay=wd)
+
+    @pytest.mark.parametrize("wd", [0.005, 0.0025, 0.001, 0.0])
+    def test_sweep_value_differs_and_is_finite(self, wd):
+        parent = self._run(anneal_tau=2.0)
+        arm = self._run(anneal_tau=2.0, weight_decay=wd)
+        loss = np.asarray(arm.per_task_loss)
+        assert np.all(np.isfinite(loss))
+        assert np.all(np.isfinite(np.asarray(arm.per_task_accuracy)))
+        assert not np.array_equal(loss, np.asarray(parent.per_task_loss))
+
+
+class TestRLSHeadIdentMapAnnealWd0FloorRegistry:
+    """Anneal-floor retune arms on anneal_f2t1000_wd0 (wd0_floor_retune/).
+
+    Each arm differs from the wd0 parent only in ``anneal_floor``; at
+    weight_decay 0 the decay is exactly 1 on both branches of the coupling.
+    """
+
+    PARENT = "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+    WD0 = PARENT + "_wd0"
+    ARMS = (
+        ("f1t1000", 0.005625),
+        ("f4t1000", 0.00140625),
+        ("f8t1000", 0.000703125),
+    )
+
+    def _arm(self, tag):
+        return "rls_head_resid_identmap50_r_idet003_s005625_anneal_" + tag + "_wd0"
+
+    def test_registry_resolves_and_differs_only_in_floor(self):
+        wd0 = dict(screening_spec(self.WD0).hyperparameters)
+        for tag, floor in self.ARMS:
+            spec = screening_spec(self._arm(tag))
+            hp = dict(spec.hyperparameters)
+            assert hp.pop("anneal_floor") == floor
+            rest = dict(wd0)
+            del rest["anneal_floor"]
+            assert hp == rest
+            assert spec.factory is screening_spec(self.WD0).factory
+
+    def test_floor_values_relative_to_peak(self):
+        for (tag, floor), k in zip(self.ARMS, (1, 4, 8)):
+            hp = screening_spec(self._arm(tag)).hyperparameters
+            assert hp["step_size"] == 0.005625
+            assert hp["anneal_tau"] == 1000.0
+            assert floor * k == hp["step_size"]
+            assert 0.0 < hp["anneal_floor"] <= hp["step_size"]
+
+    def test_decay_exactly_one_at_wd0(self):
+        for tag, _ in self.ARMS:
+            hp = screening_spec(self._arm(tag)).hyperparameters
+            wd = hp["weight_decay"]
+            assert wd == 0.0
+            step = hp["step_size"]
+            assert 1.0 - step * wd == 1.0
+            for lr in (step, hp["anneal_floor"], step * 0.5):
+                d = 1.0 - jnp.float32(lr) * jnp.float32(wd)
+                assert np.asarray(d, dtype=np.float32) == np.float32(1.0)
+
+    def test_parent_configs_unchanged(self):
+        parent = dict(screening_spec(self.PARENT).hyperparameters)
+        assert parent["weight_decay"] == 0.01
+        assert parent["anneal_floor"] == 0.0028125
+        assert parent["anneal_tau"] == 1000.0
+        assert parent["step_size"] == 0.005625
+        wd0 = dict(screening_spec(self.WD0).hyperparameters)
+        assert wd0.pop("weight_decay") == 0.0
+        del parent["weight_decay"]
+        assert wd0 == parent
+
+
+class TestRLSHeadIdentMapWd0ConstStepRegistry:
+    """Constant-step size retune on anneal_f1t1000_wd0 (wd0_const_step_retune/).
+
+    Each arm differs from the incumbent only in ``step_size`` and
+    ``anneal_floor`` (kept equal, so the step is constant); at weight_decay 0
+    the body decay is exactly 1.
+    """
+
+    INCUMBENT = "rls_head_resid_identmap50_r_idet003_s005625_anneal_f1t1000_wd0"
+    ARMS = (("004", 0.004), ("0075", 0.0075), ("01", 0.01))
+
+    def _arm(self, tag):
+        return f"rls_head_resid_identmap50_r_idet003_s{tag}_anneal_f1t1000_wd0"
+
+    def test_registry_resolves_and_differs_only_in_step(self):
+        inc = dict(screening_spec(self.INCUMBENT).hyperparameters)
+        assert inc["step_size"] == inc["anneal_floor"] == 0.005625
+        assert inc["weight_decay"] == 0.0
+        for tag, step in self.ARMS:
+            spec = screening_spec(self._arm(tag))
+            hp = dict(spec.hyperparameters)
+            assert hp.pop("step_size") == step
+            assert hp.pop("anneal_floor") == step
+            rest = {k: v for k, v in inc.items() if k not in ("step_size", "anneal_floor")}
+            assert hp == rest
+            assert spec.factory is screening_spec(self.INCUMBENT).factory
+
+    def test_steps_distinct_in_float32(self):
+        steps = [np.float32(s) for _, s in self.ARMS] + [np.float32(0.005625)]
+        assert len(set(steps)) == 4
+
+    def test_schedule_constant_and_decay_one(self):
+        for tag, step in self.ARMS:
+            hp = screening_spec(self._arm(tag)).hyperparameters
+            for s in (0.0, 1.0, 999.0, 4999.0):
+                lr = jnp.maximum(
+                    jnp.float32(hp["anneal_floor"]),
+                    jnp.float32(hp["step_size"])
+                    * jax.lax.rsqrt(1.0 + jnp.float32(s) / jnp.float32(hp["anneal_tau"])),
+                )
+                assert np.asarray(lr) == np.float32(step)
+                d = 1.0 - lr * jnp.float32(hp["weight_decay"])
+                assert np.asarray(d, dtype=np.float32) == np.float32(1.0)
+
+
+class TestRLSHeadIdentMapWd0ConstStepExtendRegistry(TestRLSHeadIdentMapWd0ConstStepRegistry):
+    """Extended constant-step grid above the 0.01 winner (wd0_const_step_extend/)."""
+
+    ARMS = (("0125", 0.0125), ("015", 0.015), ("02", 0.02))
+
+    def test_steps_distinct_in_float32(self):
+        steps = [np.float32(s) for _, s in self.ARMS] + [np.float32(0.01)]
+        assert len(set(steps)) == 4
+
+
+def _load_step200_analyze():
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "outputs"
+        / "ipmnist_screening"
+        / "wd0_const_step_200task"
+        / "analyze.py"
+    )
+    spec = importlib.util.spec_from_file_location("step200_analyze", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestWd0ConstStep200TaskConfirm:
+    """Development rules for the 200-task constant-step confirmation."""
+
+    A = _load_step200_analyze()
+    OK = [0.95] * 200
+    LOSS = [0.1] * 200
+
+    def test_both_cells_registered(self):
+        reg = ipmnist_screening.SCREENING_REGISTRY
+        assert self.A.CAND in reg and self.A.INC in reg
+
+    def test_constants(self):
+        assert (
+            self.A.FLOOR == 0.5
+            and self.A.T19 == 2.093
+            and self.A.NTASK == 200
+            and self.A.BLOCK == 50
+        )
+        assert list(self.A.SEEDS) == list(range(134, 154))
+
+    def test_healthy_shard_passes(self):
+        assert self.A.classify(self.OK, self.LOSS) is None
+
+    def test_missing_shard_diverged(self):
+        assert "missing" in self.A.classify(None, None)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_accuracy_diverged(self, bad):
+        acc = list(self.OK)
+        acc[117] = bad
+        assert "non-finite accuracy" in self.A.classify(acc, self.LOSS)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_non_finite_loss_diverged(self, bad):
+        loss = list(self.LOSS)
+        loss[199] = bad
+        assert "non-finite loss" in self.A.classify(self.OK, loss)
+
+    def test_missing_loss_diverged(self):
+        assert "non-finite loss" in self.A.classify(self.OK, None)
+
+    def test_floor(self):
+        acc = list(self.OK)
+        acc[3] = 0.4999
+        assert "tasks [3]" in self.A.classify(acc, self.LOSS)
+        acc[3] = 0.5
+        assert self.A.classify(acc, self.LOSS) is None
+
+    def test_out_of_range_accuracy_diverged(self):
+        acc = list(self.OK)
+        acc[0] = 1.5
+        assert "outside" in self.A.classify(acc, self.LOSS)
+
+    def test_pass(self):
+        v = self.A.screen_verdict([0.003 + 0.0001 * i for i in range(20)])
+        assert v["verdict"] == "PASS" and v["diverged"] == 0 and v["improved"] == 20
+
+    def test_improved_bar_is_14_of_20(self):
+        g = [0.01] * 14 + [-0.0001] * 6
+        assert self.A.screen_verdict(g)["verdict"] == "PASS"
+        assert self.A.screen_verdict([0.01] * 13 + [-0.0001] * 7)["verdict"] == "FAIL"
+
+    def test_any_diverged_seed_fails_regardless_of_mean(self):
+        v = self.A.screen_verdict([0.5] * 19 + [None])
+        assert v["mean"] >= 0.002 and v["improved"] == 19 and v["diverged"] == 1
+        assert v["verdict"] == "FAIL"
+
+    def test_bars_fail(self):
+        assert self.A.screen_verdict([0.001] * 19 + [0.0011])["verdict"] == "FAIL"
+
+    def test_incumbent_divergence_voids(self, tmp_path, monkeypatch):
+        import json
+
+        d = tmp_path / "confirm"
+        d.mkdir()
+        for c, acc in ((self.A.INC, [float("nan")] + [0.9] * 199), (self.A.CAND, self.OK)):
+            (d / f"{c}_seed134.json").write_text(
+                json.dumps({"per_task_accuracy": acc, "per_task_loss": self.LOSS})
+            )
+        monkeypatch.setattr(self.A, "D", str(tmp_path) + "/")
+        with pytest.raises(self.A.VoidRun):
+            self.A.diff("confirm", self.A.CAND, 134)
+
+    def test_candidate_divergence_scored_not_void(self, tmp_path, monkeypatch):
+        import json
+
+        d = tmp_path / "confirm"
+        d.mkdir()
+        for c, acc in ((self.A.INC, self.OK), (self.A.CAND, [0.3] + [0.9] * 199)):
+            (d / f"{c}_seed134.json").write_text(
+                json.dumps({"per_task_accuracy": acc, "per_task_loss": self.LOSS})
+            )
+        monkeypatch.setattr(self.A, "D", str(tmp_path) + "/")
+        assert self.A.diff("confirm", self.A.CAND, 134) is None
+
+
+class TestAnnealScheduleUnits:
+    """Unit tests for the identmap anneal / partial-reset / decoupled-decay
+    schedule helpers on tiny synthetic inputs (CPU, no learner run)."""
+
+    @staticmethod
+    def _h():
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _advance_anneal_clock,
+            _anneal_lr,
+            _decode_anneal_clock,
+            _runtime_decay,
+        )
+
+        return _decode_anneal_clock, _anneal_lr, _advance_anneal_clock, _runtime_decay
+
+    def test_decode_clock_before_and_after_first_shift(self):
+        dec = self._h()[0]
+        c = jnp.array([-(2**30), -(2**30) + 7, 0, 1, 42], dtype=jnp.int32)
+        np.testing.assert_array_equal(np.asarray(dec(c)), [0, 7, 0, 1, 42])
+
+    def test_clock_counts_up_without_trigger(self):
+        adv = self._h()[2]
+        no = jnp.array(False)
+        c = jnp.array(-(2**30), dtype=jnp.int32)
+        for _ in range(5):
+            c = adv(c, no, 0.5)
+        assert int(self._h()[0](c)) == 5
+        assert int(adv(jnp.array(9, jnp.int32), no, 0.5)) == 10
+
+    @pytest.mark.parametrize(
+        "prev,frac,expected",
+        [
+            (100, 0.0, 1),  # f = 0: full reset, the parent rule
+            (100, 0.5, 51),  # 1 + floor(0.5 * 100)
+            (101, 0.5, 51),  # floor, not round
+            (100, 0.25, 26),
+            (1, 0.5, 1),  # small prev: floor(0.5) = 0 -> full reset
+            (3, 0.25, 1),  # f * s < 1 -> full reset
+            (4, 0.25, 2),  # first s where the partial reset keeps time
+        ],
+    )
+    def test_partial_reset_restart(self, prev, frac, expected):
+        adv = self._h()[2]
+        out = adv(jnp.array(prev, jnp.int32), jnp.array(True), frac)
+        assert int(out) == expected
+
+    def test_partial_reset_decodes_pre_shift_clock(self):
+        """A first shift at stream step 200 restarts from the decoded 200."""
+        adv = self._h()[2]
+        c = jnp.array(-(2**30) + 200, jnp.int32)
+        assert int(adv(c, jnp.array(True), 0.5)) == 101
+
+    def test_anneal_lr_schedule(self):
+        lr = self._h()[1]
+        s = jnp.array([0.0, 3.0, 1e6], jnp.float32)
+        out = np.asarray(lr(s, 0.01, 0.001, 1.0))
+        np.testing.assert_allclose(out, [0.01, 0.005, 0.001], rtol=1e-6)
+        # floor == step: constant step at every clock value
+        const = np.asarray(lr(s, 0.02, 0.02, 1000.0))
+        np.testing.assert_array_equal(const, np.float32(0.02))
+
+    def test_runtime_decay_branches(self):
+        dec = self._h()[3]
+        step, wd = 0.005625, 0.01
+        pd = 1.0 - step * wd
+        at = dec(jnp.float32(step), step, pd, wd)
+        assert at == jnp.float32(pd)
+        off = dec(jnp.float32(0.0028125), step, pd, wd)
+        np.testing.assert_allclose(float(off), 1.0 - 0.0028125 * wd, rtol=1e-7)
+        assert float(off) > float(at)
+
+    def test_runtime_decay_selects_branch_by_exact_step(self):
+        """A sentinel param_decay shows which branch ran: only an exactly
+        equal float32 step reads the precomputed constant."""
+        dec = self._h()[3]
+        assert float(dec(jnp.float32(0.02), 0.02, 0.5, 0.01)) == 0.5
+        near = jnp.nextafter(jnp.float32(0.02), jnp.float32(1.0))
+        np.testing.assert_allclose(float(dec(near, 0.02, 0.5, 0.01)), 1.0 - 0.02 * 0.01, rtol=1e-6)
+
+    def test_runtime_decay_is_one_at_wd0_on_both_branches(self):
+        """The headline arms run at weight_decay 0: either branch gives 1."""
+        dec = self._h()[3]
+        for dl in (0.02, 0.005625, 0.0028125, 0.0031):
+            assert float(dec(jnp.float32(dl), 0.02, 1.0, 0.0)) == 1.0
+
+    def test_constant_arm_takes_parent_constant_branch(self):
+        """s02_anneal_f1t1000_wd0 (floor == step) keeps lr == float32(step)
+        at every clock, so the equality branch is always taken."""
+        _, lr, _, _ = self._h()
+        hp = screening_spec(
+            "rls_head_resid_identmap50_r_idet003_s02_anneal_f1t1000_wd0"
+        ).hyperparameters
+        s = jnp.arange(0, 200_000, 997, dtype=jnp.float32)
+        out = lr(s, hp["step_size"], hp["anneal_floor"], hp["anneal_tau"])
+        assert bool(jnp.all(out == jnp.float32(hp["step_size"])))
+        assert hp["weight_decay"] == 0.0
+
+    def test_headline_arms_do_not_use_partial_or_decoupled_reset(self):
+        for arm in ("s02_anneal_f1t1000_wd0", "s005625_anneal_f2t1000_wd0"):
+            hp = screening_spec("rls_head_resid_identmap50_r_idet003_" + arm).hyperparameters
+            assert "anneal_reset_frac" not in hp
+            assert "anneal_decay_reset_frac" not in hp
+            assert hp["weight_decay"] == 0.0
+
+
+class TestRLSHeadIdentMapAnnealClockArithmetic:
+    """Exact clock and schedule arithmetic of the identmap body anneal.
+
+    One ``full_step`` on hand-built states: a forced detector trigger
+    (raw-norm mean far from a zero input, matured count) or a forced
+    non-trigger, then the stored clocks and the step sizes handed to the
+    body are compared with the documented formulas.
+    """
+
+    PARENT = "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+    OFF = -(2**30)
+
+    def _step(
+        self, monkeypatch, *, trigger, anneal_clock, decay_clock=None, since_shift=None, **overrides
+    ):
+        seen = {}
+        real = ipmnist_screening._make_rls_head_learner
+
+        def recording(hp):
+            init, step = real(hp)
+
+            def wrapped(*args, **kwargs):
+                seen.update(kwargs)
+                return step(*args, **kwargs)
+
+            return init, wrapped
+
+        monkeypatch.setattr(ipmnist_screening, "_make_rls_head_learner", recording)
+        hp = {**screening_spec(self.PARENT).hyperparameters, **overrides}
+        init_fn, step_fn = ipmnist_screening._make_rls_head_identmap_learner(hp)
+        params = init_mlp_params(jr.key(0), SMALL)
+        state = init_fn(params)
+        d = SMALL.input_dim
+        raw_norm = replace(
+            state.raw_norm,
+            mean=jnp.full((d,), 100.0 if trigger else 0.0, jnp.float32),
+            count=jnp.full((d,), 1e6, jnp.float32),
+        )
+        clock = jnp.array(anneal_clock, jnp.int32)
+        state = replace(
+            state,
+            raw_norm=raw_norm,
+            anneal_clock=clock,
+            decay_clock=clock if decay_clock is None else jnp.array(decay_clock, jnp.int32),
+            since_shift=clock if since_shift is None else jnp.array(since_shift, jnp.int32),
+        )
+        _, new, _ = step_fn(params, state, jnp.zeros((d,), jnp.float32), jnp.array(0), jr.key(1))
+        return new, seen
+
+    @staticmethod
+    def _sched(s, floor=0.0028125, step=0.005625, tau=1000.0):
+        return np.maximum(
+            np.float32(floor),
+            np.float32(step)
+            * np.asarray(jax.lax.rsqrt(np.float32(1.0) + np.float32(s) / np.float32(tau))),
+        )
+
+    def test_partial_reset_restart_value(self, monkeypatch):
+        new, _ = self._step(monkeypatch, trigger=True, anneal_clock=7, anneal_reset_frac=0.5)
+        assert int(new.anneal_clock) == 1 + math.floor(0.5 * 7)
+        assert int(new.since_shift) == 1
+
+    def test_partial_reset_decodes_pre_shift_offset(self, monkeypatch):
+        new, _ = self._step(
+            monkeypatch, trigger=True, anneal_clock=self.OFF + 9, anneal_reset_frac=0.5
+        )
+        assert int(new.anneal_clock) == 1 + math.floor(0.5 * 9)
+
+    def test_partial_clock_counts_without_trigger(self, monkeypatch):
+        new, _ = self._step(monkeypatch, trigger=False, anneal_clock=7, anneal_reset_frac=0.5)
+        assert int(new.anneal_clock) == 8
+        assert int(new.since_shift) == 8
+
+    def test_flag_off_clocks_mirror_since_shift(self, monkeypatch):
+        for trig in (True, False):
+            new, _ = self._step(monkeypatch, trigger=trig, anneal_clock=7)
+            assert int(new.anneal_clock) == int(new.since_shift)
+            assert int(new.decay_clock) == int(new.since_shift)
+        new, _ = self._step(monkeypatch, trigger=False, anneal_clock=self.OFF)
+        assert int(new.anneal_clock) == self.OFF + 1 == int(new.since_shift)
+
+    def test_decay_clock_restart_value(self, monkeypatch):
+        new, _ = self._step(
+            monkeypatch,
+            trigger=True,
+            anneal_clock=8,
+            decay_clock=10,
+            anneal_reset_frac=0.5,
+            anneal_decay_reset_frac=0.25,
+        )
+        assert int(new.anneal_clock) == 1 + math.floor(0.5 * 8)
+        assert int(new.decay_clock) == 1 + math.floor(0.25 * 10)
+
+    def test_schedule_value_and_floor(self, monkeypatch):
+        for s in (0, 1, 999, 2999, 10**6):
+            _, seen = self._step(monkeypatch, trigger=False, anneal_clock=s)
+            np.testing.assert_array_equal(np.asarray(seen["lr"]), self._sched(s))
+        _, seen = self._step(monkeypatch, trigger=False, anneal_clock=10**6)
+        assert np.asarray(seen["lr"]) == np.float32(0.0028125)
+
+    def test_schedule_reads_partial_and_decay_clocks(self, monkeypatch):
+        _, seen = self._step(
+            monkeypatch,
+            trigger=False,
+            anneal_clock=500,
+            decay_clock=50,
+            since_shift=5,
+            anneal_reset_frac=0.5,
+            anneal_decay_reset_frac=0.25,
+        )
+        np.testing.assert_array_equal(np.asarray(seen["lr"]), self._sched(500))
+        np.testing.assert_array_equal(np.asarray(seen["decay_lr"]), self._sched(50))
+
+    def test_schedule_reads_since_shift_when_partial_off(self, monkeypatch):
+        _, seen = self._step(monkeypatch, trigger=False, anneal_clock=500, since_shift=5)
+        np.testing.assert_array_equal(np.asarray(seen["lr"]), self._sched(5))
+        assert "decay_lr" not in seen
+
+    def test_stream_start_lr_equals_step(self, monkeypatch):
+        _, seen = self._step(monkeypatch, trigger=False, anneal_clock=self.OFF)
+        assert np.asarray(seen["lr"]) == np.float32(0.005625)
+
+    def test_decay_schedule_decodes_pre_shift_offset(self, monkeypatch):
+        _, seen = self._step(
+            monkeypatch,
+            trigger=False,
+            anneal_clock=self.OFF + 500,
+            decay_clock=self.OFF + 50,
+            anneal_reset_frac=0.5,
+            anneal_decay_reset_frac=0.25,
+        )
+        np.testing.assert_array_equal(np.asarray(seen["lr"]), self._sched(500))
+        np.testing.assert_array_equal(np.asarray(seen["decay_lr"]), self._sched(50))
+
+    def test_decay_clock_restart_decodes_pre_shift_offset(self, monkeypatch):
+        new, _ = self._step(
+            monkeypatch,
+            trigger=True,
+            anneal_clock=self.OFF + 8,
+            decay_clock=self.OFF + 10,
+            anneal_reset_frac=0.5,
+            anneal_decay_reset_frac=0.25,
+        )
+        assert int(new.anneal_clock) == 1 + math.floor(0.5 * 8)
+        assert int(new.decay_clock) == 1 + math.floor(0.25 * 10)
+
+
+def _exp_path(*parts):
+    return Path(__file__).resolve().parents[1].joinpath("outputs", "ipmnist_screening", *parts)
+
+
+def _run_py(script, cwd, *args):
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(cwd)}
+    return subprocess.run(
+        [sys.executable, str(script), *args], cwd=cwd, capture_output=True, text=True, env=env
+    )
+
+
+def _jobs_ok_rc(launch, content, tmp_path):
+    import re
+    import subprocess
+
+    fn = re.search(r"^jobs_ok\(\)\{.*$", launch.read_text(), re.M).group(0)
+    f = tmp_path / "jobs.txt"
+    f.write_text(content)
+    return subprocess.run(
+        ["bash", "-c", "L=/dev/null; log(){ :; }\n" + fn + '\njobs_ok "$1"', "x", str(f)],
+        capture_output=True,
+        text=True,
+    ).returncode
+
+
+def _worker_xla_flags(worker):
+    import re
+    import subprocess
+
+    line = re.search(r"^export XLA_FLAGS=.*$", worker.read_text(), re.M).group(0)
+    return subprocess.run(
+        ["bash", "-c", line + '\nprintf %s "$XLA_FLAGS"'], capture_output=True, text=True
+    ).stdout
+
+
+class TestEnvcheckWd0Confirm200Unreadable:
+    """An unreadable environment-check reference fails cleanly with exit 1."""
+
+    ENV = _exp_path("wd0_confirm200", "envcheck.py")
+
+    def _check_clean_fail(self, r):
+        assert r.returncode == 1, r.stderr
+        assert "Traceback" not in r.stderr
+        assert "UNREADABLE" in r.stdout
+        assert r.stdout.strip().splitlines()[-1] == "ENVCHECK FAIL"
+
+    def test_commit_absent_from_clone(self, tmp_path):
+        import shutil
+        import subprocess
+
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        shutil.copytree(
+            _exp_path("wd0_confirm200", "envcheck"),
+            tmp_path / "outputs" / "ipmnist_screening" / "wd0_confirm200" / "envcheck",
+        )
+        self._check_clean_fail(_run_py(self.ENV, tmp_path))
+
+    def test_not_a_git_checkout_and_no_local_shards(self, tmp_path):
+        self._check_clean_fail(_run_py(self.ENV, tmp_path))
+
+    def test_full_history_still_passes(self):
+        import subprocess
+
+        root = Path(__file__).resolve().parents[1]
+        if subprocess.run(["git", "cat-file", "-e", "396d6d3c^{commit}"], cwd=root).returncode:
+            pytest.skip("reference commit not in this clone")
+        r = _run_py(self.ENV, root)
+        assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "ENVCHECK PASS"
+
+
+class TestWd0Confirm200AnalyzeShardErrors:
+    """wd0_confirm200/analyze.py: a missing or wrong-length shard is a clean VOID (exit 1)."""
+
+    A = _exp_path("wd0_confirm200", "analyze.py")
+    P = "rls_head_resid_identmap50_r_idet003_s005625_anneal_f2t1000"
+
+    def _shards(self, tmp_path):
+        import json
+
+        d = tmp_path / "outputs" / "ipmnist_screening" / "wd0_confirm200" / "shards"
+        d.mkdir(parents=True)
+        for s in range(50, 70):
+            (d / f"{self.P}_seed{s}.json").write_text(
+                json.dumps({"per_task_accuracy": [0.9] * 200})
+            )
+            (d / f"{self.P}_wd0_seed{s}.json").write_text(
+                json.dumps({"per_task_accuracy": [0.9 + 0.003 + 0.0001 * (s - 50)] * 200})
+            )
+        return d
+
+    def test_valid_shards_give_verdict(self, tmp_path):
+        self._shards(tmp_path)
+        r = _run_py(self.A, tmp_path)
+        assert r.returncode == 0 and r.stdout.strip().endswith("-> PASS")
+
+    def _void(self, r):
+        assert r.returncode == 1 and "Traceback" not in r.stderr
+        assert r.stderr.startswith("VOID: shard ") and r.stdout == ""
+
+    def test_missing_shard_voids(self, tmp_path):
+        (self._shards(tmp_path) / f"{self.P}_seed57.json").unlink()
+        self._void(_run_py(self.A, tmp_path))
+
+    def test_short_shard_voids(self, tmp_path):
+        import json
+
+        (self._shards(tmp_path) / f"{self.P}_wd0_seed61.json").write_text(
+            json.dumps({"per_task_accuracy": [0.9] * 199})
+        )
+        self._void(_run_py(self.A, tmp_path))
+
+    def test_malformed_shard_voids(self, tmp_path):
+        (self._shards(tmp_path) / f"{self.P}_seed50.json").write_text("{not json")
+        self._void(_run_py(self.A, tmp_path))
+
+
+class TestRLSHeadIdentMapS02Wd0Ridge:
+    """RLS head ridge cells on the s02 wd0 incumbent (s02_wd0_ridge/)."""
+
+    INCUMBENT = "rls_head_resid_identmap50_r_idet003_s02_anneal_f1t1000_wd0"
+    RIDGES = (("r03", 0.3), ("r01", 0.1), ("r003", 0.03))
+
+    def _spec(self, **overrides):
+        spec = screening_spec(self.INCUMBENT)
+        return replace(
+            spec,
+            name=spec.name + "_ridge_test",
+            hyperparameters={
+                **spec.hyperparameters,
+                "ident_match_at": 10.0,
+                "ident_match2": 0.0,
+                "ident_match3": 0.0,
+                **overrides,
+            },
+        )
+
+    def _run(self, **overrides):
+        x, y = TestRLSHeadIdentMapStepAnneal._offset_data()
+        return run_screening_config(x, y, self._spec(**overrides), seed=7, config=SMALL)
+
+    def test_registry_differs_only_in_ridge(self):
+        inc = dict(screening_spec(self.INCUMBENT).hyperparameters)
+        assert inc["rls_ridge_init"] == 1.0
+        for tag, ridge in self.RIDGES:
+            spec = screening_spec(self.INCUMBENT + "_" + tag)
+            hp = dict(spec.hyperparameters)
+            assert hp.pop("rls_ridge_init") == ridge
+            inc_rest = dict(inc)
+            inc_rest.pop("rls_ridge_init")
+            assert hp == inc_rest
+            assert spec.factory is screening_spec(self.INCUMBENT).factory
+
+    def test_initial_p_is_identity_over_ridge(self):
+        for _, ridge in self.RIDGES:
+            spec = screening_spec(self.INCUMBENT + "_" + _)
+            init_fn, _step = spec.factory(dict(spec.hyperparameters))
+            state = init_fn(init_mlp_params(jr.key(0), SMALL))
+            p = np.asarray(state.inner.p)
+            np.testing.assert_allclose(p, np.eye(p.shape[0]) / ridge, rtol=1e-6)
+
+    def test_ridge_one_override_is_bit_exact_with_parent(self):
+        a = self._run()
+        b = self._run(rls_ridge_init=1.0)
+        assert np.array_equal(np.asarray(a.per_task_accuracy), np.asarray(b.per_task_accuracy))
+        assert np.array_equal(np.asarray(a.per_task_loss), np.asarray(b.per_task_loss))
+
+    def test_small_ridge_is_live_and_finite(self):
+        a = self._run()
+        b = self._run(rls_ridge_init=0.03)
+        acc = np.asarray(b.per_task_accuracy)
+        assert np.all(np.isfinite(acc)) and np.all(np.isfinite(np.asarray(b.per_task_loss)))
+        assert not np.array_equal(np.asarray(a.per_task_loss), np.asarray(b.per_task_loss))
+
+
+def _load_s02_ridge_analyze():
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "outputs"
+        / "ipmnist_screening"
+        / "s02_wd0_ridge"
+        / "analyze.py"
+    )
+    spec = importlib.util.spec_from_file_location("s02_ridge_analyze", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestS02Wd0RidgeDivergenceRules:
+    """Development-plan rules of s02_wd0_ridge/analyze.py on synthetic inputs."""
+
+    A = _load_s02_ridge_analyze()
+    OK = [0.95] * 60
+    LOSS = [0.1] * 60
+
+    def test_cells_registered_and_seeds_fixed(self):
+        for c, r in self.A.CELLS:
+            assert SCREENING_REGISTRY[c].hyperparameters["rls_ridge_init"] == r
+        assert self.A.INC in SCREENING_REGISTRY
+        assert self.A.TUNE_SEED == 165 and list(self.A.SCREEN_SEEDS) == list(range(166, 176))
+        assert self.A.EDGE == self.A.INC + "_r003"
+
+    def test_classify(self):
+        assert self.A.classify(self.OK, self.LOSS) is None
+        assert "missing" in self.A.classify(None, None)
+        acc = list(self.OK)
+        acc[5] = float("nan")
+        assert "non-finite accuracy" in self.A.classify(acc, self.LOSS)
+        acc = list(self.OK)
+        acc[3] = 0.4999
+        assert "tasks [3]" in self.A.classify(acc, self.LOSS)
+        assert self.A.FLOOR == 0.5
+
+    def test_tune_gate_diverged_and_ties_to_larger_ridge(self):
+        decide = self.A.tune_decision
+        assert decide([("a", 0.03, 0.001), ("b", 0.1, None), ("c", 0.3, 0.002)]) == "c"
+        assert decide([("a", 0.03, None), ("b", 0.1, None)]) == "STOP_ALL_DIVERGED"
+        assert decide([("a", 0.03, 0.0005), ("b", 0.1, -0.01)]) == "STOP"
+        assert decide([("a", 0.03, 0.003), ("b", 0.1, 0.003)]) == "b"
+
+    def test_screen_verdict(self):
+        verdict = self.A.screen_verdict
+        assert verdict([0.003 + 0.0001 * i for i in range(10)])["verdict"] == "PASS"
+        v = verdict([0.5] * 9 + [None])
+        assert v["diverged"] == 1 and v["verdict"] == "FAIL"
+        assert verdict([0.001] * 9 + [0.0011])["verdict"] == "FAIL"
+
+    def test_incumbent_divergence_voids(self, tmp_path, monkeypatch):
+        import json
+
+        d = tmp_path / "tune"
+        d.mkdir()
+        for c, acc in ((self.A.INC, [float("nan")] + [0.9] * 59), (self.A.CELLS[0][0], self.OK)):
+            (d / f"{c}_seed165.json").write_text(
+                json.dumps({"per_task_accuracy": acc, "per_task_loss": self.LOSS})
+            )
+        monkeypatch.setattr(self.A, "D", str(tmp_path) + "/")
+        with pytest.raises(self.A.VoidRun):
+            self.A.diff("tune", self.A.CELLS[0][0], 165)
+
+
+def _load_ridge200_analyze():
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "outputs"
+        / "ipmnist_screening"
+        / "s02_wd0_ridge_200task"
+        / "analyze.py"
+    )
+    spec = importlib.util.spec_from_file_location("ridge200_analyze", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestS02Ridge200TaskConfirm:
+    """Development rules for the 200-task smaller-ridge confirmation."""
+
+    A = _load_ridge200_analyze()
+    OK = [0.95] * 200
+    LOSS = [0.1] * 200
+
+    def test_both_cells_registered(self):
+        reg = ipmnist_screening.SCREENING_REGISTRY
+        assert self.A.CAND in reg and self.A.INC in reg
+        assert self.A.CAND == self.A.INC + "_r01"
+        assert reg[self.A.CAND].hyperparameters["rls_ridge_init"] == 0.1
+
+    def test_constants(self):
+        assert (
+            self.A.FLOOR == 0.5
+            and self.A.T19 == 2.093
+            and self.A.NTASK == 200
+            and self.A.BLOCK == 50
+        )
+        assert list(self.A.SEEDS) == list(range(176, 196))
+
+    def test_healthy_shard_passes(self):
+        assert self.A.classify(self.OK, self.LOSS) is None
+
+    def test_missing_shard_diverged(self):
+        assert "missing" in self.A.classify(None, None)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_accuracy_diverged(self, bad):
+        acc = list(self.OK)
+        acc[117] = bad
+        assert "non-finite accuracy" in self.A.classify(acc, self.LOSS)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_non_finite_loss_diverged(self, bad):
+        loss = list(self.LOSS)
+        loss[199] = bad
+        assert "non-finite loss" in self.A.classify(self.OK, loss)
+
+    def test_missing_loss_diverged(self):
+        assert "non-finite loss" in self.A.classify(self.OK, None)
+
+    def test_floor(self):
+        acc = list(self.OK)
+        acc[3] = 0.4999
+        assert "tasks [3]" in self.A.classify(acc, self.LOSS)
+        acc[3] = 0.5
+        assert self.A.classify(acc, self.LOSS) is None
+
+    def test_out_of_range_accuracy_diverged(self):
+        acc = list(self.OK)
+        acc[0] = 1.5
+        assert "outside" in self.A.classify(acc, self.LOSS)
+
+    def test_pass(self):
+        v = self.A.screen_verdict([0.003 + 0.0001 * i for i in range(20)])
+        assert v["verdict"] == "PASS" and v["diverged"] == 0 and v["improved"] == 20
+
+    def test_improved_bar_is_14_of_20(self):
+        g = [0.01] * 14 + [-0.0001] * 6
+        assert self.A.screen_verdict(g)["verdict"] == "PASS"
+        assert self.A.screen_verdict([0.01] * 13 + [-0.0001] * 7)["verdict"] == "FAIL"
+
+    def test_any_diverged_seed_fails_regardless_of_mean(self):
+        v = self.A.screen_verdict([0.5] * 19 + [None])
+        assert v["mean"] >= 0.002 and v["improved"] == 19 and v["diverged"] == 1
+        assert v["verdict"] == "FAIL"
+
+    def test_bars_fail(self):
+        assert self.A.screen_verdict([0.001] * 19 + [0.0011])["verdict"] == "FAIL"
+
+    def test_incumbent_divergence_voids(self, tmp_path, monkeypatch):
+        import json
+
+        d = tmp_path / "confirm"
+        d.mkdir()
+        for c, acc in ((self.A.INC, [float("nan")] + [0.9] * 199), (self.A.CAND, self.OK)):
+            (d / f"{c}_seed176.json").write_text(
+                json.dumps({"per_task_accuracy": acc, "per_task_loss": self.LOSS})
+            )
+        monkeypatch.setattr(self.A, "D", str(tmp_path) + "/")
+        with pytest.raises(self.A.VoidRun):
+            self.A.diff("confirm", self.A.CAND, 176)
+
+    def test_candidate_divergence_scored_not_void(self, tmp_path, monkeypatch):
+        import json
+
+        d = tmp_path / "confirm"
+        d.mkdir()
+        for c, acc in ((self.A.INC, self.OK), (self.A.CAND, [0.3] + [0.9] * 199)):
+            (d / f"{c}_seed176.json").write_text(
+                json.dumps({"per_task_accuracy": acc, "per_task_loss": self.LOSS})
+            )
+        monkeypatch.setattr(self.A, "D", str(tmp_path) + "/")
+        assert self.A.diff("confirm", self.A.CAND, 176) is None
+
+    def test_memguard_stop_sentinel_is_ignored_and_untracked(self):
+        import subprocess
+
+        root = Path(__file__).resolve().parents[1]
+        rel = "outputs/ipmnist_screening/s02_wd0_ridge_200task/MEMGUARD_STOP"
+        assert (
+            subprocess.run(["git", "check-ignore", "-q", "--no-index", rel], cwd=root).returncode
+            == 0
+        )
+        tracked = subprocess.run(
+            ["git", "ls-files", "outputs/ipmnist_screening/s02_wd0_ridge_200task/"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        assert not any(f.endswith("MEMGUARD_STOP") for f in tracked)
+
+
+class TestLaunchHardeningS02Wd0Ridge:
+    """s02_wd0_ridge launch.sh job-file validation and worker.sh XLA_FLAGS value."""
+
+    LAUNCH = _exp_path("s02_wd0_ridge", "launch.sh")
+
+    def test_committed_job_files_validate(self, tmp_path):
+        for f in sorted(_exp_path("s02_wd0_ridge").glob("*jobs*.txt")):
+            assert _jobs_ok_rc(self.LAUNCH, f.read_text(), tmp_path) == 0, f.name
+
+    def test_blank_and_comment_lines_allowed(self, tmp_path):
+        assert _jobs_ok_rc(self.LAUNCH, "# c\n\nabc 5 60 tune\n", tmp_path) == 0
+
+    @pytest.mark.parametrize(
+        "line",
+        ["abc 5 60", "abc 5 60 tune extra", "abc x 60 tune", "abc 5 6o tune", "abc 5a 60 tune"],
+    )
+    def test_malformed_lines_rejected(self, tmp_path, line):
+        assert _jobs_ok_rc(self.LAUNCH, f"abc 5 60 tune\n{line}\n", tmp_path) == 1
+
+    def test_worker_xla_flags_value_unchanged(self):
+        assert _worker_xla_flags(_exp_path("s02_wd0_ridge", "worker.sh")) == (
+            "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
+        )
+
+
+class TestS02Wd0RidgeScreenVerdictEmpty:
+    """screen_verdict with fewer than 2 seeds is a FAIL, not a StatisticsError."""
+
+    A = _load_s02_ridge_analyze()
+
+    @pytest.mark.parametrize("gains", [[], [0.01], [None]])
+    def test_degenerate_fails(self, gains):
+        v = self.A.screen_verdict(gains)
+        assert v["verdict"] == "FAIL" and v["bars"] is False
+
+    def test_ten_seed_values_unchanged(self):
+        import statistics as st
+
+        g = [0.003 + 0.0001 * i for i in range(10)]
+        v = self.A.screen_verdict(g)
+        assert v["se"] == st.stdev(g) / 10**0.5 and v["mean"] == st.mean(g)
+
+
+class TestRLSHeadIdentMapWd0ConstStepExtend2Registry(TestRLSHeadIdentMapWd0ConstStepRegistry):
+    """Constant-step grid above the 0.02 edge winner (wd0_const_step_extend2/)."""
+
+    ARMS = (("03", 0.03), ("04", 0.04), ("05", 0.05))
+
+    def test_steps_distinct_in_float32(self):
+        steps = [np.float32(s) for _, s in self.ARMS] + [np.float32(0.02)]
+        assert len(set(steps)) == 4
+
+    def test_tags_do_not_collide_with_small_steps(self):
+        # s004 is 0.004 (wd0_const_step_retune); the new 0.04 cell is s04.
+        base = "rls_head_resid_identmap50_r_idet003_s{}_anneal_f1t1000_wd0"
+        assert SCREENING_REGISTRY[base.format("004")].hyperparameters["step_size"] == 0.004
+        assert SCREENING_REGISTRY[base.format("04")].hyperparameters["step_size"] == 0.04
+
+
+def _load_extend2_analyze():
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "outputs"
+        / "ipmnist_screening"
+        / "wd0_const_step_extend2"
+        / "analyze.py"
+    )
+    spec = importlib.util.spec_from_file_location("extend2_analyze", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestWd0ConstStepExtend2DivergenceRules:
+    """Preregistered divergence rules of wd0_const_step_extend2/analyze.py on synthetic inputs."""
+
+    A = _load_extend2_analyze()
+    OK = [0.95] * 60
+    LOSS = [0.1] * 60
+
+    def test_healthy_shard_passes(self):
+        assert self.A.classify(self.OK, self.LOSS) is None
+
+    def test_missing_shard_diverged(self):
+        assert "missing" in self.A.classify(None, None)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_accuracy_diverged(self, bad):
+        acc = list(self.OK)
+        acc[17] = bad
+        assert "non-finite accuracy" in self.A.classify(acc, self.LOSS)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_non_finite_loss_diverged(self, bad):
+        loss = list(self.LOSS)
+        loss[59] = bad
+        assert "non-finite loss" in self.A.classify(self.OK, loss)
+
+    def test_missing_loss_diverged(self):
+        assert "non-finite loss" in self.A.classify(self.OK, None)
+
+    def test_floor(self):
+        acc = list(self.OK)
+        acc[3] = 0.4999
+        assert "tasks [3]" in self.A.classify(acc, self.LOSS)
+        acc[3] = 0.5
+        assert self.A.classify(acc, self.LOSS) is None
+        assert self.A.FLOOR == 0.5
+
+    def test_out_of_range_accuracy_diverged(self):
+        acc = list(self.OK)
+        acc[0] = 1.5
+        assert "outside" in self.A.classify(acc, self.LOSS)
+
+    def test_tune_diverged_cell_never_wins(self):
+        cells = [("a", 0.03, 0.001), ("b", 0.04, None), ("c", 0.05, 0.002)]
+        assert self.A.tune_decision(cells) == "c"
+        assert self.A.tune_decision([("a", 0.03, 0.001), ("b", 0.04, None)]) == "a"
+
+    def test_tune_all_diverged_stops(self):
+        cells = [("a", 0.03, None), ("b", 0.04, None), ("c", 0.05, None)]
+        assert self.A.tune_decision(cells) == "STOP_ALL_DIVERGED"
+
+    def test_tune_gate_and_ties(self):
+        assert self.A.tune_decision([("a", 0.03, 0.0005), ("b", 0.04, -0.01)]) == "STOP"
+        assert self.A.tune_decision([("b", 0.04, 0.003), ("a", 0.03, 0.003)]) == "a"
+
+    def test_screen_pass(self):
+        v = self.A.screen_verdict([0.003 + 0.0001 * i for i in range(10)])
+        assert v["verdict"] == "PASS" and v["diverged"] == 0 and v["improved"] == 10
+
+    def test_screen_any_diverged_seed_fails_regardless_of_mean(self):
+        # nine large gains keep the mean and CI bars nominally satisfied
+        v = self.A.screen_verdict([0.5] * 9 + [None])
+        assert v["mean"] >= 0.002 and v["improved"] == 9 and v["diverged"] == 1
+        assert v["verdict"] == "FAIL"
+
+    def test_screen_bars_fail(self):
+        assert self.A.screen_verdict([0.001] * 9 + [0.0011])["verdict"] == "FAIL"
+
+    def test_incumbent_divergence_voids(self, tmp_path, monkeypatch):
+        import json
+
+        for c, acc in ((self.A.INC, [float("nan")] + [0.9] * 59), (self.A.CELLS[0][0], self.OK)):
+            d = tmp_path / "tune"
+            d.mkdir(exist_ok=True)
+            (d / f"{c}_seed123.json").write_text(
+                json.dumps({"per_task_accuracy": acc, "per_task_loss": self.LOSS})
+            )
+        monkeypatch.setattr(self.A, "D", str(tmp_path) + "/")
+        with pytest.raises(self.A.VoidRun):
+            self.A.diff("tune", self.A.CELLS[0][0], 123)
+
+
+class TestRLSHeadIdentMapS02Wd0WeightClip:
+    """Opt-in residual-body weight clipping on the s02 wd0 incumbent (s02_wd0_wclip/)."""
+
+    INCUMBENT = "rls_head_resid_identmap50_r_idet003_s02_anneal_f1t1000_wd0"
+    KAPPAS = (("2", 2.0), ("4", 4.0), ("8", 8.0))
+
+    def _spec(self, **overrides):
+        spec = screening_spec(self.INCUMBENT)
+        return replace(
+            spec,
+            name=spec.name + "_wclip_test",
+            hyperparameters={
+                **spec.hyperparameters,
+                "ident_match_at": 10.0,
+                "ident_match2": 0.0,
+                "ident_match3": 0.0,
+                **overrides,
+            },
+        )
+
+    def _run(self, **overrides):
+        x, y = TestRLSHeadIdentMapStepAnneal._offset_data()
+        return run_screening_config(x, y, self._spec(**overrides), seed=7, config=SMALL)
+
+    def test_registry_differs_only_in_kappa(self):
+        inc = dict(screening_spec(self.INCUMBENT).hyperparameters)
+        assert "body_wclip_kappa" not in inc
+        for tag, kappa in self.KAPPAS:
+            spec = screening_spec(self.INCUMBENT + "_wclip" + tag)
+            hp = dict(spec.hyperparameters)
+            assert hp.pop("body_wclip_kappa") == kappa
+            assert hp == inc
+            assert spec.factory is screening_spec(self.INCUMBENT).factory
+
+    def test_loose_clip_is_parent_bitwise(self):
+        """A bound far above any weight leaves the trajectory bit-exact."""
+        parent = self._run()
+        loose = self._run(body_wclip_kappa=1e30)
+        for f in ("per_task_accuracy", "per_task_loss"):
+            np.testing.assert_array_equal(
+                np.asarray(getattr(loose, f)), np.asarray(getattr(parent, f))
+            )
+
+    def test_tight_clip_is_live_and_finite(self):
+        parent = self._run()
+        tight = self._run(body_wclip_kappa=0.05)
+        assert not np.array_equal(np.asarray(tight.per_task_loss), np.asarray(parent.per_task_loss))
+        assert np.all(np.isfinite(np.asarray(tight.per_task_loss)))
+
+    def test_rejects_bad_kappa(self):
+        from alberta_framework.benchmarks.ipmnist_screening import (
+            _make_rls_head_identmap_learner,
+        )
+
+        for bad in (0.0, -1.0, float("inf"), float("nan")):
+            with pytest.raises(ValueError):
+                _make_rls_head_identmap_learner(
+                    {**self._spec().hyperparameters, "body_wclip_kappa": bad}
+                )
+        with pytest.raises(ValueError):
+            _make_rls_head_identmap_learner(
+                {
+                    **self._spec().hyperparameters,
+                    "head_resid": 0.0,
+                    "ident_match_at": 0.0,
+                    "body_wclip_kappa": 2.0,
+                }
+            )
+
+    def test_bound_is_kappa_over_sqrt_fan_in(self):
+        from alberta_framework.benchmarks.ipmnist_screening import _wclip_bound
+
+        params = {
+            "w1": np.zeros((784, 300)),
+            "b1": np.zeros(300),
+            "w2": np.zeros((300, 150)),
+            "b2": np.zeros(150),
+        }
+        assert _wclip_bound(params, "w1", 2.0) == 2.0 / math.sqrt(784)
+        assert _wclip_bound(params, "b2", 4.0) == 4.0 / math.sqrt(300)
+
+
+def _load_s02_wclip_analyze():
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "outputs"
+        / "ipmnist_screening"
+        / "s02_wd0_wclip"
+        / "analyze.py"
+    )
+    spec = importlib.util.spec_from_file_location("s02_wclip_analyze", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestS02Wd0WclipDivergenceRules:
+    """Development-plan rules of s02_wd0_wclip/analyze.py on synthetic inputs."""
+
+    A = _load_s02_wclip_analyze()
+    OK = [0.95] * 60
+    LOSS = [0.1] * 60
+
+    def test_cells_registered_and_seeds_fixed(self):
+        for c, k in self.A.CELLS:
+            assert SCREENING_REGISTRY[c].hyperparameters["body_wclip_kappa"] == k
+        assert self.A.INC in SCREENING_REGISTRY
+        assert self.A.TUNE_SEED == 154 and list(self.A.SCREEN_SEEDS) == list(range(155, 165))
+        assert self.A.EDGE == self.A.INC + "_wclip2"
+
+    def test_classify(self):
+        assert self.A.classify(self.OK, self.LOSS) is None
+        assert "missing" in self.A.classify(None, None)
+        acc = list(self.OK)
+        acc[5] = float("nan")
+        assert "non-finite accuracy" in self.A.classify(acc, self.LOSS)
+        assert "non-finite loss" in self.A.classify(self.OK, None)
+        acc = list(self.OK)
+        acc[3] = 0.4999
+        assert "tasks [3]" in self.A.classify(acc, self.LOSS)
+        acc[3] = 1.5
+        assert "outside" in self.A.classify(acc, self.LOSS)
+        assert self.A.FLOOR == 0.5
+
+    def test_tune_gate_diverged_and_ties_to_larger_kappa(self):
+        decide = self.A.tune_decision
+        assert decide([("a", 2.0, 0.001), ("b", 4.0, None), ("c", 8.0, 0.002)]) == "c"
+        assert decide([("a", 2.0, None), ("b", 4.0, None)]) == "STOP_ALL_DIVERGED"
+        assert decide([("a", 2.0, 0.0005), ("b", 4.0, -0.01)]) == "STOP"
+        assert decide([("a", 2.0, 0.003), ("b", 4.0, 0.003)]) == "b"
+
+    def test_screen_verdict(self):
+        verdict = self.A.screen_verdict
+        assert verdict([0.003 + 0.0001 * i for i in range(10)])["verdict"] == "PASS"
+        v = verdict([0.5] * 9 + [None])
+        assert v["mean"] >= 0.002 and v["diverged"] == 1 and v["verdict"] == "FAIL"
+        assert verdict([0.001] * 9 + [0.0011])["verdict"] == "FAIL"
+
+    def test_incumbent_divergence_voids(self, tmp_path, monkeypatch):
+        import json
+
+        d = tmp_path / "tune"
+        d.mkdir()
+        for c, acc in ((self.A.INC, [float("nan")] + [0.9] * 59), (self.A.CELLS[0][0], self.OK)):
+            (d / f"{c}_seed154.json").write_text(
+                json.dumps({"per_task_accuracy": acc, "per_task_loss": self.LOSS})
+            )
+        monkeypatch.setattr(self.A, "D", str(tmp_path) + "/")
+        with pytest.raises(self.A.VoidRun):
+            self.A.diff("tune", self.A.CELLS[0][0], 154)
+
+
+class TestEnvcheckS02Wd0WclipUnreadable:
+    """An unreadable clipping environment-check reference fails cleanly."""
+
+    ENV = _exp_path("s02_wd0_wclip", "envcheck.py")
+
+    def _check_clean_fail(self, r):
+        assert r.returncode == 1, r.stderr
+        assert "Traceback" not in r.stderr
+        assert "UNREADABLE" in r.stdout
+        assert r.stdout.strip().splitlines()[-1] == "ENVCHECK FAIL"
+
+    def test_commit_absent_from_clone(self, tmp_path):
+        import shutil
+        import subprocess
+
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        shutil.copytree(
+            _exp_path("s02_wd0_wclip", "envcheck"),
+            tmp_path / "outputs" / "ipmnist_screening" / "s02_wd0_wclip" / "envcheck",
+        )
+        self._check_clean_fail(_run_py(self.ENV, tmp_path))
+
+    def test_not_a_git_checkout_and_no_local_shards(self, tmp_path):
+        self._check_clean_fail(_run_py(self.ENV, tmp_path))
+
+    def test_full_history_still_passes(self):
+        import subprocess
+
+        root = Path(__file__).resolve().parents[1]
+        if subprocess.run(["git", "cat-file", "-e", "ef85fff8^{commit}"], cwd=root).returncode:
+            pytest.skip("reference commit not in this clone")
+        r = _run_py(self.ENV, root)
+        assert r.returncode == 0 and r.stdout.strip().splitlines()[-1] == "ENVCHECK PASS"
+
+
+class TestLaunchHardeningS02Wd0Wclip:
+    """s02_wd0_wclip launch.sh job-file validation and worker.sh XLA_FLAGS value."""
+
+    LAUNCH = _exp_path("s02_wd0_wclip", "launch.sh")
+
+    def test_committed_job_files_validate(self, tmp_path):
+        for f in sorted(_exp_path("s02_wd0_wclip").glob("*jobs*.txt")):
+            assert _jobs_ok_rc(self.LAUNCH, f.read_text(), tmp_path) == 0, f.name
+
+    def test_blank_and_comment_lines_allowed(self, tmp_path):
+        assert _jobs_ok_rc(self.LAUNCH, "# c\n\nabc 5 60 tune\n", tmp_path) == 0
+
+    @pytest.mark.parametrize(
+        "line",
+        ["abc 5 60", "abc 5 60 tune extra", "abc x 60 tune", "abc 5 6o tune", "abc 5a 60 tune"],
+    )
+    def test_malformed_lines_rejected(self, tmp_path, line):
+        assert _jobs_ok_rc(self.LAUNCH, f"abc 5 60 tune\n{line}\n", tmp_path) == 1
+
+    def test_worker_xla_flags_value_unchanged(self):
+        assert _worker_xla_flags(_exp_path("s02_wd0_wclip", "worker.sh")) == (
+            "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
+        )

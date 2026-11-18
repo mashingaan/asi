@@ -89,6 +89,25 @@ def test_step1_kernel_all_public_optimizers_smoke(optimizer: str) -> None:
     assert result.metrics_shape == (12, 4)
 
 
+@pytest.mark.parametrize("optimizer", ["idbd", "autostep", "autostep_gtd", "adagain"])
+def test_step1_kernel_meta_optimizers_use_configured_meta_step_size(
+    optimizer: Literal["idbd", "autostep", "autostep_gtd", "adagain"],
+) -> None:
+    """``meta_step_size`` reaches every Step 1 optimizer that adapts its gains."""
+    config = Step1KernelConfig(optimizer=optimizer, meta_step_size=0.05)
+    assert make_step1_optimizer(config).to_config()["meta_step_size"] == 0.05
+
+    # The smoke record reports ``meta_step_size``, so the run must depend on it.
+    frozen = run_step1_smoke(
+        Step1KernelConfig(optimizer=optimizer, meta_step_size=0.0),
+        steps=64,
+        final_window=16,
+    )
+    adapted = run_step1_smoke(config, steps=64, final_window=16)
+    assert adapted.to_dict()["config"] == config.to_dict()
+    assert adapted.final_window_mse != frozen.final_window_mse
+
+
 @pytest.mark.parametrize(
     ("normalizer", "expected_type", "expected_field", "endpoint"),
     [
@@ -1277,6 +1296,36 @@ def test_step2_config_from_dict_requires_exact_keys(config: Any) -> None:
     for malformed in (missing, extra):
         with pytest.raises(ValueError, match=type(config).__name__):
             type(config).from_dict(malformed)
+
+
+def test_step2_smoke_final_window_mse_is_the_pre_update_mean_squared_error() -> None:
+    """The field shares Step 1's name and must carry Step 1's meaning, not the UPGD loss."""
+    from alberta_framework.steps.step2 import (
+        Step2KernelConfig,
+        collect_step2_arrays,
+        make_step2_learner,
+        make_step2_stream,
+        run_step2_smoke,
+    )
+
+    cfg = Step2KernelConfig(
+        feature_dim=4, n_heads=3, hidden_sizes=(8,), context_length=4, noise_std=0.0
+    )
+    steps, seed, final_window = 8, 0, 4
+    smoke = run_step2_smoke(cfg, steps=steps, seed=seed, final_window=final_window)
+
+    learner, stream = make_step2_learner(cfg), make_step2_stream(cfg)
+    data_key, learner_key = jr.split(jr.key(seed))
+    observations, targets = collect_step2_arrays(stream, steps=steps, key=data_key)
+    state = learner.init(cfg.feature_dim, learner_key)
+    squared_errors = []
+    for t in range(steps):
+        prediction = learner.predict(state, observations[t])
+        squared_errors.append(float(jnp.mean(jnp.square(prediction - targets[t]))))
+        state = learner.update(state, observations[t], targets[t]).state
+    expected = sum(squared_errors[-final_window:]) / final_window
+    assert expected > 0.0
+    assert smoke.final_window_mse == pytest.approx(expected, rel=1e-5)
 
 
 @pytest.mark.parametrize(

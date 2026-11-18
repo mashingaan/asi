@@ -9,6 +9,8 @@ import numpy as np
 import pytest
 
 from alberta_framework import (
+    LMS,
+    AGCBounding,
     Autostep,
     BatchedHordeResult,
     DemonType,
@@ -16,6 +18,7 @@ from alberta_framework import (
     GVFSpec,
     HordeLearner,
     HordeLearningResult,
+    IndependentDemonHorde,
     MultiHeadMLPLearner,
     MultiHeadMLPState,
     ObGDBounding,
@@ -388,6 +391,76 @@ class TestHordeTraceDecay:
         h1_w_trace = r2.state.head_traces[1][0]
         assert not jnp.allclose(h0_w_trace, h1_w_trace)
 
+    @pytest.mark.parametrize("learner_cls", [HordeLearner, IndependentDemonHorde])
+    @pytest.mark.parametrize("bounded", ["obgd", "agc_clips_nothing"])
+    def test_bounder_metric_never_scales_traces(
+        self, learner_cls: type[HordeLearner] | type[IndependentDemonHorde], bounded: str
+    ) -> None:
+        """Bounding rescales the applied step only; traces decay by gamma*lambda.
+
+        ``Bounder.bound`` returns ``(steps, metric)`` where the metric is for
+        reporting (ObGD's step scale, AGC's clipped-unit fraction, 0.0 when
+        nothing is clipped). Multiplying it into the stored traces attenuated
+        ObGD traces and zeroed AGC traces. A linear demon must match the
+        textbook ObGD semi-gradient TD(lambda) reference.
+        """
+        alpha, gamma, lamda, kappa, dim, n_steps = 0.05, 0.9, 0.8, 2.0, 3, 8
+        spec = create_horde_spec(
+            [
+                GVFSpec(
+                    name="d",
+                    demon_type=DemonType.PREDICTION,
+                    gamma=gamma,
+                    lamda=lamda,
+                    cumulant_index=0,
+                )
+            ]
+        )
+        rng = np.random.default_rng(0)
+        xs = rng.normal(size=(n_steps + 1, dim)).astype(np.float32)
+        cumulants = (3.0 * rng.normal(size=n_steps)).astype(np.float32)
+        bounder = ObGDBounding(kappa=kappa) if bounded == "obgd" else AGCBounding(clip_factor=1e6)
+        learner = learner_cls(
+            spec,
+            hidden_sizes=(),
+            optimizer=LMS(step_size=alpha),
+            bounder=bounder,
+            sparsity=0.0,
+            use_layer_norm=False,
+        )
+        state = learner.init(dim, jr.key(0))
+
+        def head(s: object) -> tuple[np.ndarray, float]:
+            if isinstance(s, MultiHeadMLPState):
+                w, b = s.head_params.weights[0], s.head_params.biases[0]
+            else:
+                params = s.demon_states[0].params  # type: ignore[attr-defined]
+                w, b = params.weights[0], params.biases[0]
+            return np.asarray(w, dtype=np.float64).reshape(-1), float(np.asarray(b).reshape(-1)[0])
+
+        w, b = head(state)
+        z_w, z_b = np.zeros(dim), 0.0
+        min_scale = 1.0
+        for t in range(n_steps):
+            state = learner.update(
+                state, jnp.asarray(xs[t]), jnp.asarray(cumulants[t : t + 1]), jnp.asarray(xs[t + 1])
+            ).state
+            x, x_next = xs[t].astype(np.float64), xs[t + 1].astype(np.float64)
+            delta = cumulants[t] + gamma * (w @ x_next + b) - (w @ x + b)
+            z_w, z_b = gamma * lamda * z_w + x, gamma * lamda * z_b + 1.0
+            scale = 1.0
+            if bounded == "obgd":
+                total = alpha * (np.abs(z_w).sum() + abs(z_b))
+                scale = 1.0 / max(kappa * max(abs(delta), 1.0) * total, 1.0)
+            min_scale = min(min_scale, scale)
+            w, b = w + scale * alpha * delta * z_w, b + scale * alpha * delta * z_b
+
+        if bounded == "obgd":
+            assert min_scale < 0.9  # the bound was active
+        coded_w, coded_b = head(state)
+        np.testing.assert_allclose(coded_w, w, rtol=0.0, atol=1e-4)
+        np.testing.assert_allclose(coded_b, b, rtol=0.0, atol=1e-4)
+
 
 # =============================================================================
 # NaN masking
@@ -581,6 +654,31 @@ class TestRunHordeLearningLoop:
         assert isinstance(result, HordeLearningResult)
         chex.assert_shape(result.per_demon_metrics, (num_steps, n_demons, 3))
         chex.assert_shape(result.td_errors, (num_steps, n_demons))
+
+    def test_preserves_initialized_host_clocks(self) -> None:
+        """The scan boundary should not narrow host-only lifecycle metadata."""
+        horde, state = _shape_contract_horde()
+        birth_timestamp = 1_700_000_000.125
+        uptime_s = float(2**24) + 0.25
+        state = state.replace(
+            birth_timestamp=birth_timestamp,
+            uptime_s=uptime_s,
+        )
+        observations = jnp.ones((2, 5), dtype=jnp.float32)
+        cumulants = jnp.zeros((2, 3), dtype=jnp.float32)
+
+        result = run_horde_learning_loop(
+            horde,
+            state,
+            observations,
+            cumulants,
+            observations,
+        )
+
+        assert isinstance(result.state.birth_timestamp, float)
+        assert result.state.birth_timestamp == birth_timestamp
+        assert isinstance(result.state.uptime_s, float)
+        assert result.state.uptime_s > uptime_s
 
     def test_deterministic(self):
         """Same inputs should give identical results."""
@@ -975,3 +1073,45 @@ def test_mixed_horde_rejects_bool_step_size_before_inner_construction() -> None:
     )
     with pytest.raises(ValueError, match="step_size"):
         MixedHorde(horde_spec=spec, hidden_sizes=(4,), step_size=True)  # type: ignore[arg-type]
+
+
+def test_horde_loop_finishes_device_work_before_stopping_uptime_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+    from types import SimpleNamespace
+
+    import jax
+
+    import alberta_framework.core.horde as module
+
+    # LMS step size 1.0 diverges on this stream within 100 steps.
+    horde = HordeLearner(
+        horde_spec=create_horde_spec(_make_all_gamma0_spec(3)),
+        hidden_sizes=(4,),
+        sparsity=0.0,
+        step_size=0.1,
+    )
+    state = horde.init(5, jr.key(0))
+    observations = jnp.full((1024, 5), 0.1, dtype=jnp.float32)
+    cumulants = jnp.full((1024, 3), 0.2, dtype=jnp.float32)
+    scan_outputs: list[object] = []
+    real_scan = jax.lax.scan
+    real_time = time.time
+
+    def recording_scan(*args: object, **kwargs: object) -> object:
+        result = real_scan(*args, **kwargs)
+        scan_outputs.extend(jax.tree.leaves(result))
+        return result
+
+    def clock() -> float:
+        if scan_outputs:
+            assert all(leaf.is_ready() for leaf in scan_outputs if isinstance(leaf, jax.Array))
+        return real_time()
+
+    monkeypatch.setattr(jax.lax, "scan", recording_scan)
+    monkeypatch.setattr(module, "time", SimpleNamespace(time=clock))
+    result = run_horde_learning_loop(horde, state, observations, cumulants, observations)
+    assert scan_outputs
+    assert int(result.state.step_count) == 1024
+    assert bool(jnp.all(result.updates_applied))

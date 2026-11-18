@@ -8,6 +8,7 @@ are intentionally not regularized.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import cast
@@ -284,11 +285,21 @@ class AdamO:
         )
         task_step = task_update.step
         if regularize and config.isometry_strength != 0.0:
-            isometry_step = (
-                cast(float, config.isometry_step_size)
-                * config.isometry_strength
-                * isometry_gradient(parameter)
-            )
+            scale = cast(float, config.isometry_step_size) * config.isometry_strength
+            iso_gradient = isometry_gradient(parameter)
+            limits = np.finfo(parameter.dtype)
+            if limits.tiny <= scale <= limits.max:
+                isometry_step = scale * iso_gradient
+            else:
+                # The combined scalar can leave the storage range even when
+                # its product with the gradient is representable. Restore the
+                # exponent only after multiplying normalized components.
+                scale_mantissa, scale_exponent = math.frexp(scale)
+                gradient_mantissa, gradient_exponent = jnp.frexp(iso_gradient)
+                isometry_step = jnp.ldexp(
+                    scale_mantissa * gradient_mantissa,
+                    gradient_exponent + scale_exponent,
+                )
             step = task_step + isometry_step
         else:
             isometry_step = jnp.zeros_like(parameter)

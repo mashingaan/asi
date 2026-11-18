@@ -25,21 +25,7 @@ from jaxtyping import Bool, Float, Int
 from alberta_framework.core._float32_scalars import validated_float32_scalar
 
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _ACTUAL_FLOAT_TYPES = frozenset((float, np.float16, np.float32, np.float64, np.longdouble))
 _CONFIG_FIELDS = frozenset(
     {
@@ -88,6 +74,109 @@ def _resource_counts(n_actions: int, feature_dim: int) -> tuple[int, int]:
     return trainable, state_nbytes
 
 
+def _require_typed_threefry_key(name: str, value: object) -> Array:
+    """Require the two-word key assumed by the exact resource contract."""
+    if not isinstance(value, jax.Array) or tuple(value.shape) != ():
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key")
+    try:
+        implementation = str(jr.key_impl(value))
+        words = jr.key_data(value)
+    except Exception as error:
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key") from error
+    if (
+        implementation != "threefry2x32"
+        or tuple(words.shape) != (2,)
+        or words.dtype != jnp.uint32
+    ):
+        raise ValueError(f"{name} must be a typed scalar threefry2x32 key")
+    return value
+
+
+# float32's finite minimum, used to keep shifted log-probabilities representable
+# when the pairwise logit distance itself exceeds the float32 range (see
+# ``_temperature_scaled_logits``).
+_TEMPERATURE_SCALED_LOGITS_FLOAT32_MIN = float(np.finfo(np.float32).min)
+
+
+def _temperature_scaled_logits(
+    logits: Float[Array, " n_actions"],
+    temperature: float,
+) -> Float[Array, " n_actions"]:
+    """Scale logits for softmax without exposing a rounded argmax to fusion.
+
+    Under ``jax.jit`` on XLA:CPU, ``softmax(logits / T)`` with a
+    non-power-of-two ``T`` can return NaN for finite inputs: the compiler
+    recomputes the scale product inside both fused subcomputations of the
+    softmax, and the contracted multiply-then-subtract leaves a rounding
+    residual at the argmax instead of an exact zero; once ``|logits / T|``
+    is large enough that residual drives the exponential to ``inf`` or
+    ``0`` (SlopDotCash/asi#2886).
+
+    Both shifts below are exact (softmax and log-softmax are shift
+    invariant) and each blocks one of the two recomputations, the
+    construction measured immune across shapes in the issue report.
+    Measured on linux x86_64, JAX 0.11.0, single-threaded XLA:CPU: the
+    plain expression returns compiled-only ``[nan, nan]`` where eager is
+    ``[1, 0]`` for ``logits=[4e9, 0]`` at ``T=0.7``, and this construction
+    returns the eager answer on every onset-scale probe.  The issue's
+    original measurements were arm64-only; the defect is therefore not
+    arm64-specific, but whether a given fused shape triggers it remains
+    host- and toolchain-dependent — through this module's public API the
+    failure was only ever reproduced on arm64, so the macos-14 CI panel
+    runs the onset-scale regressions.
+
+    When the temperature exceeds one, halving both operands first is exact
+    and keeps the pre-scale centering finite for opposite finite extreme
+    logits whose pairwise distance exceeds the float32 maximum — inputs
+    where the plain ``logits / temperature`` expression stays finite and
+    must stay finite.  For temperatures at or below one, the centering
+    subtraction and the division itself can still overflow: float32 cannot
+    represent the pairwise distance of ``[3e38, -3e38]``, so the shifted
+    quotient reaches ``-inf`` and downstream ``probability *
+    log_probability`` entropy products evaluate ``0 * -inf`` as NaN.  The
+    negative tail is therefore clamped to the finite float32 minimum,
+    which is exact for every reported quantity: ``exp(floor)`` underflows
+    to zero exactly like ``exp(-inf)``, so softmax results, derived
+    probabilities, and the normalization sum are unchanged, while
+    log-probabilities stay finite and gradients remain finite.  In that
+    regime the plain expression is itself non-finite, so this is a
+    documented, deliberate deviation from it, not a change of any finite
+    answer.
+
+    Gradients are unchanged: the ``stop_gradient`` maxima are piecewise
+    constant almost everywhere, matching the internal ``stop_gradient``
+    that ``jax.nn.softmax`` already applies.
+    """
+    if temperature > 1.0:
+        # Halving both operands is exact and prevents centering opposite
+        # finite extremes from overflowing before a large temperature
+        # brings them in range.
+        logits = logits * jnp.asarray(0.5, dtype=logits.dtype)
+        temperature = temperature * 0.5
+    # Both shifts preserve softmax/log-softmax while keeping division in range.
+    centered = logits - jax.lax.stop_gradient(jnp.max(logits))
+    scaled = centered / jnp.asarray(temperature, dtype=logits.dtype)
+    shifted = scaled - jax.lax.stop_gradient(jnp.max(scaled))
+    # NaN propagates through maximum, so genuine NaN inputs still surface.
+    return jnp.maximum(shifted, _TEMPERATURE_SCALED_LOGITS_FLOAT32_MIN)
+
+
+def _stable_temperature_softmax(
+    logits: Float[Array, " n_actions"],
+    temperature: float,
+) -> Float[Array, " n_actions"]:
+    """Softmax over temperature-scaled logits; see :func:`_temperature_scaled_logits`."""
+    return jax.nn.softmax(_temperature_scaled_logits(logits, temperature))
+
+
+def _stable_temperature_log_softmax(
+    logits: Float[Array, " n_actions"],
+    temperature: float,
+) -> Float[Array, " n_actions"]:
+    """Log-softmax over temperature-scaled logits; see :func:`_temperature_scaled_logits`."""
+    return jax.nn.log_softmax(_temperature_scaled_logits(logits, temperature))
+
+
 # Matches the class of ceiling already established for other scan-driven
 # array-loop runners in ``core`` (e.g. ``average_reward._AVERAGE_REWARD_SEQUENCE_MAX_STEPS``,
 # ``learners._LEARNING_LOOP_MAX_STEPS``). Set with generous headroom above
@@ -96,6 +185,8 @@ def _resource_counts(n_actions: int, feature_dim: int) -> tuple[int, int]:
 # axis that ``run_behavior_model_from_arrays`` hands straight to
 # ``jax.lax.scan``.
 _BEHAVIOR_MODEL_SEQUENCE_MAX_STEPS = 50_000
+# Admits float32 softmax rounding, not an unnormalized target policy.
+_TARGET_PROBABILITY_SUM_TOLERANCE = 1e-4
 
 
 def _require_behavior_model_sequence_length(name: str, value: object) -> int:
@@ -126,7 +217,7 @@ def _behavior_model_update_working_set_bytes(n_actions: int, feature_dim: int) -
 
     ``update`` keeps the source state, the proposed state, and the
     transaction-selected result simultaneously live.  The worst-case path
-    also materializes a weight/bias gradient plus an L2 or clip copy,
+    also materializes a weight/bias gradient plus norm-scaled and L2 or clip copies,
     logits / probabilities / one-hot / logit-error, the observation, and
     neutralized returned logits/probabilities beside the committed state.
     """
@@ -135,8 +226,8 @@ def _behavior_model_update_working_set_bytes(n_actions: int, feature_dim: int) -
     persist_scalars = trainable + 6
     update_scalars = (
         3 * persist_scalars
-        + 2 * n_actions * feature_dim
-        + 2 * n_actions
+        + 3 * n_actions * feature_dim
+        + 3 * n_actions
         + 4 * n_actions
         + feature_dim
         + 2 * n_actions
@@ -165,6 +256,28 @@ def _saturating_int32_increment(value: Array) -> Array:
     maximum = jnp.asarray(_INT32_MAX, dtype=jnp.int32)
     counter = jnp.asarray(value, dtype=jnp.int32)
     return jnp.minimum(jnp.maximum(counter, 0), maximum - 1) + 1
+
+
+def _reduction_safe_l2_norm(*values: Array) -> Array:
+    """Preserve an ordinary L2 norm when only its square reduction overflows."""
+
+    direct_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    scale = jnp.asarray(0.0, dtype=jnp.float32)
+    all_finite = jnp.asarray(True, dtype=jnp.bool_)
+    for value in values:
+        direct_sum = direct_sum + jnp.sum(jnp.square(value))
+        scale = jnp.maximum(scale, jnp.max(jnp.abs(value)))
+        all_finite = all_finite & jnp.all(jnp.isfinite(value))
+    direct = jnp.sqrt(direct_sum)
+
+    _, exponent = jnp.frexp(scale)
+    scaled_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    for value in values:
+        scaled = jnp.ldexp(value, -exponent)
+        scaled_sum = scaled_sum + jnp.sum(jnp.square(scaled))
+    stable = jnp.ldexp(jnp.sqrt(scaled_sum), exponent)
+    reduction_only_overflow = ~jnp.isfinite(direct) & all_finite
+    return jnp.where(reduction_only_overflow, stable, direct)
 
 
 def _integer_action_ids(
@@ -225,11 +338,13 @@ def floor_and_renormalize_probabilities(
     if min_probability * n_actions >= 1.0:
         return jnp.ones_like(probs) / n_actions
     clipped = jnp.maximum(probs, 0.0)
-    normalizer = jnp.maximum(
-        jnp.sum(clipped, axis=-1, keepdims=True),
-        jnp.asarray(1e-12, dtype=jnp.float32),
-    )
-    normalized = clipped / normalizer
+    max_val = jnp.max(clipped, axis=-1, keepdims=True)
+    _, exponent = jnp.frexp(max_val)
+    scaled = jnp.ldexp(clipped, -exponent)
+    total = jnp.sum(scaled, axis=-1, keepdims=True)
+    valid = (max_val > 0.0) & (total > 0.0) & jnp.isfinite(total)
+    uniform = jnp.full_like(clipped, 1.0 / n_actions)
+    normalized = jnp.where(valid, scaled / jnp.where(valid, total, 1.0), uniform)
     floor_mass = jnp.asarray(min_probability * n_actions, dtype=jnp.float32)
     return jnp.asarray(min_probability, dtype=jnp.float32) + (1.0 - floor_mass) * normalized
 
@@ -272,6 +387,23 @@ def action_log_likelihoods(
     )
 
 
+def _require_target_distribution(target_probabilities: Array, n_actions: int) -> None:
+    """Reject a target policy that is not a distribution over ``n_actions``."""
+    target = jnp.asarray(target_probabilities)
+    if not jnp.issubdtype(target.dtype, jnp.floating):
+        raise ValueError("target_probabilities must have a real floating dtype")
+    if target.ndim == 0 or target.shape[-1] != n_actions:
+        raise ValueError(f"target_probabilities must have {n_actions} actions on the last axis")
+    if isinstance(target, jax.core.Tracer):
+        return
+    probabilities = np.asarray(target, dtype=np.float64)
+    if not bool(np.all(np.isfinite(probabilities))) or bool(np.any(probabilities < 0.0)):
+        raise ValueError("target_probabilities must be finite and non-negative")
+    totals = np.sum(probabilities, axis=-1)
+    if bool(np.any(np.abs(totals - 1.0) > _TARGET_PROBABILITY_SUM_TOLERANCE)):
+        raise ValueError("target_probabilities must sum to one")
+
+
 def clipped_importance_ratios(
     target_probabilities: Array,
     behavior_probabilities: Array,
@@ -293,7 +425,13 @@ def clipped_importance_ratios(
 
     Returns:
         Per-sample ratios with shape ``target_probabilities.shape[:-1]``.
+
+    Raises:
+        ValueError: If ``target_probabilities`` is not real floating with one
+            entry per behavior action or, when concrete, is not a finite
+            non-negative distribution along its last axis.
     """
+    _require_target_distribution(target_probabilities, jnp.shape(behavior_probabilities)[-1])
     target = selected_action_probabilities(
         target_probabilities,
         actions,
@@ -366,6 +504,10 @@ class BehaviorModelConfig:
         _resource_counts(self.n_actions, 1)
         step_size = _validated_config_float("step_size", self.step_size, lower=0.0)
         temperature = _validated_config_float("temperature", self.temperature, positive=True)
+        if temperature < float(np.finfo(np.float32).tiny):
+            raise ValueError(
+                f"temperature must be at least {np.finfo(np.float32).tiny} in float32"
+            )
         l2_penalty = _validated_config_float("l2_penalty", self.l2_penalty, lower=0.0)
         max_gradient_norm = (
             _validated_config_float(
@@ -636,6 +778,7 @@ class BehaviorModel:
     def init(self, feature_dim: int, key: Array) -> BehaviorModelState:
         """Initialize parameters and diagnostics."""
         feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
+        key = _require_typed_threefry_key("key", key)
         _resource_counts(self._config.n_actions, feature_dim)
         _preflight_behavior_model_update_working_set(
             self._config.n_actions,
@@ -682,6 +825,22 @@ class BehaviorModel:
             replay_capacity=0,
         )
 
+    @staticmethod
+    def _observation_vector(
+        state: BehaviorModelState,
+        observation: Array,
+    ) -> Float[Array, " feature_dim"]:
+        """Narrow one event observation without accepting batch or keepdims axes."""
+        expected_shape = (state.weights.shape[1],)
+        actual_shape = tuple(jnp.shape(observation))
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"observation must have shape {expected_shape}, got {actual_shape}"
+            )
+        if jnp.iscomplexobj(observation):
+            raise ValueError("observation must be real")
+        return jnp.asarray(observation, dtype=jnp.float32)
+
     @functools.partial(jax.jit, static_argnums=(0,))
     def predict_logits(
         self,
@@ -689,7 +848,7 @@ class BehaviorModel:
         observation: Array,
     ) -> Float[Array, " n_actions"]:
         """Predict behavior logits for one feature vector."""
-        obs = jnp.asarray(observation, dtype=jnp.float32)
+        obs = self._observation_vector(state, observation)
         return state.weights @ obs + state.bias
 
     @functools.partial(jax.jit, static_argnums=(0,))
@@ -700,7 +859,7 @@ class BehaviorModel:
     ) -> Float[Array, " n_actions"]:
         """Predict behavior action probabilities for one feature vector."""
         logits = self.predict_logits(state, observation)
-        return jax.nn.softmax(logits / self._config.temperature)
+        return _stable_temperature_softmax(logits, self._config.temperature)
 
     def action_probability(
         self,
@@ -766,15 +925,18 @@ class BehaviorModel:
     ) -> BehaviorModelInputGradient:
         """Execute one already identity-checked input-gradient transaction."""
         cfg = self._config
-        obs = jnp.asarray(observation, dtype=jnp.float32)
+        obs = self._observation_vector(state, observation)
         logits = state.weights @ obs + state.bias
-        scaled_logits = logits / cfg.temperature
-        probabilities = jax.nn.softmax(scaled_logits)
+        probabilities = _stable_temperature_softmax(logits, cfg.temperature)
         one_hot = jax.nn.one_hot(action_id, cfg.n_actions, dtype=jnp.float32)
-        loss = -jnp.sum(one_hot * jax.nn.log_softmax(scaled_logits))
+        loss = -jnp.sum(one_hot * _stable_temperature_log_softmax(logits, cfg.temperature))
         logit_gradient = (probabilities - one_hot) / cfg.temperature
         gradient = state.weights.T @ logit_gradient
-        gradient_norm = jnp.linalg.norm(gradient)
+        # Square only power-of-two-normalized components: a finite norm can
+        # survive even when the raw squares overflow or underflow float32.
+        _, exponent = jnp.frexp(jnp.max(jnp.abs(gradient)))
+        scaled_gradient = jnp.ldexp(gradient, -exponent)
+        gradient_norm = jnp.ldexp(jnp.linalg.norm(scaled_gradient), exponent)
         # Inf observation makes softmax NaN and W.T @ (p - one_hot)
         # non-finite, including 0*inf on a silent feature. The parameter
         # update already no-ops; this pre-update bridge must not hand a
@@ -838,9 +1000,9 @@ class BehaviorModel:
     ) -> BehaviorModelUpdateResult:
         """Execute one already identity-checked atomic update."""
         cfg = self._config
-        obs = jnp.asarray(observation, dtype=jnp.float32)
+        obs = self._observation_vector(state, observation)
         logits = state.weights @ obs + state.bias
-        probabilities = jax.nn.softmax(logits / cfg.temperature)
+        probabilities = _stable_temperature_softmax(logits, cfg.temperature)
         one_hot = jax.nn.one_hot(action_id, cfg.n_actions, dtype=jnp.float32)
 
         logit_error = (one_hot - probabilities) / cfg.temperature
@@ -851,9 +1013,7 @@ class BehaviorModel:
             bias_gradient = bias_gradient - cfg.l2_penalty * state.bias
 
         if cfg.max_gradient_norm is not None:
-            grad_norm = jnp.sqrt(
-                jnp.sum(weight_gradient * weight_gradient) + jnp.sum(bias_gradient * bias_gradient)
-            )
+            grad_norm = _reduction_safe_l2_norm(weight_gradient, bias_gradient)
             grad_scale = jnp.minimum(
                 1.0,
                 jnp.asarray(cfg.max_gradient_norm, dtype=jnp.float32)
@@ -910,9 +1070,10 @@ class BehaviorModel:
         # Inf observation makes softmax NaN and logit_error * x = 0*inf = NaN
         # on silent features. Hold the previous finite state.
         diagnostics_required = jnp.asarray(cfg.diagnostic_decay != 0.0, dtype=jnp.bool_)
-        source_finite = (
+        source_valid = (
             jnp.all(jnp.isfinite(state.weights))
             & jnp.all(jnp.isfinite(state.bias))
+            & (state.step_count >= 0)
             & (
                 (~diagnostics_required)
                 | (
@@ -933,7 +1094,7 @@ class BehaviorModel:
             & jnp.isfinite(new_state.accuracy_ema)
             & jnp.isfinite(new_state.confidence_ema)
         )
-        update_applied = source_finite & inputs_valid & proposed_finite
+        update_applied = source_valid & inputs_valid & proposed_finite
         committed = jax.lax.cond(
             update_applied,
             lambda: new_state,

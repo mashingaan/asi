@@ -75,19 +75,7 @@ from alberta_framework.core.world_model import (
 WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA = "alberta.world_model_ensemble.v2"
 _WORLD_MODEL_ENSEMBLE_CHECKPOINT_SCHEMA_V1 = "alberta.world_model_ensemble.v1"
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_ACTUAL_INT_TYPES: tuple[type, ...] = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 _ACTUAL_FLOAT_TYPES = frozenset(
     {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
 )
@@ -114,6 +102,14 @@ def _validated_config_float(name: str, value: object, **bounds: Any) -> float:
     if type(value) not in (frozenset(_ACTUAL_INT_TYPES) | _ACTUAL_FLOAT_TYPES):
         raise ValueError(f"{name} must be a finite real scalar")
     return validated_float32_scalar(name, value, **bounds)
+
+
+def _require_one_jax_prng_key(name: str, value: Array) -> Array:
+    """Reject a key whose word payload is not one (2,) uint32 JAX PRNG key."""
+    key_data = jr.key_data(value)
+    if key_data.shape != (2,) or key_data.dtype != jnp.uint32:
+        raise ValueError(f"{name} must be one JAX PRNG key")
+    return value
 
 
 def _member_state_scalars(config: ActionConditionedWorldModelConfig) -> int:
@@ -229,7 +225,11 @@ def _preflight_ensemble_update_working_set(
 def _safe_mean(values: Array, *, axis: int | None = None) -> Array:
     """Compute a float32 mean without first forming an overflowing sum."""
     divisor = values.size if axis is None else values.shape[axis]
-    return jnp.sum(values / jnp.asarray(divisor, dtype=values.dtype), axis=axis)
+    scaled_mean = jnp.sum(values / jnp.asarray(divisor, dtype=values.dtype), axis=axis)
+    # Dividing first can flush normal inputs to zero on float32 CPU backends.
+    summed_mean = jnp.mean(values, axis=axis)
+    recover = (scaled_mean == 0) & jnp.isfinite(summed_mean)
+    return jnp.where(recover, summed_mean, scaled_mean)
 
 
 _REPLAY_KEY_FOLD_IN = 0x5245504C
@@ -373,14 +373,26 @@ class WorldModelEnsembleConfig:
             raise ValueError("config must be a readable mapping") from error
         if any(type(key) is not str for key in payload):
             raise ValueError("config keys must be exact strings")
-        type_name = payload.pop("type", None)
-        if type_name is not None and (
-            type(type_name) is not str or type_name != "WorldModelEnsembleConfig"
-        ):
+        expected_fields = {
+            "type",
+            "model",
+            "signal_estimator",
+            "ensemble_size",
+            "bootstrap_probability",
+            "residual_variance_decay",
+            "residual_variance_warmup_steps",
+            "residual_variance_floor",
+            "development_only",
+            "accepted_scientific_evidence",
+        }
+        if set(payload) != expected_fields:
+            raise ValueError("config fields do not match the world-model ensemble schema")
+        type_name = payload.pop("type")
+        if type(type_name) is not str or type_name != "WorldModelEnsembleConfig":
             raise ValueError("type must be WorldModelEnsembleConfig")
-        if payload.pop("development_only", True) is not True:
+        if payload.pop("development_only") is not True:
             raise ValueError("world-model ensemble is development_only")
-        if payload.pop("accepted_scientific_evidence", False) is not False:
+        if payload.pop("accepted_scientific_evidence") is not False:
             raise ValueError("world-model ensemble is not accepted scientific evidence")
         raw_model = payload.pop("model")
         raw_signals = payload.pop("signal_estimator")
@@ -898,7 +910,9 @@ class WorldModelEnsemble:
         self._config = config
         self._model = ActionConditionedWorldModel(config.model)
         self._signals = LearningSignalEstimator(config.signal_estimator)
-        self._member_state_static_signature = _tree_static_signature(self._model.init(jr.key(0)))
+        self._member_state_static_signature = _tree_static_signature(
+            self._model.init(jr.key(0, impl="threefry2x32"))
+        )
         self._signal_state_static_signature = _tree_static_signature(self._signals.init())
 
     @property
@@ -934,13 +948,11 @@ class WorldModelEnsemble:
             raise ValueError("ensemble payload must be a readable mapping") from error
         if any(type(key) is not str for key in payload):
             raise ValueError("ensemble payload keys must be exact strings")
-        type_name = payload.pop("type", None)
-        if type_name is not None and (
-            type(type_name) is not str or type_name != "WorldModelEnsemble"
-        ):
+        if set(payload) != {"type", "config"}:
+            raise ValueError("ensemble payload fields do not match the construction schema")
+        type_name = payload.pop("type")
+        if type(type_name) is not str or type_name != "WorldModelEnsemble":
             raise ValueError("type must be WorldModelEnsemble")
-        if set(payload) != {"config"}:
-            raise ValueError("world-model ensemble config keys are invalid")
         nested = payload["config"]
         if not issubclass(type(nested), Mapping):
             raise ValueError("nested ensemble config must be an actual mapping")
@@ -948,6 +960,7 @@ class WorldModelEnsemble:
 
     def init(self, key: Array) -> WorldModelEnsembleState:
         """Initialize distinct members and isolated real/replay mask streams."""
+        _require_one_jax_prng_key("key", key)
         keys = jr.split(key, self._config.ensemble_size + 1)
         member_states = tuple(
             self._model.init(keys[index]) for index in range(self._config.ensemble_size)
@@ -1147,12 +1160,8 @@ class WorldModelEnsemble:
             if array.shape != shape or array.dtype != jnp.dtype(dtype):
                 raise ValueError(f"{name} must have shape {shape} and dtype {dtype}")
 
-        key_data = jr.key_data(state.bootstrap_key)
-        if key_data.shape != (2,) or key_data.dtype != jnp.uint32:
-            raise ValueError("state.bootstrap_key must be one JAX PRNG key")
-        replay_key_data = jr.key_data(state.replay_bootstrap_key)
-        if replay_key_data.shape != (2,) or replay_key_data.dtype != jnp.uint32:
-            raise ValueError("state.replay_bootstrap_key must be one JAX PRNG key")
+        _require_one_jax_prng_key("state.bootstrap_key", state.bootstrap_key)
+        _require_one_jax_prng_key("state.replay_bootstrap_key", state.replay_bootstrap_key)
 
     @staticmethod
     def _signal_state_valid(state: LearningSignalEstimatorState) -> Array:
@@ -2091,6 +2100,8 @@ def load_world_model_ensemble_checkpoint(
     resource_budget = metadata.get("resource_budget")
     if type(resource_budget) is not dict or resource_budget != expected_budget:
         raise ValueError("ensemble checkpoint resource budget does not match config")
+    if set(metadata) != {"schema", "ensemble_config", "config_sha256", "resource_budget"}:
+        raise ValueError("ensemble checkpoint metadata fields do not match the schema")
     restored, restored_metadata = load_checkpoint(restore_template, path)
     if restored_metadata != metadata:
         raise ValueError("ensemble checkpoint metadata changed between reads")

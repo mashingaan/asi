@@ -859,6 +859,113 @@ class TestBayesReference:
 
         np.testing.assert_array_equal(predictions, np.asarray([2], dtype=np.int32))
 
+    @pytest.mark.parametrize("offset", [1_000_000.0, 10_000_000.0])
+    def test_bayes_nonunit_sigma_shared_offset(self, offset):
+        # Synthetic numerical inputs, not a benchmark or scientific evaluation.
+        means = np.asarray(
+            [[[offset, offset]], [[offset + 1.0, offset + 1.0]]],
+            dtype=np.float32,
+        )
+        sigma = np.asarray([3.0, 7.0], dtype=np.float32)
+        coordinates = np.linspace(-1.0, 2.0, 49, dtype=np.float32)
+        grid = np.stack(np.meshgrid(coordinates, coordinates), axis=-1).reshape(-1, 2)
+        observations = np.unique(np.float32(offset) + grid, axis=0)
+
+        # Promote stored float32 inputs before independent oracle arithmetic.
+        distances = np.sum(
+            (
+                (observations.astype(np.float64)[:, None, :]
+                 - means.astype(np.float64)[None, :, 0, :])
+                / sigma.astype(np.float64)
+            ) ** 2,
+            axis=2,
+        )
+        # Exclude ties and cases too close to a tie for a float32 comparison.
+        selected = np.abs(distances[:, 0] - distances[:, 1]) > 1e-5
+        expected = np.argmin(distances[selected], axis=1).astype(np.int32)
+        assert expected.size > 0
+        assert np.unique(expected).size == 2
+        inputs = (
+            jnp.asarray(means),
+            jnp.asarray(sigma),
+            jnp.asarray(observations[selected]),
+        )
+        for actual in (
+            np.asarray(bayes_predict(*inputs)),
+            np.asarray(jax.jit(bayes_predict)(*inputs)),
+        ):
+            assert actual.dtype == np.int32
+            np.testing.assert_array_equal(actual, expected)
+
+    @pytest.mark.parametrize("sigma_scale", [1e20, 1e-10])
+    def test_bayes_predict_handles_opposite_sign_overflow_after_sigma(self, sigma_scale):
+        # Synthetic numerical inputs, not a benchmark or scientific evaluation.
+        means = jnp.asarray([[[-3e38]], [[-1e38]]], dtype=jnp.float32)
+        sigma = jnp.asarray([sigma_scale], dtype=jnp.float32)
+        observations = jnp.asarray([[3e38]], dtype=jnp.float32)
+
+        # Promote stored float32 inputs before independent oracle arithmetic.
+        means64 = np.asarray(means, dtype=np.float64)
+        sigma64 = np.asarray(sigma, dtype=np.float64)
+        observations64 = np.asarray(observations, dtype=np.float64)
+        distances = np.sum(
+            ((observations64[:, None, :] - means64[None, :, 0, :]) / sigma64) ** 2,
+            axis=2,
+        )
+        expected = np.argmin(distances, axis=1).astype(np.int32)
+        np.testing.assert_array_equal(expected, np.asarray([1], dtype=np.int32))
+
+        for actual in (
+            np.asarray(bayes_predict(means, sigma, observations)),
+            np.asarray(jax.jit(bayes_predict)(means, sigma, observations)),
+        ):
+            assert actual.dtype == np.int32
+            np.testing.assert_array_equal(actual, expected)
+    def test_bayes_predict_keeps_nearer_class_when_squared_distances_overflow(self):
+        """A finite overflow of both squared distances must not select class 0."""
+
+        scale = jnp.asarray(2.0**63, dtype=jnp.float32)
+        big = jnp.asarray(2.0**65, dtype=jnp.float32)
+        means = jnp.zeros((2, 1, 8), dtype=jnp.float32)
+        means = means.at[0, 0, 0].set(big)
+        means = means.at[1, 0, :].set(scale)
+        observations = jnp.zeros((1, 8), dtype=jnp.float32)
+        sigma = jnp.ones((8,), dtype=jnp.float32)
+        delta0 = np.asarray(observations[0] - means[0, 0], dtype=np.float64)
+        delta1 = np.asarray(observations[0] - means[1, 0], dtype=np.float64)
+
+        assert not bool(jnp.isfinite(jnp.sum(jnp.square(observations[0] - means[0, 0]))))
+        assert not bool(jnp.isfinite(jnp.sum(jnp.square(observations[0] - means[1, 0]))))
+        assert float(np.sum(delta1 * delta1)) < float(np.sum(delta0 * delta0))
+
+        predictions = bayes_predict(means, sigma, observations)
+
+        np.testing.assert_array_equal(predictions, np.asarray([1], dtype=np.int32))
+
+    @pytest.mark.parametrize(
+        ("near_offsets", "far_offset", "nearer"),
+        [
+            ((2.0**63,) * 8, 1e38, 0),
+            ((2.0**63,) * 8, 3e38, 0),
+            ((2.0**63,) * 8, 1e38, 1),
+        ],
+    )
+    def test_bayes_predict_keeps_nearer_class_above_two_to_the_126(
+        self, near_offsets, far_offset, nearer
+    ):
+        """A per-sample max coordinate above 2**126 must not scale to zero."""
+
+        means = jnp.zeros((2, 1, 8), dtype=jnp.float32)
+        means = means.at[nearer, 0, :].set(jnp.asarray(near_offsets, dtype=jnp.float32))
+        means = means.at[1 - nearer, 0, 0].set(jnp.asarray(far_offset, dtype=jnp.float32))
+        observations = jnp.zeros((1, 8), dtype=jnp.float32)
+        sigma = jnp.ones((8,), dtype=jnp.float32)
+
+        for jitted in (False, True):
+            predict = jax.jit(bayes_predict) if jitted else bayes_predict
+            predictions = predict(means, sigma, observations)
+            np.testing.assert_array_equal(predictions, np.asarray([nearer], dtype=np.int32))
+
     def test_stream_geometry_matches_reference_geometry(self):
         stream = generate_stream(TINY, seed=5)
         means, dim_sigma = class_geometry(TINY, seed=5)
@@ -1751,6 +1858,31 @@ class TestTransferValidation:
         with pytest.raises(ValueError, match="seed"):
             transfer_validation(ladder)
 
+    @pytest.mark.parametrize(
+        "poison",
+        [float("nan"), float("inf"), -0.5, 1.5],
+        ids=["nan", "inf", "negative", "above_one"],
+    )
+    def test_out_of_domain_accuracy_rejected(self, poison: float):
+        ladder = _synthetic_ladder()
+        ladder["sgd_raw"][1] = ladder["sgd_raw"][1].copy()
+        ladder["sgd_raw"][1][3] = poison
+        with pytest.raises(ValueError, match="sgd_raw"):
+            transfer_validation(ladder)
+
+    @pytest.mark.parametrize(
+        "curve",
+        [np.zeros(0), np.float64(0.5), np.full((8, 2), 0.5)],
+        ids=["empty", "scalar", "matrix"],
+    )
+    def test_non_vector_curve_rejected(self, curve: np.ndarray):
+        ladder = _synthetic_ladder()
+        for arm in ladder:
+            ladder[arm][0] = curve
+            ladder[arm][1] = curve
+        with pytest.raises(ValueError, match="per-regime curve"):
+            transfer_validation(ladder)
+
     def test_from_shards(self, tmp_path: Path):
         paths = []
         for arm in LADDER_ARMS:
@@ -1875,6 +2007,36 @@ class TestCLI:
         ):
             main([*base, "--hidden1", "16", "--hidden2", "6"])
         assert path.read_bytes() == first
+
+    def test_run_refuses_to_skip_a_shard_recorded_for_another_arm_or_seed(
+        self, tmp_path: Path
+    ):
+        """The idempotent skip must bind the payload's arm and seed, not just the path name."""
+        import shutil
+
+        base = [
+            "run", "--family", "input_permutation", "--out", str(tmp_path), *self.ARGS,
+        ]
+        assert main([*base, "--arm", "sgd_raw", "--seed", "0"]) == 0
+        genuine = micro_shard_path(tmp_path, "input_permutation", "sgd_raw", 0)
+        relabeled_seed = micro_shard_path(tmp_path, "input_permutation", "sgd_raw", 7)
+        relabeled_arm = micro_shard_path(tmp_path, "input_permutation", "naive_bayes", 0)
+        shutil.copyfile(genuine, relabeled_seed)
+        shutil.copyfile(genuine, relabeled_arm)
+        with pytest.raises(
+            ValueError,
+            match=r"existing shard records arm='sgd_raw' seed=0, not the requested "
+            r"arm='sgd_raw' seed=7; use a fresh --out directory",
+        ):
+            main([*base, "--arm", "sgd_raw", "--seed", "7"])
+        with pytest.raises(
+            ValueError,
+            match=r"existing shard records arm='sgd_raw' seed=0, not the requested "
+            r"arm='naive_bayes' seed=0; use a fresh --out directory",
+        ):
+            main([*base, "--arm", "naive_bayes", "--seed", "0"])
+        assert relabeled_seed.read_bytes() == genuine.read_bytes()
+        assert relabeled_arm.read_bytes() == genuine.read_bytes()
 
     def test_ladder_partial_arms_writes_summary_only(self, tmp_path: Path):
         argv = [
@@ -2096,3 +2258,33 @@ def test_micro_run_result_rejects_numeric_subclasses_without_conversion_hooks() 
         _legal_micro_run_result(overall_accuracy=HostileFloat(0.5))
     with pytest.raises(ValueError, match="wall_clock_seconds"):
         _legal_micro_run_result(wall_clock_seconds=HostileFloat(1.0))
+
+
+def test_sgd_raw_zero_step_size_preserves_params_under_infinite_grads() -> None:
+    """Frozen SGD must not poison params when grads overflow to inf.
+
+    Hyperparameter freeze accepts ``step_size=0.0``. The update used to
+    evaluate ``params - 0 * grads``, which is ``0 * inf = NaN`` and destroys
+    finite parameters on a no-op step.
+    """
+    params = {"w": jnp.array([1.0, -2.0], dtype=jnp.float32)}
+    grads = {"w": jnp.array([jnp.inf, 3.0], dtype=jnp.float32)}
+    assert bool(jnp.isnan(jnp.float32(0.0) * jnp.float32(jnp.inf)))
+
+    updated = micro_continual._sgd_raw_param_update(
+        params, grads, step_size=0.0, weight_decay=0.01
+    )
+    chex.assert_trees_all_equal(updated, params)
+    assert bool(jnp.all(jnp.isfinite(updated["w"])))
+
+
+def test_sgd_raw_nonzero_step_size_still_applies_to_finite_grads() -> None:
+    params = {"w": jnp.array([1.0, -2.0], dtype=jnp.float32)}
+    grads = {"w": jnp.array([0.5, -1.0], dtype=jnp.float32)}
+    updated = micro_continual._sgd_raw_param_update(
+        params, grads, step_size=0.1, weight_decay=0.0
+    )
+    chex.assert_trees_all_close(
+        updated["w"],
+        params["w"] - 0.1 * grads["w"],
+    )

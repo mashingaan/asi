@@ -19,6 +19,7 @@ from fractions import Fraction
 from types import MappingProxyType
 from typing import Any, SupportsIndex, cast
 
+import jax
 import numpy as np
 
 from alberta_framework.core._float32_scalars import validated_float32_scalar
@@ -39,21 +40,11 @@ _JSON_MAX_STRING_LENGTH: int = 65_536
 _JSON_MAX_INTEGER_BITS: int = 64
 _ORACLE_EXPERIENCE_SCHEMA = "alberta.security_gym.oracle_experience.v1"
 
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
+_CONFUSION_MATRIX_LABELS: frozenset[str] = frozenset(
+    {"true_positive", "false_positive", "true_negative", "false_negative"}
 )
+
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _ACTUAL_FLOAT_TYPES = frozenset(
     {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
 )
@@ -297,8 +288,7 @@ class SecurityRewardWeights:
             "compromise_cost",
             "recovery",
         ):
-            if type(getattr(self, name)) is bool:
-                raise ValueError(f"{name} must be a finite real number")
+            object.__setattr__(self, name, _require_finite_real(name, getattr(self, name)))
 
     def to_dict(self) -> dict[str, float]:
         """Return a JSON-serializable weight mapping."""
@@ -363,11 +353,24 @@ class SecurityFeatureSchema:
 
     def validate_observation(self, observation: Sequence[float]) -> None:
         """Raise ``ValueError`` if an observation does not match this schema."""
-        if len(observation) != self.feature_dim:
+        actual_type: type[object] = type(observation)
+        values: list[object]
+        if actual_type is list or actual_type is tuple:
+            values = list(observation)
+        elif actual_type is np.ndarray or issubclass(actual_type, jax.Array):
+            array = np.asarray(observation)
+            if array.ndim != 1:
+                raise ValueError("observation must be one-dimensional")
+            values = array.tolist()
+        else:
+            raise ValueError("observation must be an exact list, tuple, or array")
+        if len(values) != self.feature_dim:
             raise ValueError(
-                f"observation length {len(observation)} does not match "
+                f"observation length {len(values)} does not match "
                 f"schema feature_dim {self.feature_dim}"
             )
+        for index, value in enumerate(values):
+            _require_finite_real(f"observation[{index}]", value)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable schema mapping."""
@@ -456,6 +459,18 @@ class SecurityRolloutStep:
         _require_rfc_json_mapping(payload, name="security rollout step")
         return payload
 
+    def _revalidated_copy(self) -> SecurityRolloutStep:
+        """Reconstruct the record before a public validator trusts its fields."""
+        return SecurityRolloutStep(
+            state=self.state,
+            action=self.action,
+            reward=self.reward,
+            next_state=self.next_state,
+            terminated=self.terminated,
+            truncated=self.truncated,
+            policy_metadata=self.policy_metadata,
+        )
+
     @classmethod
     def from_dict(cls, data: object) -> SecurityRolloutStep:
         """Reconstruct a rollout step from ``to_dict`` output."""
@@ -538,6 +553,14 @@ class SecurityOracleExperience:
             )
             if type(label) is not str or label != expected_label:
                 raise ValueError("security oracle outcome label does not match action metadata")
+        label = outcome.get("label")
+        if type(label) is str and label in _CONFUSION_MATRIX_LABELS:
+            possible_labels = {
+                _security_outcome_label(action=self.action, is_malicious=True),
+                _security_outcome_label(action=self.action, is_malicious=False),
+            }
+            if label not in possible_labels:
+                raise ValueError("security oracle outcome label is impossible for action")
         object.__setattr__(self, "state", state)
         object.__setattr__(self, "reward", reward)
         object.__setattr__(self, "outcome", _freeze_json_mapping(outcome))
@@ -671,9 +694,13 @@ def coerce_security_action(action: object) -> SecurityAction:
         raise ValueError("security action must not be a boolean")
     if type(action) is SecurityAction:
         return action
-    if type(action) is int:
+    # Accept the same exact integer types as every other integer gate in this
+    # module. Gymnasium ``Discrete`` sampling and ``argmax`` over action values
+    # both hand callers a numpy integer, and ``to_security_gym_action`` already
+    # admits those types for ``risk_score``.
+    if any(type(action) is allowed for allowed in _ACTUAL_INT_TYPES):
         try:
-            return SecurityAction(action)
+            return SecurityAction(operator.index(cast(SupportsIndex, action)))
         except ValueError as exc:
             raise ValueError("unknown security action") from exc
     if type(action) is str:
@@ -735,10 +762,17 @@ def validate_security_rollout(
     schema: SecurityFeatureSchema,
 ) -> None:
     """Validate that rollout transitions satisfy the active-defense contract."""
+    if type(steps) is not list and type(steps) is not tuple:
+        raise ValueError("security rollout steps must be an exact list or tuple")
+    if type(schema) is not SecurityFeatureSchema:
+        raise ValueError("schema must be an exact SecurityFeatureSchema")
     for idx, step in enumerate(steps):
+        if type(step) is not SecurityRolloutStep:
+            raise ValueError(f"invalid rollout step {idx}: wrong record type")
         try:
-            schema.validate_observation(step.state)
-            schema.validate_observation(step.next_state)
+            validated = step._revalidated_copy()
+            schema.validate_observation(validated.state)
+            schema.validate_observation(validated.next_state)
         except ValueError as exc:
             raise ValueError(f"invalid rollout step {idx}: {exc}") from exc
 

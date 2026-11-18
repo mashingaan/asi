@@ -157,10 +157,10 @@ def _preflight_static_resources(
     n_phases = num_steps // phase_length
     # Exact state-tree measurements for the fixed two-state/two-action/one-option
     # protocol. Host timing floats are included at their deployed eight bytes.
-    recommendation_state_scalars = 113 + 2 * n_demons
-    recommendation_state_bytes = 468 + 8 * n_demons
-    augmented_state_scalars = 103 + 7 * n_demons
-    augmented_state_bytes = 428 + 28 * n_demons
+    recommendation_state_scalars = 115 + 2 * n_demons
+    recommendation_state_bytes = 476 + 8 * n_demons
+    augmented_state_scalars = 105 + 7 * n_demons
+    augmented_state_bytes = 436 + 28 * n_demons
     # The recommendation scan retains 21 bytes/step of outputs while its
     # uint32 split-key schedule is live. The three recommendation results each
     # retain 41 bytes/step; the three plain results each retain 33 because one
@@ -1479,6 +1479,16 @@ def aggregate_ia_evidence(
     mean_recovery: dict[IAConditionName, float] = {}
     for condition, group in groups.items():
         values = np.concatenate([result.recovery_lengths for result in group])
+        if values.size == 0:
+            # A schedule with no phase switch has nothing to recover from. The
+            # mean of an empty vector is NaN and the conditional mean below is
+            # inf, while ``all_values_finite`` only inspects rewards and phase
+            # means, so the aggregate would report a finite-looking record with
+            # non-finite recovery evidence. Fail closed instead.
+            raise ValueError(
+                f"recovery evidence is empty for condition {condition!r}; "
+                "the schedule must contain at least one phase switch"
+            )
         recovered = values >= 0
         recovery_fraction[condition] = float(np.mean(recovered))
         mean_recovery[condition] = (

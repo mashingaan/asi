@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added a unit test that re-derives the stored
+  `outputs/ipmnist_screening/summary.json` campaign record from the shards on
+  disk, matching its sibling retention tests for `frontier_results.json` and
+  the ceiling summary. Every measurement field, the shard count, the protocol
+  config, the evidence policy, and the rank order must reproduce; only the run
+  stamp and the two keys added after the payload was written may differ.
+- Added the execution-gated `asi-bimu-matched-development` campaign for the
+  bounded five-task BiMU mechanism-on versus memory-off comparison. Its fixed
+  six-shard namespace, fresh-process roster, paired outcome rule, validators,
+  and resource/provenance bindings are permanently nonpromoting and not
+  paper-comparable; execution remains explicitly unauthorized. Its publicly
+  exposed three-seed development roster is consumed for promotion and has no
+  retained matched result.
 - Added the unfrozen `preview1` reference-agent transaction ledger, primitive
   Prototype adapter, aggregate SwitchingTwoState/RiverSwim life runner, and
   development-only quiescent checkpoint codec. These L0 mechanisms enforce
@@ -74,6 +87,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The average-reward Horde actor uses centered temperature-scaled logits so
+  compiled softmax stays finite for extreme logits. Subnormal temperatures
+  are rescaled before device division to preserve the configured policy scale.
+- `ipmnist_screening.load_shard` now rejects a non-string `schema` and a legacy
+  v1 shard without a `config` object as `ValueError`s. Testing an unhashable
+  JSON array/object schema against the supported-schema set raised
+  `TypeError: unhashable type`, and the legacy path indexed `payload["config"]`
+  before validating it, so an absent key raised `KeyError`. Both malformed
+  artifacts crashed merge, proxy, and preregistration validation instead of
+  failing closed through the loader's validation contract.
+- `upgd_label_emnist.load_plan` now rejects a plan body whose keys differ from
+  the schema `build_plan_payload` writes, a duplicate or non-string
+  `learner_ids` entry, and a non-integer `planned_shard_count` with
+  `ValueError` instead of `KeyError` or silent acceptance. Shard validation
+  routes per-task curves and `average_online_accuracy` through the finite-real
+  gate, so a string mean, an absent mean, and nested or boolean curve entries
+  fail the loader contract instead of being coerced.
+- Required every merged screening arm's recorded `base_learner` to match its
+  registered arm. `load_shard` cross-checks the registered arm only for
+  source-bound v2/v3 shards and the campaign's live format is v1, so a v1 arm
+  whose seeds all agreed on a learner its registry entry never registered could
+  still rank, and `merge_shards` publishes that recorded field as the arm's
+  identity. The existing within-arm consistency check runs first and cannot
+  catch a batch that is consistently wrong.
+- `upgd_memory._normalize_simplex` now returns a probability simplex for
+  zero, negative, sub-`1e-12`, and float32-overflowing inputs.  The previous
+  floored-denominator helper could drop mass (including the reachable
+  zeros `previous_targets` target-trace blend) without reporting it.
 - Canonicalized discounted-SARSA lifecycle timers at the exact-dispatch
   reference-control boundary. The first compiled update can no longer grow
   persistent numeric state by promoting two host floats into JAX leaves, so

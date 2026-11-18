@@ -28,6 +28,7 @@ _ACTUAL_DECAY_TYPES = frozenset(
         *(np.dtype(code).type for code in "bBhHiIlLqQpefdg"),
     }
 )
+_NORMALIZATION_MODES = frozenset({"none", "age", "uncertainty", "uncertainty_age"})
 
 
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
@@ -68,7 +69,43 @@ def _require_exact_mode(value: object) -> str:
 
     if type(value) is not str:
         raise ValueError("mode must be an exact string")
+    if value not in _NORMALIZATION_MODES:
+        raise ValueError(f"mode must be one of {sorted(_NORMALIZATION_MODES)}")
     return value
+
+
+def _require_ema_decay_operand(name: str, value: float | Array) -> Array:
+    """Validate a helper decay; a device value cannot raise, so it stays visible."""
+    if np.shape(value):
+        raise ValueError(f"{name} must be a scalar")
+    if not isinstance(value, Array):
+        return jnp.asarray(canonical_float32_ema_decay(name, value), dtype=jnp.float32)
+    decay = jnp.asarray(value, dtype=jnp.float32)
+    return jnp.where((decay >= 0.0) & (decay < 1.0), decay, jnp.nan)
+
+
+def _validate_estimator_axes(
+    errors: Array,
+    feature_values: Array,
+    active_mask: Array,
+    step_size_output: float | Array,
+    active_count: float | Array,
+) -> tuple[int, int]:
+    """Reject shape broadcasts before they can change retained estimator state."""
+    error_shape = jnp.shape(errors)
+    feature_shape = jnp.shape(feature_values)
+    mask_shape = jnp.shape(active_mask)
+    if len(error_shape) != 1:
+        raise ValueError("errors must be a rank-one task vector")
+    if len(feature_shape) != 1:
+        raise ValueError("feature_values must be a rank-one feature vector")
+    if mask_shape != error_shape:
+        raise ValueError("active_mask must match errors exactly")
+    if not jnp.issubdtype(jnp.asarray(active_mask).dtype, jnp.bool_):
+        raise ValueError("active_mask must have boolean dtype")
+    if jnp.shape(step_size_output) or jnp.shape(active_count):
+        raise ValueError("step_size_output and active_count must be scalars")
+    return error_shape[0], feature_shape[0]
 
 
 class FutureUtilityEstimate(NamedTuple):
@@ -148,6 +185,9 @@ def one_step_output_loss_reduction_with_diagnostics(
         Non-negative per-task/per-feature predicted loss reductions with
         inactive tasks masked to zero.
     """
+    _validate_estimator_axes(
+        errors, feature_values, active_mask, step_size_output, active_count
+    )
     step_size = jnp.asarray(step_size_output, dtype=jnp.float32)
     count = jnp.asarray(active_count, dtype=jnp.float32)
     delta_prediction = (
@@ -156,7 +196,9 @@ def one_step_output_loss_reduction_with_diagnostics(
         * (feature_values[None, :] ** 2)
         / jnp.maximum(count, 1.0)
     )
-    reduction = errors[:, None] * delta_prediction - 0.5 * delta_prediction**2
+    # Subtract before multiplying: both expanded products can overflow even
+    # when their difference is a representable loss reduction.
+    reduction = delta_prediction * (errors[:, None] - 0.5 * delta_prediction)
     reduction = jnp.maximum(reduction, 0.0)
     proposed = jnp.where(active_mask[:, None], reduction, 0.0)
     inputs_valid = (
@@ -223,6 +265,17 @@ def contribution_trace_output_loss_reduction_with_diagnostics(
     Returns:
         ``(reductions, new_contribution_trace, new_feature_energy_trace)``.
     """
+    n_tasks, n_features = _validate_estimator_axes(
+        errors, feature_values, active_mask, step_size_output, active_count
+    )
+    if jnp.shape(contribution_trace) != (n_tasks, n_features):
+        raise ValueError(
+            "contribution_trace must have shape (n_tasks, n_features)"
+        )
+    if jnp.shape(feature_energy_trace) != (n_features,):
+        raise ValueError("feature_energy_trace must match feature_values")
+    if jnp.shape(trace_decay):
+        raise ValueError("trace_decay must be a scalar")
     decay = jnp.asarray(trace_decay, dtype=jnp.float32)
     step_size = jnp.asarray(step_size_output, dtype=jnp.float32)
     count = jnp.asarray(active_count, dtype=jnp.float32)
@@ -247,9 +300,9 @@ def contribution_trace_output_loss_reduction_with_diagnostics(
         * feature_values[None, :]
         / jnp.maximum(count, 1.0)
     )
-    reduction = (
-        delta_weight * new_contribution_trace
-        - 0.5 * (delta_weight**2) * new_feature_energy_trace[None, :]
+    reduction = delta_weight * (
+        new_contribution_trace
+        - (0.5 * delta_weight) * new_feature_energy_trace[None, :]
     )
     reduction = jnp.maximum(reduction, 0.0)
     proposed_reductions = jnp.where(active_mask[:, None], reduction, 0.0)
@@ -360,6 +413,17 @@ def trace_output_loss_reduction_with_diagnostics(
         new_feature_energy_trace)``.  ``reductions`` is non-negative and masked
         for inactive tasks.
     """
+    n_tasks, n_features = _validate_estimator_axes(
+        errors, feature_values, active_mask, step_size_output, active_count
+    )
+    if jnp.shape(error_trace) != (n_tasks,):
+        raise ValueError("error_trace must match errors exactly")
+    if jnp.shape(feature_trace) != (n_features,):
+        raise ValueError("feature_trace must match feature_values")
+    if jnp.shape(feature_energy_trace) != (n_features,):
+        raise ValueError("feature_energy_trace must match feature_values")
+    if jnp.shape(trace_decay):
+        raise ValueError("trace_decay must be a scalar")
     decay = jnp.asarray(trace_decay, dtype=jnp.float32)
     step_size = jnp.asarray(step_size_output, dtype=jnp.float32)
     count = jnp.asarray(active_count, dtype=jnp.float32)
@@ -381,9 +445,8 @@ def trace_output_loss_reduction_with_diagnostics(
     )
     recurring_error_feature = new_error_trace[:, None] * new_feature_trace[None, :]
     recurring_feature_energy = new_feature_energy_trace[None, :]
-    reduction = (
-        delta_weight * recurring_error_feature
-        - 0.5 * (delta_weight**2) * recurring_feature_energy
+    reduction = delta_weight * (
+        recurring_error_feature - (0.5 * delta_weight) * recurring_feature_energy
     )
     reduction = jnp.maximum(reduction, 0.0)
     proposed_reductions = jnp.where(active_mask[:, None], reduction, 0.0)
@@ -481,13 +544,34 @@ def normalize_future_utility_signal(
     ``ages`` and ``utility_decay`` remain in this established helper surface so
     existing callers and serialized configurations remain compatible.
     """
+    if jnp.shape(second_moment) != jnp.shape(signal):
+        raise ValueError("second_moment must match signal exactly")
+    if jnp.shape(ages) != jnp.shape(signal):
+        raise ValueError("ages must match signal exactly")
     del ages, utility_decay
-    decay = jnp.asarray(moment_decay, dtype=jnp.float32)
-    new_second_moment = (
-        _skip_zero_scale(decay, second_moment) + (1.0 - decay) * signal**2
+    mode = _require_exact_mode(mode)
+    decay = _require_ema_decay_operand("moment_decay", moment_decay)
+    decayed_second_moment = _skip_zero_scale(decay, second_moment)
+    innovation_weight = 1.0 - decay
+    direct_second_moment = (
+        decayed_second_moment + innovation_weight * signal**2
+    )
+    # Keep the ordinary path bitwise stable.  The exponent-scaled fallback
+    # avoids squaring a wide finite signal before its small EMA weight is
+    # applied, and remains explicit under XLA compilation.
+    signal_mantissa, signal_exponent = jnp.frexp(signal)
+    weight_mantissa, weight_exponent = jnp.frexp(innovation_weight)
+    recovered_innovation = jnp.ldexp(
+        weight_mantissa * signal_mantissa**2,
+        weight_exponent + 2 * signal_exponent,
+    )
+    recovered_second_moment = decayed_second_moment + recovered_innovation
+    new_second_moment = jnp.where(
+        jnp.isfinite(direct_second_moment) | ~jnp.isfinite(recovered_second_moment),
+        direct_second_moment,
+        recovered_second_moment,
     )
     normalized = signal
-    mode = _require_exact_mode(mode)
     if mode in {"uncertainty", "uncertainty_age"}:
         normalized = normalized / jnp.sqrt(new_second_moment + 1e-6)
 
@@ -510,11 +594,13 @@ def bias_correct_future_utility(
     raw value (normally zero).
     """
     mode = _require_exact_mode(mode)
+    if jnp.shape(ages) != jnp.shape(utilities):
+        raise ValueError("ages must match utilities exactly")
+    decay = _require_ema_decay_operand("utility_decay", utility_decay).astype(utilities.dtype)
     if mode not in {"age", "uncertainty_age"}:
         return utilities
 
     age_count = jnp.maximum(ages.astype(jnp.float32), 0.0)
-    decay = jnp.asarray(utility_decay, dtype=utilities.dtype)
     debias = 1.0 - jnp.power(decay, age_count)
     safe_debias = jnp.maximum(
         debias,

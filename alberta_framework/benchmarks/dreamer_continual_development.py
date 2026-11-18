@@ -215,9 +215,9 @@ def _run_arm(
                 state = learned.state
                 updates += int(bool(learned.update_applied))
                 queries += 1
-                replay.append(observation.copy())
-                if len(replay) > capacity:
+                if len(replay) >= capacity:
                     replay.pop(0)
+                replay.append(observation.copy())
                 inserts += 1
                 peak_replay_bytes = max(peak_replay_bytes, sum(item.nbytes for item in replay))
                 if arm_id == "guarded_imagination":
@@ -366,6 +366,23 @@ def validate_result(value: object) -> DevelopmentResult:
         )
         if receipt.persistent_bytes != expected_persistent:
             raise ValueError("persistent-byte receipt mismatch")
+        expected_arm = _run_arm(
+            value.seed,
+            value.steps_per_task,
+            value.replay_capacity,
+            value.imaginations_per_step,
+            arm.arm_id,
+        )
+        observed_arm = dataclasses.replace(
+            arm,
+            receipt=dataclasses.replace(arm.receipt, elapsed_ns=0),
+        )
+        expected_arm = dataclasses.replace(
+            expected_arm,
+            receipt=dataclasses.replace(expected_arm.receipt, elapsed_ns=0),
+        )
+        if observed_arm != expected_arm:
+            raise ValueError("deterministic replay mismatch")
     return value
 
 

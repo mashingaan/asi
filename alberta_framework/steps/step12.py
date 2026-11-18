@@ -39,7 +39,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
-from alberta_framework._seed_validation import require_jax_seed
+from alberta_framework._seed_validation import JAX_KEY_SEED_MAX, require_jax_seed
 from alberta_framework.core.intelligence_amplification import (
     ExoCerebellumConfig,
     IAAgent,
@@ -213,21 +213,7 @@ _STEP12_CONFIG_FIELDS = frozenset(
 _SUBTASK_SPEC_FIELDS = frozenset(
     {"feature_index", "threshold", "pseudo_reward_scale", "max_option_steps"}
 )
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 def _require_payload(
@@ -703,7 +689,7 @@ def run_step12_smoke(
         :class:`Step12SmokeResult` with shape/fineness summary.
     """
     steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
-    seed = _require_int("seed", seed, minimum=0, maximum=_INT32_MAX)
+    seed = _require_int("seed", seed, minimum=0, maximum=JAX_KEY_SEED_MAX)
 
     if config is None:
         cfg = Step12IAConfig()
@@ -716,7 +702,7 @@ def run_step12_smoke(
     agent = make_step12_ia_agent(cfg)
     obs_dim = cfg.observation_dim
 
-    data_key, state_key = jr.split(jr.key(seed))
+    data_key, state_key = jr.split(jr.key(seed, impl="threefry2x32"))
     observations = jr.normal(data_key, (steps + 1, obs_dim), dtype=jnp.float32)
     rewards = jnp.tanh(observations[1:, 0])
 

@@ -7,6 +7,7 @@ import chex
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax import Array
 
 from alberta_framework import (
     DemonType,
@@ -231,6 +232,38 @@ class TestGVFSpec:
 
 class TestHordeSpec:
     """Tests for HordeSpec construction and serialization."""
+
+    @pytest.mark.parametrize(
+        ("field", "drifted"),
+        [
+            ("gammas", jnp.asarray([0.0], dtype=jnp.float32)),
+            ("lamdas", jnp.asarray([0.0], dtype=jnp.float32)),
+            ("gammas", jnp.asarray([0.9, 0.9], dtype=jnp.float32)),
+            ("lamdas", jnp.asarray([], dtype=jnp.float32)),
+        ],
+        ids=("gamma-value", "lamda-value", "gamma-shape", "lamda-shape"),
+    )
+    def test_direct_construction_rejects_cached_question_drift(
+        self,
+        field: str,
+        drifted: Array,
+    ) -> None:
+        demon = GVFSpec(
+            name="d0",
+            demon_type=DemonType.PREDICTION,
+            gamma=0.9,
+            lamda=0.8,
+            cumulant_index=0,
+        )
+        values = {
+            "demons": (demon,),
+            "gammas": jnp.asarray([demon.gamma], dtype=jnp.float32),
+            "lamdas": jnp.asarray([demon.lamda], dtype=jnp.float32),
+        }
+        values[field] = drifted
+
+        with pytest.raises(ValueError, match=field):
+            HordeSpec(**values)
 
     def test_create_horde_spec(self):
         demons = [
@@ -632,3 +665,17 @@ class TestGVFSpecRemainingFields:
     def test_horde_spec_from_config_rejects_non_list_demons(self, invalid_demons):
         with pytest.raises(ValueError, match="HordeSpec demons must be an exact list"):
             HordeSpec.from_config({"demons": invalid_demons})
+
+
+@pytest.mark.parametrize("dtype_code", ["e", "f", "d", "g"])
+def test_gvf_spec_accepts_all_numpy_floating_types_for_terminal_reward(dtype_code: str) -> None:
+    val = np.dtype(dtype_code).type(1.5)
+    spec = GVFSpec(
+        name="d",
+        demon_type=DemonType.PREDICTION,
+        gamma=0.0,
+        lamda=0.0,
+        cumulant_index=0,
+        terminal_reward=val,
+    )
+    assert spec.terminal_reward == 1.5

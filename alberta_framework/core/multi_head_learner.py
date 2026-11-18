@@ -32,7 +32,10 @@ from jaxtyping import Bool, Float, UInt
 
 from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.initializers import sparse_init
-from alberta_framework.core.learners import _update_from_gradient_with_diagnostics
+from alberta_framework.core.learners import (
+    _gradient_step_error,
+    _update_from_gradient_with_diagnostics,
+)
 from alberta_framework.core.normalizers import (
     AnyNormalizerState,
     Normalizer,
@@ -87,19 +90,7 @@ _CONFIG_FIELDS = frozenset(
     }
 )
 
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_ACTUAL_INT_TYPES: tuple[type, ...] = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 
 
 def _validated_nonnegative_float32_scalar(
@@ -167,7 +158,16 @@ def _validate_direct_state_resources(
     final_width = hidden_sizes[-1] if hidden_sizes else feature_dim
     head_parameter_count = n_heads * (final_width + 1)
     parameter_count = trunk_parameter_count + head_parameter_count
-    direct_state_scalars = 2 * parameter_count + sum(hidden_sizes) + 3
+    # Params and traces are one copy each (2x); the LMS optimizer state adds
+    # one scalar step size per (weight, bias) pair: two per trunk layer and
+    # two per head. The +3 covers step_count plus the two step_words.
+    direct_state_scalars = (
+        2 * parameter_count
+        + sum(hidden_sizes)
+        + 2 * len(hidden_sizes)
+        + 2 * n_heads
+        + 3
+    )
     for name, value in (
         ("parameter_count", parameter_count),
         ("direct_state_scalars", direct_state_scalars),
@@ -190,7 +190,16 @@ def _direct_state_bytes(
     )
     final_width = hidden_sizes[-1] if hidden_sizes else feature_dim
     head_parameter_count = n_heads * (final_width + 1)
-    return 4 * (2 * (trunk_parameter_count + head_parameter_count) + sum(hidden_sizes) + 3)
+    # See _validate_direct_state_resources: params and traces are 2x, plus
+    # the LMS step-size scalars (two per trunk layer, two per head) and the
+    # three counter scalars (step_count plus two step_words).
+    return 4 * (
+        2 * (trunk_parameter_count + head_parameter_count)
+        + sum(hidden_sizes)
+        + 2 * len(hidden_sizes)
+        + 2 * n_heads
+        + 3
+    )
 
 
 def _multi_head_update_result_extras_bytes(n_heads: int) -> int:
@@ -232,6 +241,45 @@ def _preflight_multi_head_update_working_set(
 def _skip_zero_scale(scale: Array, value: Array) -> Array:
     """Return 0 when ``scale`` is 0 so IEEE ``0 * inf`` does not become NaN."""
     return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
+def _finite_layer_norm(values: Array) -> Array:
+    """Preserve parameterless layer norm when only its reductions overflow."""
+    mean = jnp.mean(values)
+    variance = jnp.var(values)
+    direct = (values - mean) / jnp.sqrt(variance + 1e-5)
+    reduction_overflowed = (
+        (~jnp.isfinite(mean) | ~jnp.isfinite(variance))
+        & jnp.all(jnp.isfinite(values))
+    )
+
+    def scaled_layer_norm(finite_values: Array) -> Array:
+        scale = jnp.max(jnp.abs(finite_values))
+        _, exponent = jnp.frexp(scale)
+        scaled = jnp.ldexp(finite_values, -exponent)
+        centered = scaled - jnp.mean(scaled)
+        scaled_variance = jnp.mean(centered * centered)
+        positive_variance = scaled_variance > 0.0
+        safe_variance = jnp.where(
+            positive_variance,
+            scaled_variance,
+            jnp.ones_like(scaled_variance),
+        )
+        contrast = centered * jax.lax.rsqrt(safe_variance)
+        constant = jnp.ldexp(centered, exponent) * jax.lax.rsqrt(
+            jnp.asarray(1e-5, dtype=finite_values.dtype)
+        )
+        return jnp.where(positive_variance, contrast, constant)
+
+    return cast(
+        Array,
+        jax.lax.cond(
+            reduction_overflowed,
+            scaled_layer_norm,
+            lambda _: direct,
+            values,
+        ),
+    )
 
 
 def _extract_mean_step_size(
@@ -647,6 +695,16 @@ class MultiHeadMLPLearner:
         """The feature normalizer, or None if normalization is disabled."""
         return self._normalizer
 
+    @property
+    def optimizer(self) -> AnyOptimizer:
+        """The per-parameter trunk optimizer."""
+        return self._optimizer
+
+    @property
+    def head_optimizer(self) -> AnyOptimizer | None:
+        """The separate head optimizer, or None when heads share the trunk's."""
+        return self._head_optimizer
+
     def to_config(self) -> dict[str, Any]:
         """Serialize learner configuration to dict.
 
@@ -900,9 +958,7 @@ class MultiHeadMLPLearner:
         for i in range(len(weights)):
             x = weights[i] @ x + biases[i]
             if use_layer_norm:
-                mean = jnp.mean(x)
-                var = jnp.var(x)
-                x = (x - mean) / jnp.sqrt(var + 1e-5)
+                x = _finite_layer_norm(x)
             x = jnp.where(x >= 0, x, leaky_relu_slope * x)
             activations.append(x)
         return x, tuple(activations)
@@ -1098,6 +1154,7 @@ class MultiHeadMLPLearner:
 
         # 1. Handle NaN targets
         active_mask = ~jnp.isnan(targets)  # (n_heads,)
+        any_active = jnp.any(active_mask)
         safe_targets = jnp.where(active_mask, targets, 0.0)
 
         # 2. Normalize observation if needed
@@ -1221,7 +1278,8 @@ class MultiHeadMLPLearner:
             new_trunk_traces.append(new_wt)
             w_step, new_w_opt, w_update_applied = _update_from_gradient_with_diagnostics(
                 self._optimizer,
-                state.trunk_optimizer_states[2 * i], new_wt, error=None
+                state.trunk_optimizer_states[2 * i], new_wt, error=None,
+                param=state.trunk_params.weights[i],
             )
             trunk_steps.append(w_step)
             new_trunk_opt_states.append(new_w_opt)
@@ -1239,25 +1297,43 @@ class MultiHeadMLPLearner:
             new_trunk_traces.append(new_bt)
             b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
                 self._optimizer,
-                state.trunk_optimizer_states[2 * i + 1], new_bt, error=None
+                state.trunk_optimizer_states[2 * i + 1], new_bt, error=None,
+                param=state.trunk_params.biases[i],
             )
             trunk_steps.append(b_step)
             new_trunk_opt_states.append(new_b_opt)
             optimizer_updates_applied.append(b_update_applied)
 
+        # Freeze the shared trunk when no head is active. The step carries
+        # zero error signal, and inactive heads are frozen in section 7;
+        # without this guard a stateful optimizer (e.g. Adam) steps the
+        # trunk on stale momentum. Mirrors the inactive-head freeze below.
+        new_trunk_traces = [
+            jnp.where(any_active, new_trace, old_trace)
+            for new_trace, old_trace in zip(new_trunk_traces, state.trunk_traces)
+        ]
+        new_trunk_opt_states = [
+            jax.tree.map(
+                lambda new, old: jnp.where(any_active, new, old),
+                new_opt,
+                old_opt,
+            )
+            for new_opt, old_opt in zip(new_trunk_opt_states, state.trunk_optimizer_states)
+        ]
+
         # Trunk bounding (pseudo_error=1.0 since error is in gradient)
-        # Scale traces by the bounding factor for consistency with future updates
         trunk_bounding_metric = jnp.array(1.0, dtype=jnp.float32)
         if self._bounder is not None:
             trunk_params_flat: list[Array] = []
             for i in range(n_trunk_layers):
                 trunk_params_flat.append(state.trunk_params.weights[i])
                 trunk_params_flat.append(state.trunk_params.biases[i])
+            # The bounder's metric is a reporting scalar (ObGD's step scale,
+            # AGC's clipped-unit fraction); it must never scale the traces.
             bounded_trunk_steps, trunk_bounding_metric = self._bounder.bound(
                 tuple(trunk_steps), jnp.array(1.0), tuple(trunk_params_flat)
             )
             trunk_steps = list(bounded_trunk_steps)
-            new_trunk_traces = [trunk_bounding_metric * t for t in new_trunk_traces]
 
         # Apply trunk updates (no error multiply -- error already in gradient)
         new_trunk_weights: list[Array] = []
@@ -1269,6 +1345,16 @@ class MultiHeadMLPLearner:
             new_trunk_biases.append(
                 state.trunk_params.biases[i] + trunk_steps[2 * i + 1]
             )
+
+        # Freeze trunk params when no head is active (see above).
+        new_trunk_weights = [
+            jnp.where(any_active, new_w, old_w)
+            for new_w, old_w in zip(new_trunk_weights, state.trunk_params.weights)
+        ]
+        new_trunk_biases = [
+            jnp.where(any_active, new_b, old_b)
+            for new_b, old_b in zip(new_trunk_biases, state.trunk_params.biases)
+        ]
 
         new_trunk_params = MLPParams(
             weights=tuple(new_trunk_weights),
@@ -1317,26 +1403,25 @@ class MultiHeadMLPLearner:
             # Optimizer step (with error for meta-learning)
             head_opt = self._head_optimizer if self._head_optimizer is not None else self._optimizer
             w_step, new_w_opt, w_update_applied = _update_from_gradient_with_diagnostics(
-                head_opt, old_w_opt, new_w_trace, error=error_i
+                head_opt, old_w_opt, new_w_trace, error=error_i, param=head_w
             )
             b_step, new_b_opt, b_update_applied = _update_from_gradient_with_diagnostics(
-                head_opt, old_b_opt, new_b_trace, error=error_i
+                head_opt, old_b_opt, new_b_trace, error=error_i, param=head_b
             )
             optimizer_updates_applied.extend((w_update_applied, b_update_applied))
 
-            # Head bounding — scale traces by the bounding factor so that
-            # future trace-based updates reflect the effective step magnitude
+            step_error = _gradient_step_error(head_opt, error_i)
+            # Head bounding only rescales the applied step; the traces keep
+            # their gamma * lambda decay.
             if self._bounder is not None:
-                bounded_head_steps, bound_scale = self._bounder.bound(
-                    (w_step, b_step), error_i, (head_w, head_b)
+                bounded_head_steps, _bound_metric = self._bounder.bound(
+                    (w_step, b_step), step_error, (head_w, head_b)
                 )
                 w_step, b_step = bounded_head_steps
-                new_w_trace = bound_scale * new_w_trace
-                new_b_trace = bound_scale * new_b_trace
 
             # Apply: param += error_i * step
-            new_w = head_w + error_i * w_step
-            new_b = head_b + error_i * b_step
+            new_w = head_w + step_error * w_step
+            new_b = head_b + step_error * b_step
 
             # Mask: for inactive heads, keep old state
             new_w = jnp.where(active_mask[i], new_w, head_w)
@@ -1656,8 +1741,19 @@ def run_multi_head_learning_loop(
     final_state, (per_head_metrics, updates_applied) = jax.lax.scan(
         step_fn, state, (observations, targets)
     )
+    # Concrete calls must finish device work before recording active uptime.
+    # Traced calls (including the batched wrapper) defer execution to callers.
+    if not isinstance(per_head_metrics, jax.core.Tracer):
+        per_head_metrics.block_until_ready()
     elapsed = time.time() - t0
-    final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
+    # lax.scan narrows the host-only Python-float birth_timestamp to float32
+    # (at current epoch values this shifts it by tens of seconds), just as
+    # the horde/average-reward array loops restore host clocks. Restore the
+    # incoming value and advance uptime from the original host clock.
+    final_state = final_state.replace(  # type: ignore[attr-defined]
+        birth_timestamp=state.birth_timestamp,
+        uptime_s=state.uptime_s + elapsed,
+    )
 
     return MultiHeadLearningResult(
         state=final_state,

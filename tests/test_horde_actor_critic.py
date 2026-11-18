@@ -776,12 +776,136 @@ def _make_nlhac_agent(
     return NonlinearHordeActorCriticAgent(cfg, critic)
 
 
+def _make_nlqhac_agent() -> NonlinearQHordeActorCriticAgent:
+    demons = [
+        GVFSpec(  # type: ignore[call-arg]
+            name=f"q_{action}",
+            demon_type=DemonType.CONTROL,
+            gamma=0.0,
+            lamda=0.0,
+            cumulant_index=-1,
+        )
+        for action in range(N_ACTIONS)
+    ]
+    critic = HordeLearner(
+        create_horde_spec(demons),
+        hidden_sizes=(16,),
+        step_size=0.03,
+    )
+    return NonlinearQHordeActorCriticAgent(
+        NonlinearQHordeActorCriticConfig(
+            n_actions=N_ACTIONS,
+            hidden_sizes=(16,),
+            actor_td_error_clip=1.0,
+            actor_gradient_clip_norm=1.0,
+        ),
+        critic,
+        actor_optimizer=Autostep(initial_step_size=0.01),
+    )
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        _make_agent,
+        _make_qhorde_agent,
+        _make_nlhac_agent,
+        _make_nlqhac_agent,
+    ],
+)
+def test_horde_actor_critic_construction_requires_exact_schema(
+    factory: Callable[[], Any],
+) -> None:
+    agent = factory()
+    payload = agent.to_config()
+    malformed_payloads = [
+        {key: value for key, value in payload.items() if key != "type"},
+        {**payload, "type": "DifferentAgent"},
+        {**payload, "unexpected": "ignored"},
+    ]
+
+    for malformed in malformed_payloads:
+        with pytest.raises(ValueError, match="construction fields"):
+            type(agent).from_config(malformed)
+
+
 def _init_nlhac(
     agent: NonlinearHordeActorCriticAgent,
 ) -> NonlinearHordeActorCriticState:
     state = agent.init(feature_dim=OBS_DIM, key=jr.key(0))
     state, _, _ = agent.start(state, jnp.zeros(OBS_DIM))
     return state
+
+
+def test_all_horde_actor_samplers_preserve_reported_rare_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases: list[tuple[Any, int]] = [
+        (_make_agent(), 2),
+        (_make_qhorde_agent(), 2),
+        (_make_nlhac_agent(), OBS_DIM),
+        (_make_nlqhac_agent(), OBS_DIM),
+    ]
+    observed_logits: list[jax.Array] = []
+    observed_modes: list[object] = []
+
+    def fake_categorical(
+        _key: jax.Array,
+        logits: jax.Array,
+        **kwargs: object,
+    ) -> jax.Array:
+        observed_logits.append(logits)
+        observed_modes.append(kwargs.get("mode"))
+        return jnp.asarray(0, dtype=jnp.int32)
+
+    monkeypatch.setattr(jr, "categorical", fake_categorical)
+    for agent, feature_dim in cases:
+        state = agent.init(feature_dim=feature_dim, key=jr.key(feature_dim))
+        rare_logit = jnp.log(jnp.asarray(5e-9, dtype=jnp.float32)) * agent.config.temperature
+        if hasattr(state, "actor_bias"):
+            rare_bias = jnp.full_like(state.actor_bias, rare_logit).at[0].set(0.0)
+            state = state.replace(
+                actor_weights=jnp.zeros_like(state.actor_weights),
+                actor_bias=rare_bias,
+            )
+        else:
+            rare_bias = jnp.full_like(state.actor_head_b, rare_logit).at[0].set(0.0)
+            state = state.replace(
+                actor_head_w=jnp.zeros_like(state.actor_head_w),
+                actor_head_b=rare_bias,
+            )
+        observation = jnp.zeros((feature_dim,), dtype=jnp.float32)
+        with jax.disable_jit():
+            action, _next_key, policy = agent.select_action(state, observation)
+
+        assert int(action) == 0
+        assert float(policy[1]) < 1e-8
+        chex.assert_trees_all_close(observed_logits[-1], jnp.log(policy))
+
+    assert observed_modes == ["high"] * len(cases)
+
+
+@pytest.mark.parametrize("rare_bias", [-10.0, -100.0])
+def test_nonlinear_horde_actor_learns_from_a_rare_policy_action(
+    rare_bias: float,
+) -> None:
+    agent = _make_nlhac_agent(hidden_sizes=())
+    state = agent.init(feature_dim=OBS_DIM, key=jr.key(81)).replace(
+        actor_head_w=jnp.zeros((N_ACTIONS, OBS_DIM), dtype=jnp.float32),
+        actor_head_b=jnp.asarray((0.0, rare_bias, rare_bias), dtype=jnp.float32),
+        last_observation=jnp.zeros((OBS_DIM,), dtype=jnp.float32),
+        last_action=jnp.asarray(1, dtype=jnp.int32),
+    )
+
+    assert float(agent.policy(state, state.last_observation)[1]) < 1e-8
+    result = agent.update(
+        state,
+        reward=jnp.asarray(1.0, dtype=jnp.float32),
+        observation=jnp.zeros((OBS_DIM,), dtype=jnp.float32),
+    )
+
+    assert bool(result.update_applied)
+    assert not jnp.array_equal(result.state.actor_head_b, state.actor_head_b)
 
 
 def test_nonlinear_horde_zero_discount_neutralizes_inf_next_value() -> None:
@@ -1092,6 +1216,55 @@ class TestNonlinearHordeActorCriticUpdate:
         result = agent.update(state, jnp.array(1.0, dtype=jnp.float32), obs)
         assert bool(result.update_applied)
         chex.assert_tree_all_finite(result.state.actor_td_error_normalizer)
+
+    def test_small_td_error_warmup_normalizes_by_true_ema(self) -> None:
+        """Sub-1e-3 warmup errors divide by the true EMA, not a fixed floor."""
+        # With decay=0.9 the first update sets EMA = 0.1 * |td|, so the
+        # normalized actor signal is ~10 whatever the TD scale. Identical
+        # initial states mean the only difference between the two runs below
+        # is the reward, so the actor movement must match. The former 1e-3
+        # denominator floor substituted its own scale whenever |td| fell
+        # below it, weakening the small-error update by orders of magnitude.
+        critic = HordeLearner(
+            create_horde_spec(
+                [
+                    GVFSpec(  # type: ignore[call-arg]
+                        name="v",
+                        demon_type=DemonType.PREDICTION,
+                        gamma=0.99,
+                        lamda=0.0,
+                        cumulant_index=0,
+                    )
+                ]
+            ),
+            hidden_sizes=(8,),
+            step_size=0.03,
+        )
+        cfg = NonlinearHordeActorCriticConfig(
+            n_actions=N_ACTIONS,
+            hidden_sizes=(8,),
+            actor_td_error_normalizer_decay=0.9,
+        )
+
+        def _first_update(reward: float):
+            agent = NonlinearHordeActorCriticAgent(cfg, critic)
+            state = agent.init(OBS_DIM, jr.key(7))
+            obs = jr.normal(jr.key(8), (OBS_DIM,))
+            state, _, _ = agent.start(state, obs)
+            before = state.actor_head_w.copy()
+            result = agent.update(state, jnp.array(reward, dtype=jnp.float32), obs)
+            return result, result.state.actor_head_w - before
+
+        small_result, small_delta = _first_update(1e-4)
+        large_result, large_delta = _first_update(1e-2)
+
+        # First update sets the stored EMA to 0.1 * |raw td| (exposed verbatim).
+        assert float(small_result.state.actor_td_error_normalizer) == pytest.approx(
+            0.1 * abs(float(small_result.td_error)), rel=1e-5
+        )
+
+        # Both normalized signals are ~10, so the actor must move equally.
+        chex.assert_trees_all_close(small_delta, large_delta, rtol=1e-4, atol=0.0)
 
     def test_policy_sums_to_one(self) -> None:
         agent = _make_nlhac_agent()
@@ -1406,32 +1579,7 @@ class TestNonlinearHordeActorCriticExport:
 
 class TestNonlinearQHordeActorCritic:
     def _agent(self) -> NonlinearQHordeActorCriticAgent:
-        demons = [
-            GVFSpec(  # type: ignore[call-arg]
-                name=f"q_{action}",
-                demon_type=DemonType.CONTROL,
-                gamma=0.0,
-                lamda=0.0,
-                cumulant_index=-1,
-            )
-            for action in range(N_ACTIONS)
-        ]
-        critic = HordeLearner(
-            create_horde_spec(demons),
-            hidden_sizes=(16,),
-            step_size=0.03,
-        )
-        cfg = NonlinearQHordeActorCriticConfig(
-            n_actions=N_ACTIONS,
-            hidden_sizes=(16,),
-            actor_td_error_clip=1.0,
-            actor_gradient_clip_norm=1.0,
-        )
-        return NonlinearQHordeActorCriticAgent(
-            cfg,
-            critic,
-            actor_optimizer=Autostep(initial_step_size=0.01),
-        )
+        return _make_nlqhac_agent()
 
     def test_actor_optimizer_must_support_mlp(self) -> None:
         demons = [
@@ -1753,6 +1901,26 @@ def test_nonlinear_horde_actor_critic_configs_accept_and_canonicalizes_numpy_int
 
 
 @pytest.mark.parametrize(
+    "config_type",
+    [
+        HordeActorCriticConfig,
+        QHordeActorCriticConfig,
+        NonlinearHordeActorCriticConfig,
+        NonlinearQHordeActorCriticConfig,
+    ],
+)
+def test_actor_configs_reject_subnormal_float32_temperature(config_type: type) -> None:
+    """An accepted softmax temperature must remain a usable XLA divisor."""
+    subnormal = float(np.nextafter(np.float32(0), np.float32(1)))
+
+    with pytest.raises(ValueError, match="temperature must be at least"):
+        config_type(n_actions=2, temperature=subnormal)
+
+    smallest_normal = float(np.finfo(np.float32).tiny)
+    assert config_type(n_actions=2, temperature=smallest_normal).temperature == smallest_normal
+
+
+@pytest.mark.parametrize(
     "config",
     [
         HordeActorCriticConfig(n_actions=2),
@@ -1822,16 +1990,16 @@ def test_actor_resource_budgets_preflight_before_allocation(
     linear = HordeActorCriticConfig(n_actions=2)
     assert linear.actor_resource_budget(3) == {
         "parameter_scalars": 8,
-        "float32_state_scalars": 19,
-        "state_scalars": 23,
-        "state_nbytes": 92,
+        "float32_state_scalars": 20,
+        "state_scalars": 24,
+        "state_nbytes": 96,
     }
     nonlinear = NonlinearHordeActorCriticConfig(n_actions=2, hidden_sizes=(3,))
     budget = nonlinear.actor_resource_budget(4)
     assert budget["parameter_scalars"] == 23
     assert budget["optimizer_tensor_count"] == 4
-    assert budget["float32_state_scalars"] == 128
-    assert budget["state_nbytes"] == 528
+    assert budget["float32_state_scalars"] == 129
+    assert budget["state_nbytes"] == 532
 
     with pytest.raises(ValueError, match="derived actor"):
         HordeActorCriticConfig(n_actions=2**31 - 1)
@@ -2019,3 +2187,1067 @@ def test_all_horde_actor_critic_counters_saturate_and_rollback(
     assert applied.tolist() == [False, True]
     assert final_state.step_count.dtype == jnp.int32
     assert int(final_state.step_count) == 2**31 - 1
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(_linear_value_counter_case, id="linear-value"),
+        pytest.param(_linear_q_counter_case, id="linear-q"),
+        pytest.param(_nonlinear_value_counter_case, id="nonlinear-value"),
+        pytest.param(_nonlinear_q_counter_case, id="nonlinear-q"),
+    ],
+)
+def test_all_horde_actor_critic_updates_reject_negative_lifetime_counters(
+    factory: Callable[[], tuple[Any, CounterUpdate]],
+) -> None:
+    state, update = factory()
+    corrupted = state.replace(step_count=jnp.asarray(-1, dtype=jnp.int32))
+
+    for apply_update in (update, jax.jit(update)):
+        result = apply_update(corrupted, jnp.asarray(1.0, dtype=jnp.float32))
+        assert not bool(result.update_applied)
+        _assert_state_unchanged(result.state, corrupted)
+
+
+def test_array_runner_policies_align_with_actions() -> None:
+    critic = HordeLearner(
+        create_horde_spec(
+            [
+                GVFSpec(  # type: ignore[call-arg]
+                    name="value",
+                    demon_type=DemonType.PREDICTION,
+                    gamma=0.9,
+                    lamda=0.0,
+                    cumulant_index=-1,
+                )
+            ]
+        ),
+        hidden_sizes=(),
+        step_size=0.5,
+        use_layer_norm=False,
+    )
+    agent = HordeActorCriticAgent(
+        HordeActorCriticConfig(n_actions=3, actor_step_size=0.5, actor_lamda=0.0),
+        critic=critic,
+    )
+    state = agent.init(feature_dim=2, key=jr.key(0)).replace(  # type: ignore[attr-defined]
+        actor_weights=jnp.array([[2.0, -1.0], [0.0, 3.0], [-2.0, 0.5]], jnp.float32),
+    )
+    observations = jnp.array([[1.0, 0.0], [0.0, 1.0]], jnp.float32)
+    next_observations = jnp.array([[0.0, 1.0], [1.0, 1.0]], jnp.float32)
+    rewards = jnp.array([1.0, 1.0], jnp.float32)
+
+    result = run_horde_actor_critic_from_arrays(
+        agent, state, observations, rewards, next_observations
+    )
+
+    # ``policies[t]`` documents the pre-update distribution at
+    # ``observations[t]`` -- the one that produced ``actions[t]`` -- matching
+    # the discrete runner's contract.
+    chex.assert_trees_all_close(
+        result.policies[0], agent.policy(state, observations[0]), atol=1e-7
+    )
+    assert not bool(
+        jnp.allclose(result.policies[0], agent.policy(state, next_observations[0]))
+    )
+
+
+def test_nonlinear_array_runner_neutralizes_policy_on_rejected_update() -> None:
+    agent = _make_nlhac_agent(hidden_sizes=())
+    state = _init_nlhac(agent)
+    obs = jnp.zeros((1, OBS_DIM))
+    result = run_nonlinear_horde_actor_critic_from_arrays(
+        agent, state, obs, jnp.array([jnp.nan]), obs
+    )
+    np.testing.assert_array_equal(result.policies, jnp.zeros_like(result.policies))
+    chex.assert_trees_all_equal(result.state, state)
+
+
+# ===========================================================================
+# Terminal critic eligibility
+# ===========================================================================
+
+_EPISODE_1_OBS = jnp.array([1.0, 0.0, 0.0], dtype=jnp.float32)  # finished episode only
+_EPISODE_2_OBS = jnp.array([0.0, 1.0, 0.0], dtype=jnp.float32)
+_EPISODE_2_NEXT_OBS = jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
+_TERMINAL_OBS = jnp.zeros(3, dtype=jnp.float32)
+
+
+def _trace_keeping_critic() -> HordeLearner:
+    """Linear value head with a trace (gamma 0.9, lambda 0.8) plus an auxiliary GVF."""
+    demons = [
+        GVFSpec(  # type: ignore[call-arg]
+            name="value",
+            demon_type=DemonType.PREDICTION,
+            gamma=0.9,
+            lamda=0.8,
+            cumulant_index=-1,
+        ),
+        GVFSpec(  # type: ignore[call-arg]
+            name="aux",
+            demon_type=DemonType.PREDICTION,
+            gamma=0.5,
+            lamda=0.5,
+            cumulant_index=-1,
+        ),
+    ]
+    return HordeLearner(
+        create_horde_spec(demons),
+        hidden_sizes=(),
+        step_size=0.1,
+        use_layer_norm=False,
+    )
+
+
+def _linear_terminal_trace_agent() -> HordeActorCriticAgent:
+    return HordeActorCriticAgent(
+        HordeActorCriticConfig(n_actions=2, actor_step_size=0.05, actor_lamda=0.7),
+        critic=_trace_keeping_critic(),
+    )
+
+
+def _nonlinear_terminal_trace_agent() -> NonlinearHordeActorCriticAgent:
+    return NonlinearHordeActorCriticAgent(
+        NonlinearHordeActorCriticConfig(n_actions=2, hidden_sizes=()),
+        _trace_keeping_critic(),
+    )
+
+
+_TERMINAL_TRACE_AGENTS = pytest.mark.parametrize(
+    ("make_agent", "run_arrays"),
+    [
+        (_linear_terminal_trace_agent, run_horde_actor_critic_from_arrays),
+        (_nonlinear_terminal_trace_agent, run_nonlinear_horde_actor_critic_from_arrays),
+    ],
+    ids=["linear", "nonlinear"],
+)
+
+
+@_TERMINAL_TRACE_AGENTS
+def test_terminal_update_clears_value_head_critic_trace(
+    make_agent: Callable[[], Any], run_arrays: Callable[..., Any]
+) -> None:
+    """A terminal update must not carry critic eligibility into the next episode.
+
+    The value head learns the terminal reward along its trace and the actor
+    traces are cleared. The value head's critic trace must be cleared as well:
+    otherwise the first TD error of the next episode moves the weight of a
+    feature that was only active in the finished episode.
+    """
+    del run_arrays
+    agent = make_agent()
+    state = agent.init(feature_dim=3, key=jr.key(0))
+    state, _, _ = agent.start(state, _EPISODE_1_OBS)
+    terminal = agent.update(
+        state,
+        jnp.array(1.0, dtype=jnp.float32),
+        _TERMINAL_OBS,
+        jnp.zeros(1, dtype=jnp.float32),
+        jnp.array(0.0, dtype=jnp.float32),
+    )
+    assert bool(terminal.update_applied)
+
+    critic_state = terminal.state.critic_state
+    value_w_trace, value_b_trace = critic_state.head_traces[0]
+    np.testing.assert_array_equal(value_w_trace, jnp.zeros_like(value_w_trace))
+    np.testing.assert_array_equal(value_b_trace, jnp.zeros_like(value_b_trace))
+    # The auxiliary demon keeps its configured gamma, so its trace survives.
+    aux_w_trace, _ = critic_state.head_traces[1]
+    np.testing.assert_array_equal(aux_w_trace, _EPISODE_1_OBS[None, :])
+    # The pipeline reads the critic state from the committed critic result.
+    chex.assert_trees_all_equal(terminal.critic_result.state.head_traces, critic_state.head_traces)
+
+    weights = np.asarray(critic_state.head_params.weights[0][0])
+    bias = float(critic_state.head_params.biases[0][0])
+    state, _, _ = agent.start(terminal.state, _EPISODE_2_OBS)
+    first = agent.update(
+        state,
+        jnp.array(1.0, dtype=jnp.float32),
+        _EPISODE_2_NEXT_OBS,
+        jnp.zeros(1, dtype=jnp.float32),
+        jnp.array(0.9, dtype=jnp.float32),
+    )
+    assert bool(first.update_applied)
+
+    # One-step TD(lambda) reference that starts the episode from a cleared trace.
+    td_error = 1.0 + 0.9 * (weights[2] + bias) - (weights[1] + bias)
+    new_weights = np.asarray(first.state.critic_state.head_params.weights[0][0])
+    assert new_weights[0] == weights[0]
+    np.testing.assert_allclose(
+        new_weights, weights + 0.1 * td_error * np.asarray(_EPISODE_2_OBS), rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        float(first.state.critic_state.head_params.biases[0][0]),
+        bias + 0.1 * td_error,
+        rtol=1e-6,
+    )
+
+
+@_TERMINAL_TRACE_AGENTS
+def test_array_runner_keeps_terminal_critic_eligibility_out_of_the_next_episode(
+    make_agent: Callable[[], Any], run_arrays: Callable[..., Any]
+) -> None:
+    """A zero entry in ``discounts`` ends the value head's critic eligibility."""
+    agent = make_agent()
+    state = agent.init(feature_dim=3, key=jr.key(0))
+    first_episode = run_arrays(
+        agent,
+        state,
+        _EPISODE_1_OBS[None, :],
+        jnp.array([1.0], dtype=jnp.float32),
+        _TERMINAL_OBS[None, :],
+        auxiliary_cumulants=jnp.zeros((1, 1), dtype=jnp.float32),
+        discounts=jnp.array([0.0], dtype=jnp.float32),
+    )
+    both_episodes = run_arrays(
+        agent,
+        state,
+        jnp.stack([_EPISODE_1_OBS, _EPISODE_2_OBS]),
+        jnp.array([1.0, 1.0], dtype=jnp.float32),
+        jnp.stack([_TERMINAL_OBS, _EPISODE_2_NEXT_OBS]),
+        auxiliary_cumulants=jnp.zeros((2, 1), dtype=jnp.float32),
+        discounts=jnp.array([0.0, 0.9], dtype=jnp.float32),
+    )
+    assert bool(jnp.all(both_episodes.updates_applied))
+
+    weight_after_episode_1 = first_episode.state.critic_state.head_params.weights[0][0, 0]
+    assert float(weight_after_episode_1) != 0.0
+    assert float(both_episodes.state.critic_state.head_params.weights[0][0, 0]) == float(
+        weight_after_episode_1
+    )
+
+
+_AGENT_FACTORIES: dict[str, Callable[[], Any]] = {
+    "horde": _make_agent,
+    "q-horde": _make_qhorde_agent,
+    "nonlinear": _make_nlhac_agent,
+    "nonlinear-q": _make_nlqhac_agent,
+}
+
+
+@pytest.mark.parametrize("agent_name", sorted(_AGENT_FACTORIES))
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf, -np.inf])
+def test_horde_actor_start_rejects_nonfinite_observation(
+    agent_name: str, bad_value: float
+) -> None:
+    """The public start boundary refuses non-finite observations.
+
+    ``start`` is the only public path that stores an observation into
+    persistent state without a runtime gate: ``update`` commits only when the
+    whole stored state is finite, so a non-finite value accepted here would be
+    stored in ``last_observation`` and silently reject every later update with
+    the state bitwise frozen.
+    """
+
+    agent = _AGENT_FACTORIES[agent_name]()
+    state = agent.init(feature_dim=OBS_DIM, key=jr.key(0))
+    observation = jnp.zeros(OBS_DIM, dtype=jnp.float32).at[1].set(bad_value)
+    with pytest.raises(ValueError, match="observation must contain only finite values"):
+        agent.start(state, observation)
+
+
+@pytest.mark.parametrize("agent_name", sorted(_AGENT_FACTORIES))
+def test_horde_actor_start_keeps_finite_and_traced_observations(agent_name: str) -> None:
+    """Finite inputs still start the episode, and tracing skips the eager gate."""
+
+    agent = _AGENT_FACTORIES[agent_name]()
+    state = agent.init(feature_dim=OBS_DIM, key=jr.key(0))
+    observation = jnp.full((OBS_DIM,), 0.25, dtype=jnp.float32)
+    started, action, probs = agent.start(state, observation)
+    chex.assert_trees_all_equal(started.last_observation, observation)
+    assert probs.shape == (agent.config.n_actions,)
+    assert 0 <= int(action) < agent.config.n_actions
+    traced_state, traced_action, _ = jax.jit(agent.start)(state, observation)
+    chex.assert_trees_all_equal(traced_state.last_observation, observation)
+    assert int(traced_action) == int(action)
+
+
+def test_horde_actor_nonfinite_stored_observation_freezes_every_later_update() -> None:
+    """A committed non-finite observation silently drops every later update.
+
+    This is what the eager start gate prevents: ``update_applied`` stays
+    ``False`` and the state is returned unchanged forever, so a campaign would
+    record a frozen agent instead of an error.
+    """
+
+    agent = _make_agent()
+    state, _, _ = agent.start(
+        agent.init(feature_dim=OBS_DIM, key=jr.key(0)),
+        jnp.zeros(OBS_DIM, dtype=jnp.float32),
+    )
+    reward = jnp.asarray(1.0, dtype=jnp.float32)
+    next_observation = jnp.full((OBS_DIM,), 0.5, dtype=jnp.float32)
+    assert bool(agent.update(state, reward, next_observation).update_applied)
+    poisoned = state.replace(
+        last_observation=jnp.zeros(OBS_DIM, dtype=jnp.float32).at[0].set(np.nan)
+    )
+    frozen = agent.update(poisoned, reward, next_observation)
+    assert not bool(frozen.update_applied)
+    chex.assert_trees_all_equal(frozen.state, poisoned)
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+def test_actor_gradient_clip_bounds_finite_gradients_with_overflowing_norms(
+    disable_jit: bool,
+) -> None:
+    from alberta_framework.core.horde_actor_critic import _clip_nlhac_actor_grads
+
+    trunk_w = (jnp.array([[3e19, 0.0]], dtype=jnp.float32),)
+    trunk_b = (jnp.zeros(1, dtype=jnp.float32),)
+    head_w = jnp.array([[4e19]], dtype=jnp.float32)
+    head_b = jnp.zeros(1, dtype=jnp.float32)
+    with jax.disable_jit(disable_jit):
+        clipped = jax.jit(_clip_nlhac_actor_grads, static_argnums=4)(
+            trunk_w, trunk_b, head_w, head_b, 1.0
+        )
+        overflowing = _clip_nlhac_actor_grads(
+            trunk_w, trunk_b, head_w, head_b + jnp.inf, 1.0
+        )
+    np.testing.assert_allclose(clipped[0][0], [[0.6, 0.0]], rtol=1e-5)
+    np.testing.assert_allclose(clipped[2], [[0.8]], rtol=1e-5)
+    assert not np.any(np.asarray(overflowing[2]))
+
+
+@pytest.mark.parametrize("disable_jit", [True, False])
+def test_actor_gradient_clip_recovers_near_float32_max_norm(
+    disable_jit: bool,
+) -> None:
+    from alberta_framework.core.horde_actor_critic import _clip_nlhac_actor_grads
+
+    trunk_w = (jnp.array([[1e38, 0.0]], dtype=jnp.float32),)
+    trunk_b = (jnp.zeros(1, dtype=jnp.float32),)
+    head_w = jnp.zeros((1, 1), dtype=jnp.float32)
+    head_b = jnp.zeros(1, dtype=jnp.float32)
+    with jax.disable_jit(disable_jit):
+        clipped = jax.jit(_clip_nlhac_actor_grads, static_argnums=4)(
+            trunk_w, trunk_b, head_w, head_b, 1.0
+        )
+    np.testing.assert_allclose(clipped[0][0], [[1.0, 0.0]], rtol=1e-5)
+
+
+def test_horde_actor_critic_rejected_update_preserves_last_action() -> None:
+    """A rejected update must report the prior last_action rather than hardcoding action 0.
+
+    When an update fails validation (e.g. nonfinite reward or observation), the
+    state is rolled back to the incoming state atomically and retains
+    ``state.last_action``. The returned result.action must also report
+    ``state.last_action`` so external callers and scans record the actual action
+    maintained by the agent rather than desynchronizing with action 0.
+    """
+    agent = _make_agent()
+    state = agent.init(feature_dim=2, key=jr.key(0)).replace(  # type: ignore[attr-defined]
+        last_observation=jnp.array([1.0, 0.0], dtype=jnp.float32),
+        last_action=jnp.array(1, dtype=jnp.int32),
+    )
+    result = agent.update(
+        state,
+        reward=jnp.array(jnp.inf, dtype=jnp.float32),
+        observation=jnp.array([0.0, 1.0], dtype=jnp.float32),
+    )
+    assert not bool(result.update_applied)
+    assert int(result.state.last_action) == 1
+    assert int(result.action) == 1
+
+
+def test_qhorde_actor_critic_rejected_update_preserves_last_action() -> None:
+    """QHordeActorCriticAgent must report prior last_action when an update is rejected."""
+    agent = _make_qhorde_agent(n_actions=3)
+    state = agent.init(feature_dim=2, key=jr.key(0)).replace(  # type: ignore[attr-defined]
+        last_observation=jnp.array([1.0, 0.0], dtype=jnp.float32),
+        last_action=jnp.array(2, dtype=jnp.int32),
+    )
+    result = agent.update(
+        state,
+        reward=jnp.array(jnp.inf, dtype=jnp.float32),
+        observation=jnp.array([0.0, 1.0], dtype=jnp.float32),
+        terminated=jnp.asarray(False),
+    )
+    assert not bool(result.update_applied)
+    assert int(result.state.last_action) == 2
+    assert int(result.action) == 2
+
+
+def test_nonlinear_horde_actor_critic_rejected_update_preserves_last_action() -> None:
+    """NonlinearHordeActorCriticAgent must report prior last_action when an update is rejected."""
+    agent = _make_nlhac_agent(hidden_sizes=())
+    state = _init_nlhac(agent).replace(  # type: ignore[attr-defined]
+        last_observation=jnp.zeros(OBS_DIM, dtype=jnp.float32),
+        last_action=jnp.array(2, dtype=jnp.int32),
+    )
+    result = agent.update(
+        state,
+        reward=jnp.array(jnp.inf, dtype=jnp.float32),
+        observation=jnp.zeros(OBS_DIM, dtype=jnp.float32),
+    )
+    assert not bool(result.update_applied)
+    assert int(result.state.last_action) == 2
+    assert int(result.action) == 2
+
+
+def test_nonlinear_qhorde_actor_critic_rejected_update_preserves_last_action() -> None:
+    """NonlinearQHordeActorCriticAgent must report prior last_action when an update is rejected."""
+    agent = _make_nlqhac_agent()
+    state = agent.init(OBS_DIM, jr.key(0)).replace(  # type: ignore[attr-defined]
+        last_observation=jnp.zeros(OBS_DIM, dtype=jnp.float32),
+        last_action=jnp.array(2, dtype=jnp.int32),
+    )
+    result = agent.update(
+        state,
+        reward=jnp.array(jnp.inf, dtype=jnp.float32),
+        observation=jnp.zeros(OBS_DIM, dtype=jnp.float32),
+        terminated=jnp.asarray(False),
+    )
+    assert not bool(result.update_applied)
+    assert int(result.state.last_action) == 2
+    assert int(result.action) == 2
+
+
+def _make_qhorde_prediction_trace_agent() -> QHordeActorCriticAgent:
+    """Q Horde AC agent with one prediction demon whose trace accumulates."""
+    demons = [
+        GVFSpec(  # type: ignore[call-arg]
+            name=f"q_{idx}",
+            demon_type=DemonType.CONTROL,
+            gamma=0.0,
+            lamda=0.0,
+            cumulant_index=-1,
+        )
+        for idx in range(2)
+    ]
+    demons.append(
+        GVFSpec(  # type: ignore[call-arg]
+            name="pred",
+            demon_type=DemonType.PREDICTION,
+            gamma=0.9,
+            lamda=0.9,
+            cumulant_index=0,
+        )
+    )
+    critic = HordeLearner(
+        create_horde_spec(demons),
+        hidden_sizes=(),
+        step_size=0.1,
+        use_layer_norm=False,
+    )
+    return QHordeActorCriticAgent(
+        QHordeActorCriticConfig(n_actions=2, gamma=0.9, actor_step_size=0.05, actor_lamda=0.7),
+        critic,
+    )
+
+
+def _make_nlqhorde_prediction_trace_agent() -> NonlinearQHordeActorCriticAgent:
+    """Nonlinear Q Horde AC agent with one accumulating prediction demon."""
+    demons = [
+        GVFSpec(  # type: ignore[call-arg]
+            name=f"q_{idx}",
+            demon_type=DemonType.CONTROL,
+            gamma=0.0,
+            lamda=0.0,
+            cumulant_index=-1,
+        )
+        for idx in range(2)
+    ]
+    demons.append(
+        GVFSpec(  # type: ignore[call-arg]
+            name="pred",
+            demon_type=DemonType.PREDICTION,
+            gamma=0.9,
+            lamda=0.9,
+            cumulant_index=0,
+        )
+    )
+    critic = HordeLearner(
+        create_horde_spec(demons),
+        hidden_sizes=(),
+        step_size=0.1,
+        use_layer_norm=False,
+    )
+    return NonlinearQHordeActorCriticAgent(
+        NonlinearQHordeActorCriticConfig(n_actions=2, gamma=0.9, actor_lamda=0.7),
+        critic,
+    )
+
+
+def _assert_prediction_demon_traces_cleared_at_terminal(agent) -> None:  # type: ignore[no-untyped-def]
+    """A terminal update must clear the prediction-demon traces.
+
+    The actor traces were already cleared at a terminal transition, but the
+    critic's prediction-demon traces survived: they decay by the spec gamma
+    * lamda, so the dead episode's trace was credited to the next episode's
+    first TD error and moved the prediction weights.
+    """
+    state = agent.init(2, jr.key(0))
+    state, _, _ = agent.start(state, jnp.array([1.0, 0.0], dtype=jnp.float32))
+    obs = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    step = agent.update(
+        state,
+        jnp.array(1.0, dtype=jnp.float32),
+        obs,
+        jnp.array(0.0, dtype=jnp.float32),
+        prediction_cumulants=jnp.array([1.0], dtype=jnp.float32),
+    )
+    assert bool(step.update_applied)
+    trace_w, _ = step.state.critic_state.head_traces[2]
+    assert float(jnp.max(jnp.abs(trace_w))) > 0.0
+    terminal = agent.update(
+        step.state,
+        jnp.array(1.0, dtype=jnp.float32),
+        obs,
+        jnp.array(1.0, dtype=jnp.float32),
+        prediction_cumulants=jnp.array([1.0], dtype=jnp.float32),
+    )
+    assert bool(terminal.update_applied)
+    trace_w, trace_b = terminal.state.critic_state.head_traces[2]
+    chex.assert_trees_all_close(trace_w, jnp.zeros_like(trace_w))
+    chex.assert_trees_all_close(trace_b, jnp.zeros_like(trace_b))
+
+    # The next episode's first update must match a control with the trace
+    # zeroed by hand: no dead-episode trace may move the prediction weights.
+    leaky = agent.update(
+        terminal.state,
+        jnp.array(1.0, dtype=jnp.float32),
+        obs,
+        jnp.array(0.0, dtype=jnp.float32),
+        prediction_cumulants=jnp.array([1.0], dtype=jnp.float32),
+    )
+    traces = list(terminal.state.critic_state.head_traces)
+    traces[2] = (jnp.zeros_like(traces[2][0]), jnp.zeros_like(traces[2][1]))
+    clean_state = terminal.state.replace(
+        critic_state=terminal.state.critic_state.replace(head_traces=tuple(traces))
+    )
+    clean = agent.update(
+        clean_state,
+        jnp.array(1.0, dtype=jnp.float32),
+        obs,
+        jnp.array(0.0, dtype=jnp.float32),
+        prediction_cumulants=jnp.array([1.0], dtype=jnp.float32),
+    )
+    chex.assert_trees_all_close(
+        np.array(leaky.state.critic_state.head_params.weights[2]),
+        np.array(clean.state.critic_state.head_params.weights[2]),
+    )
+
+
+def test_qhorde_clears_prediction_demon_traces_at_terminal() -> None:
+    _assert_prediction_demon_traces_cleared_at_terminal(_make_qhorde_prediction_trace_agent())
+
+
+def test_nonlinear_qhorde_clears_prediction_demon_traces_at_terminal() -> None:
+    _assert_prediction_demon_traces_cleared_at_terminal(_make_nlqhorde_prediction_trace_agent())
+
+
+@pytest.mark.parametrize("second_discount", [0.0, 0.9], ids=["terminal", "continuing"])
+def test_horde_actor_critic_trace_decays_by_the_discount_into_the_state(
+    second_discount: float,
+) -> None:
+    """AC(lambda) decays e_{t-1} by the discount of the transition into S_t.
+
+    The first transition's caller discount 0.4 differs from the value head's
+    configured gamma 0.9, so the second update must use 0.4, whether its own
+    discount ends the episode (0) or not (0.9).
+    """
+    agent = _make_agent()
+    s0 = jnp.array([1.0, 0.0], dtype=jnp.float32)
+    s1 = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    state = agent.init(feature_dim=2, key=jr.key(5)).replace(  # type: ignore[attr-defined]
+        last_observation=s0,
+        last_action=jnp.array(0, dtype=jnp.int32),
+    )
+    first = agent.update(
+        state,
+        reward=jnp.array(0.0, dtype=jnp.float32),
+        observation=s1,
+        discount=jnp.array(0.4, dtype=jnp.float32),
+    )
+    second = agent.update(
+        first.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=s0,
+        discount=jnp.array(second_discount, dtype=jnp.float32),
+    )
+    assert bool(first.update_applied)
+    assert bool(second.update_applied)
+
+    # grad log pi(A|S) of each update's own state and action.
+    grad0 = jax.nn.one_hot(0, 2) - agent.policy(state, s0)
+    grad1 = jax.nn.one_hot(first.state.last_action, 2) - agent.policy(first.state, s1)
+    trace_weights = 0.4 * 0.7 * grad0[:, None] * s0[None, :] + grad1[:, None] * s1[None, :]
+    trace_bias = 0.4 * 0.7 * grad0 + grad1
+    step = 0.05 * second.td_error
+    chex.assert_trees_all_close(
+        second.state.actor_weights,
+        first.state.actor_weights + step * trace_weights,
+        rtol=1e-5,
+        atol=1e-7,
+    )
+    chex.assert_trees_all_close(
+        second.state.actor_bias,
+        first.state.actor_bias + step * trace_bias,
+        rtol=1e-5,
+        atol=1e-7,
+    )
+    # s0's weight column moves only through the first action's trace.
+    first_column_step = second.state.actor_weights[:, 0] - first.state.actor_weights[:, 0]
+    assert float(jnp.max(jnp.abs(first_column_step))) > 1e-4
+    if second_discount == 0.0:
+        chex.assert_trees_all_equal(second.state.actor_trace_weights, jnp.zeros((2, 2)))
+        chex.assert_trees_all_equal(second.state.actor_trace_bias, jnp.zeros((2,)))
+
+
+def test_qhorde_actor_critic_terminal_td_error_credits_earlier_actions() -> None:
+    """The Q-critic actor also credits earlier actions at termination."""
+    agent = _make_qhorde_agent(n_actions=2)
+    s0 = jnp.array([1.0, 0.0], dtype=jnp.float32)
+    s1 = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    state = agent.init(feature_dim=2, key=jr.key(6)).replace(  # type: ignore[attr-defined]
+        last_observation=s0,
+        last_action=jnp.array(0, dtype=jnp.int32),
+    )
+    first = agent.update(
+        state,
+        reward=jnp.array(0.0, dtype=jnp.float32),
+        observation=s1,
+        terminated=jnp.array(0.0, dtype=jnp.float32),
+    )
+    terminal = agent.update(
+        first.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=s0,
+        terminated=jnp.array(1.0, dtype=jnp.float32),
+    )
+    assert bool(first.update_applied)
+    assert bool(terminal.update_applied)
+
+    # The configured gamma 0.9 and actor lambda 0.7 decay the first trace.
+    grad0 = jax.nn.one_hot(0, 2) - agent.policy(state, s0)
+    grad1 = jax.nn.one_hot(first.state.last_action, 2) - agent.policy(first.state, s1)
+    trace_weights = 0.9 * 0.7 * grad0[:, None] * s0[None, :] + grad1[:, None] * s1[None, :]
+    chex.assert_trees_all_close(
+        terminal.state.actor_weights,
+        first.state.actor_weights + 0.05 * terminal.td_error * trace_weights,
+        rtol=1e-5,
+        atol=1e-7,
+    )
+    first_column_step = terminal.state.actor_weights[:, 0] - first.state.actor_weights[:, 0]
+    assert float(jnp.max(jnp.abs(first_column_step))) > 1e-4
+    chex.assert_trees_all_equal(terminal.state.actor_trace_weights, jnp.zeros((2, 2)))
+
+
+def _zero_nonlinear_actor_traces(state: Any) -> Any:
+    return state.replace(
+        actor_trunk_traces=tuple(jnp.zeros_like(t) for t in state.actor_trunk_traces),
+        actor_head_trace_w=jnp.zeros_like(state.actor_head_trace_w),
+        actor_head_trace_b=jnp.zeros_like(state.actor_head_trace_b),
+    )
+
+
+@pytest.mark.parametrize("q_critic", [False, True], ids=["value_critic", "q_critic"])
+def test_nonlinear_horde_terminal_td_error_credits_earlier_actions(q_critic: bool) -> None:
+    """A terminal TD error must reach the trace built earlier in the episode."""
+    agent: Any = _make_nlqhac_agent() if q_critic else _make_nlhac_agent()
+    state = agent.init(feature_dim=OBS_DIM, key=jr.key(30))
+    state, _, _ = agent.start(state, jr.normal(jr.key(31), (OBS_DIM,)))
+    observations = jr.normal(jr.key(32), (2, OBS_DIM))
+
+    def step(current: Any, reward: float, observation: jax.Array, terminal: bool) -> Any:
+        if q_critic:
+            return agent.update(
+                current,
+                jnp.array(reward, jnp.float32),
+                observation,
+                terminated=jnp.array(float(terminal), jnp.float32),
+            )
+        return agent.update(
+            current,
+            jnp.array(reward, jnp.float32),
+            observation,
+            discount=jnp.array(0.0 if terminal else 0.99, jnp.float32),
+        )
+
+    first = step(state, 0.0, observations[0], terminal=False)
+    carried = step(first.state, 1.0, observations[1], terminal=True)
+    without_history = step(
+        _zero_nonlinear_actor_traces(first.state), 1.0, observations[1], terminal=True
+    )
+    assert bool(first.update_applied)
+    assert bool(carried.update_applied)
+    assert bool(without_history.update_applied)
+
+    # The trace from the first action changes the terminal actor step ...
+    assert float(jnp.max(jnp.abs(first.state.actor_head_trace_w))) > 0.0
+    assert not np.allclose(
+        np.asarray(carried.state.actor_head_w),
+        np.asarray(without_history.state.actor_head_w),
+    )
+    # ... and is still cleared after the terminal update.
+    for trace in (
+        *carried.state.actor_trunk_traces,
+        carried.state.actor_head_trace_w,
+        carried.state.actor_head_trace_b,
+    ):
+        chex.assert_trees_all_equal(trace, jnp.zeros_like(trace))
+
+
+def _actor_grad_weights_matrix(action: int, obs: np.ndarray, n_actions: int = 2) -> np.ndarray:
+    """Policy gradient of the log-softmax weights under a uniform policy.
+
+    With zero actor weights and temperature 1.0 the policy is uniform, so
+    ``grad log pi(a | s) = (one_hot(a) - 1/n_actions)`` for the bias and its
+    outer product with the observation for the weights.
+    """
+    bias = np.eye(n_actions, dtype=np.float64)[action] - 1.0 / n_actions
+    return bias[:, None] * np.asarray(obs, dtype=np.float64)[None, :]
+
+
+def _zero_critic_head_params(state):  # type: ignore[no-untyped-def]
+    """Zero the critic head weights so the TD error equals the reward.
+
+    The regression tests below isolate the *actor* trace decay; a randomly
+    initialized critic would add arbitrary value offsets to the TD error.
+    Head-parameter surgery mirrors
+    ``test_qhorde_terminal_does_not_multiply_inf_next_value``.
+    """
+    head_params = state.critic_state.head_params
+    zeroed = head_params.replace(
+        weights=tuple(jnp.zeros_like(w) for w in head_params.weights),
+        biases=tuple(jnp.zeros_like(b) for b in head_params.biases),
+    )
+    return state.replace(  # type: ignore[attr-defined]
+        critic_state=state.critic_state.replace(head_params=zeroed)
+    )
+
+
+def test_terminal_reward_credits_episode_qhorde_actor_trace() -> None:
+    """Terminal reward must credit the Q-horde episode's actor trace.
+
+    For episodic AC(lambda), the terminating transition's TD error is
+    computed with discount 0 (no bootstrap), but the eligibility traces
+    accumulated over the episode must still be decayed by the *incoming*
+    discount (the prior transition's discount) so the terminal reward
+    credits the whole episode. Decaying with the outgoing (zero) discount
+    wipes the episode trace before the terminal TD error is applied, so
+    only the final step's gradient receives the terminal credit.
+    """
+    demons = [
+        GVFSpec(  # type: ignore[call-arg]
+            name=f"q_{idx}",
+            demon_type=DemonType.CONTROL,
+            gamma=0.0,
+            lamda=0.0,
+            cumulant_index=-1,
+        )
+        for idx in range(2)
+    ]
+    critic = HordeLearner(
+        create_horde_spec(demons),
+        hidden_sizes=(),
+        step_size=0.1,
+        use_layer_norm=False,
+    )
+    agent = QHordeActorCriticAgent(
+        QHordeActorCriticConfig(
+            n_actions=2,
+            gamma=1.0,
+            actor_step_size=0.1,
+            actor_lamda=1.0,
+        ),
+        critic=critic,
+    )
+    s0 = jnp.array([1.0, 0.0], dtype=jnp.float32)
+    s1 = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    state = agent.init(feature_dim=2, key=jr.key(0))
+    state = _zero_critic_head_params(state)
+    state, action0, _ = agent.start(state, s0)
+    a0 = int(action0)
+
+    first = agent.update(
+        state,
+        reward=jnp.array(0.0, dtype=jnp.float32),
+        observation=s1,
+        terminated=jnp.array(False),
+    )
+    assert bool(first.update_applied)
+    a1 = int(first.state.last_action)
+
+    second = agent.update(
+        first.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=jnp.array([0.0, 0.0], dtype=jnp.float32),
+        terminated=jnp.array(True),
+    )
+    assert bool(second.update_applied)
+    assert abs(float(second.td_error) - 1.0) < 1e-6
+
+    # Weights stay zero through the episode, so both step policies are
+    # uniform and each step's actor gradient is
+    # (one_hot(action) - 0.5) outer observation (temperature 1.0).
+    expected_weights = 0.1 * (
+        _actor_grad_weights_matrix(a0, np.asarray(s0))
+        + _actor_grad_weights_matrix(a1, np.asarray(s1))
+    )
+    # The mutant that decays the actor trace with the outgoing (zero)
+    # discount at the terminal step drops the a0 term above, leaving the
+    # earlier state's column at zero instead of carrying its credit.
+    np.testing.assert_allclose(
+        np.asarray(second.state.actor_weights),
+        expected_weights,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    # Stored traces are still cleared after the terminal update.
+    np.testing.assert_allclose(
+        np.asarray(second.state.actor_trace_weights),
+        np.zeros((2, 2)),
+        atol=1e-7,
+    )
+
+
+def test_terminal_reward_credits_episode_horde_actor_trace() -> None:
+    """Terminal reward must credit the horde episode's actor trace.
+
+    The ``HordeActorCriticAgent`` accepts an explicit per-transition discount.
+    Passing ``discount=0.0`` on the terminating transition must still credit
+    the episode's accumulated actor trace: the trace decays with the
+    *incoming* discount (the prior accepted transition's discount), while the
+    current call's discount only controls the TD bootstrap.
+    """
+    demons = [
+        GVFSpec(  # type: ignore[call-arg]
+            name="value",
+            demon_type=DemonType.PREDICTION,
+            gamma=1.0,
+            lamda=0.0,
+            cumulant_index=-1,
+        )
+    ]
+    critic = HordeLearner(
+        create_horde_spec(demons),
+        hidden_sizes=(),
+        step_size=0.1,
+        use_layer_norm=False,
+    )
+    agent = HordeActorCriticAgent(
+        HordeActorCriticConfig(
+            n_actions=2,
+            actor_step_size=0.1,
+            actor_lamda=1.0,
+        ),
+        critic=critic,
+    )
+    s0 = jnp.array([1.0, 0.0], dtype=jnp.float32)
+    s1 = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    state = agent.init(feature_dim=2, key=jr.key(0))
+    state = _zero_critic_head_params(state)
+    state, action0, _ = agent.start(state, s0)
+    a0 = int(action0)
+
+    first = agent.update(
+        state,
+        reward=jnp.array(0.0, dtype=jnp.float32),
+        observation=s1,
+    )
+    assert bool(first.update_applied)
+    a1 = int(first.state.last_action)
+
+    second = agent.update(
+        first.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=jnp.array([0.0, 0.0], dtype=jnp.float32),
+        discount=jnp.array(0.0, dtype=jnp.float32),
+    )
+    assert bool(second.update_applied)
+    assert abs(float(second.td_error) - 1.0) < 1e-6
+
+    expected_weights = 0.1 * (
+        _actor_grad_weights_matrix(a0, np.asarray(s0))
+        + _actor_grad_weights_matrix(a1, np.asarray(s1))
+    )
+    # The mutant that decays the actor trace with the outgoing (zero)
+    # discount at the terminal step drops the a0 term above, leaving the
+    # earlier state's column at zero instead of carrying its credit.
+    np.testing.assert_allclose(
+        np.asarray(second.state.actor_weights),
+        expected_weights,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    # Stored traces are still cleared after the terminal update.
+    np.testing.assert_allclose(
+        np.asarray(second.state.actor_trace_weights),
+        np.zeros((2, 2)),
+        atol=1e-7,
+    )
+
+
+def _zero_nlhac_critic_head_params(state):  # type: ignore[no-untyped-def]
+    """Zero the critic head weights so the TD error equals the reward.
+
+    The regression tests below isolate the *actor* trace decay; a randomly
+    initialized critic would add arbitrary value offsets to the TD error.
+    """
+    head_params = state.critic_state.head_params
+    zeroed = head_params.replace(
+        weights=tuple(jnp.zeros_like(w) for w in head_params.weights),
+        biases=tuple(jnp.zeros_like(b) for b in head_params.biases),
+    )
+    return state.replace(  # type: ignore[attr-defined]
+        critic_state=state.critic_state.replace(head_params=zeroed)
+    )
+
+
+def _zero_nlhac_actor_traces(state):  # type: ignore[no-untyped-def]
+    """Return a copy of the state with every actor eligibility trace zeroed."""
+    return state.replace(  # type: ignore[attr-defined]
+        actor_trunk_traces=tuple(jnp.zeros_like(t) for t in state.actor_trunk_traces),
+        actor_head_trace_w=jnp.zeros_like(state.actor_head_trace_w),
+        actor_head_trace_b=jnp.zeros_like(state.actor_head_trace_b),
+    )
+
+
+def test_nonlinear_horde_actor_trace_decays_with_prior_discount() -> None:
+    """Actor traces must decay with the incoming discount, not the outgoing one.
+
+    The first update runs with discount 0.9 and the second with discount 0.1.
+    Decaying with the outgoing (0.1) discount would shrink the stored trace
+    far below ``0.9 * actor_lamda`` times the first step's trace plus the
+    second step's gradient, which the zeroed-trace twin isolates exactly.
+    """
+    agent = _make_nlhac_agent()
+    s0 = jnp.zeros(OBS_DIM, dtype=jnp.float32).at[0].set(1.0)
+    s1 = jnp.zeros(OBS_DIM, dtype=jnp.float32).at[1].set(1.0)
+    s2 = jnp.zeros(OBS_DIM, dtype=jnp.float32).at[2].set(1.0)
+    state = _zero_nlhac_critic_head_params(_init_nlhac(agent))
+    state, _, _ = agent.start(state, s0)
+
+    first = agent.update(
+        state,
+        reward=jnp.array(0.0, dtype=jnp.float32),
+        observation=s1,
+        discount=jnp.array(0.9, dtype=jnp.float32),
+    )
+    assert bool(first.update_applied)
+    assert float(first.state.previous_discount) == pytest.approx(0.9)
+
+    second = agent.update(
+        first.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=s2,
+        discount=jnp.array(0.1, dtype=jnp.float32),
+    )
+    twin = agent.update(
+        _zero_nlhac_actor_traces(first.state),
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=s2,
+        discount=jnp.array(0.1, dtype=jnp.float32),
+    )
+    assert bool(second.update_applied)
+    assert float(second.state.previous_discount) == pytest.approx(0.1)
+    expected = (
+        0.9 * float(agent.config.actor_lamda) * np.asarray(first.state.actor_head_trace_w)
+        + np.asarray(twin.state.actor_head_trace_w)
+    )
+    np.testing.assert_allclose(
+        np.asarray(second.state.actor_head_trace_w),
+        expected,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+def test_nonlinear_horde_terminal_reward_credits_episode_trace() -> None:
+    """A terminal reward must credit the nonlinear Horde episode's actor trace.
+
+    The terminating transition's TD error is computed with discount 0 (no
+    bootstrap), but the eligibility traces accumulated over the episode must
+    still be decayed by the incoming discount, so the terminal reward credits
+    the whole episode. Decaying with the outgoing (zero) discount wipes the
+    episode trace before the terminal TD error is applied, so the weight
+    update from the full-trace state would be identical to the update from
+    the zeroed-trace twin. Stored traces are still cleared after the update.
+    """
+    agent = _make_nlhac_agent()
+    s0 = jnp.zeros(OBS_DIM, dtype=jnp.float32).at[0].set(1.0)
+    s1 = jnp.zeros(OBS_DIM, dtype=jnp.float32).at[1].set(1.0)
+    s2 = jnp.zeros(OBS_DIM, dtype=jnp.float32).at[2].set(1.0)
+    state = _zero_nlhac_critic_head_params(_init_nlhac(agent))
+    state, _, _ = agent.start(state, s0)
+
+    first = agent.update(
+        state,
+        reward=jnp.array(0.0, dtype=jnp.float32),
+        observation=s1,
+        discount=jnp.array(0.9, dtype=jnp.float32),
+    )
+    assert bool(first.update_applied)
+
+    second = agent.update(
+        first.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=s2,
+        discount=jnp.array(0.0, dtype=jnp.float32),
+    )
+    twin = agent.update(
+        _zero_nlhac_actor_traces(first.state),
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=s2,
+        discount=jnp.array(0.0, dtype=jnp.float32),
+    )
+    assert bool(second.update_applied)
+    assert abs(float(second.td_error) - 1.0) < 1e-6
+    full_delta = np.asarray(second.state.actor_head_w) - np.asarray(first.state.actor_head_w)
+    twin_delta = np.asarray(twin.state.actor_head_w) - np.asarray(first.state.actor_head_w)
+    assert float(np.max(np.abs(full_delta - twin_delta))) > 1e-4
+    np.testing.assert_allclose(
+        np.asarray(second.state.actor_head_trace_w),
+        np.zeros_like(np.asarray(second.state.actor_head_trace_w)),
+        atol=1e-7,
+    )
+
+
+def test_nonlinear_qhorde_terminal_reward_credits_episode_trace() -> None:
+    """A terminal reward must credit the nonlinear Q-Horde episode's trace.
+
+    Same bug class as the nonlinear Horde critic test above, for the
+    action-value agent whose current call's discount is ``0`` when
+    ``terminated``: decaying with it wipes the episode trace before the
+    terminal TD error is applied, so the full-trace weight update would be
+    identical to the zeroed-trace twin's update.
+    """
+    agent = _make_nlqhac_agent()
+    s0 = jnp.zeros(OBS_DIM, dtype=jnp.float32).at[0].set(1.0)
+    s1 = jnp.zeros(OBS_DIM, dtype=jnp.float32).at[1].set(1.0)
+    s2 = jnp.zeros(OBS_DIM, dtype=jnp.float32).at[2].set(1.0)
+    state = _zero_nlhac_critic_head_params(agent.init(feature_dim=OBS_DIM, key=jr.key(0)))
+    state, _, _ = agent.start(state, s0)
+
+    first = agent.update(
+        state,
+        reward=jnp.array(0.0, dtype=jnp.float32),
+        observation=s1,
+        terminated=jnp.array(False),
+    )
+    assert bool(first.update_applied)
+
+    second = agent.update(
+        first.state,
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=s2,
+        terminated=jnp.array(True),
+    )
+    twin = agent.update(
+        _zero_nlhac_actor_traces(first.state),
+        reward=jnp.array(1.0, dtype=jnp.float32),
+        observation=s2,
+        terminated=jnp.array(True),
+    )
+    assert bool(second.update_applied)
+    assert abs(float(second.td_error) - 1.0) < 1e-6
+    full_delta = np.asarray(second.state.actor_head_w) - np.asarray(first.state.actor_head_w)
+    twin_delta = np.asarray(twin.state.actor_head_w) - np.asarray(first.state.actor_head_w)
+    assert float(np.max(np.abs(full_delta - twin_delta))) > 1e-4
+    np.testing.assert_allclose(
+        np.asarray(second.state.actor_head_trace_w),
+        np.zeros_like(np.asarray(second.state.actor_head_trace_w)),
+        atol=1e-7,
+    )

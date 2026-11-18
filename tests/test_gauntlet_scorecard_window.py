@@ -1,11 +1,13 @@
 """Tests for gauntlet scorecard and window scalar validation."""
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from alberta_framework.streams.gauntlet import (
     GauntletConfig,
     early_window_mse,
+    gauntlet_scorecard,
     lifetime_scorecard,
     savings_ratio,
     segment_slice,
@@ -80,3 +82,92 @@ def test_segment_slice_rejects_boolean_and_negative_indices() -> None:
         segment_slice(errors, segment=True, segment_length=50)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="segment_length"):
         segment_slice(errors, segment=0, segment_length=False)  # type: ignore[arg-type]
+
+
+def test_lifetime_scorecard_identical_floor_and_underflow_windows_score_one() -> None:
+    import numpy as np
+
+    config = GauntletConfig(segment_length=50)
+    # 2 seeds, 3 cycles of (4 subsegments * 50) = 600 steps
+    n_cycles = 3
+    total_steps = n_cycles * 4 * config.segment_length
+
+    # 1. Identical zeros (oracle / noiseless) must report 1.0 savings across cycles, not 0.0
+    zeros = jnp.zeros((2, total_steps), dtype=jnp.float32)
+    card_zeros = lifetime_scorecard(zeros, config, n_cycles=n_cycles, window=20)
+    np.testing.assert_allclose(np.asarray(card_zeros["savings_c"]), np.ones((2, n_cycles - 1)))
+    np.testing.assert_allclose(np.asarray(card_zeros["savings_d"]), np.ones((2, n_cycles - 1)))
+
+    # 2. Identical sub-floor underflow (1e-12) must report 1.0, not 1e-12 / 1e-8 = 1e-4
+    underflow = jnp.full((2, total_steps), 1e-12, dtype=jnp.float32)
+    card_underflow = lifetime_scorecard(underflow, config, n_cycles=n_cycles, window=20)
+    np.testing.assert_allclose(np.asarray(card_underflow["savings_c"]), np.ones((2, n_cycles - 1)))
+    np.testing.assert_allclose(np.asarray(card_underflow["savings_d"]), np.ones((2, n_cycles - 1)))
+
+    # 3. Memoryless identical non-zero (1.0) traces remain 1.0
+    ones = jnp.ones((2, total_steps), dtype=jnp.float32)
+    card_ones = lifetime_scorecard(ones, config, n_cycles=n_cycles, window=20)
+    np.testing.assert_allclose(np.asarray(card_ones["savings_c"]), np.ones((2, n_cycles - 1)))
+    np.testing.assert_allclose(np.asarray(card_ones["savings_d"]), np.ones((2, n_cycles - 1)))
+
+    # 4. Perfect first exposure (0.0) with degraded revisit (1.0) correctly scores 0.0
+    degraded = jnp.ones((2, total_steps), dtype=jnp.float32)
+    # Cycle 0 subsegment 1 (task C) and subsegment 3 (task D) have zero error
+    degraded = degraded.at[:, : 4 * config.segment_length].set(0.0)
+    # Revisit in cycles 1 and 2 has error 1.0
+    card_degraded = lifetime_scorecard(degraded, config, n_cycles=n_cycles, window=20)
+    np.testing.assert_allclose(np.asarray(card_degraded["savings_c"]), np.zeros((2, n_cycles - 1)))
+    np.testing.assert_allclose(np.asarray(card_degraded["savings_d"]), np.zeros((2, n_cycles - 1)))
+
+    # 5. Genuine improvement (1.0 first exposure, 0.1 revisit) scores expected ratio (10.0)
+    improved = jnp.full((2, total_steps), 0.1, dtype=jnp.float32)
+    improved = improved.at[:, : 4 * config.segment_length].set(1.0)
+    card_improved = lifetime_scorecard(improved, config, n_cycles=n_cycles, window=20)
+    np.testing.assert_allclose(
+        np.asarray(card_improved["savings_c"]), np.full((2, n_cycles - 1), 10.0), rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(card_improved["savings_d"]), np.full((2, n_cycles - 1), 10.0), rtol=1e-5
+    )
+
+
+def _nine_segment_errors(segment_length: int, first_c: float = 4.0) -> jnp.ndarray:
+    # Segment 2 (first task-C exposure) sits at ``first_c``; every other segment at 1.0.
+    sq = jnp.ones((2, 9 * segment_length), dtype=jnp.float32)
+    return sq.at[:, 2 * segment_length : 3 * segment_length].set(first_c)
+
+
+def test_gauntlet_scorecard_scores_legal_short_segments() -> None:
+    """Any ``GauntletConfig`` the stream accepts must be scorable.
+
+    ``run_gauntlet`` accepts every ``segment_length >= 1`` but the scorecard used
+    a hard-coded 200-step entry window it never exposed, so every legal config
+    below 200 steps crashed instead of being scored.
+    """
+    config = GauntletConfig(segment_length=100, relevant_dim=2, irrelevant_dim=0)
+    card = gauntlet_scorecard(_nine_segment_errors(config.segment_length), config)
+    np.testing.assert_allclose(np.asarray(card["savings_c"]), 4.0, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(card["early_mse_c_first"]), 4.0, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(card["early_mse_c_recur"]), 1.0, rtol=1e-6)
+    for value in card.values():
+        assert bool(jnp.all(jnp.isfinite(value)))
+
+    # An explicit window is honoured and validated against the segment.
+    explicit = gauntlet_scorecard(_nine_segment_errors(100), config, window=50)
+    np.testing.assert_allclose(np.asarray(explicit["savings_c"]), 4.0, rtol=1e-6)
+    with pytest.raises(ValueError, match=r"window must be an integer in \[1, 100\]"):
+        gauntlet_scorecard(_nine_segment_errors(100), config, window=101)
+    with pytest.raises(ValueError, match="window"):
+        gauntlet_scorecard(_nine_segment_errors(100), config, window=True)  # type: ignore[arg-type]
+
+
+def test_gauntlet_scorecard_default_window_stays_200_for_long_segments() -> None:
+    """Long segments keep the documented 200-step entry window by default."""
+    config = GauntletConfig(segment_length=400, relevant_dim=2, irrelevant_dim=0)
+    sq = _nine_segment_errors(400, first_c=1.0)
+    # First 200 steps of segment 2 at 4.0, the trailing 200 at 1.0: a 200-step
+    # window reads 4.0, a whole-segment window would read 2.5.
+    sq = sq.at[:, 800:1000].set(4.0)
+    card = gauntlet_scorecard(sq, config)
+    np.testing.assert_allclose(np.asarray(card["early_mse_c_first"]), 4.0, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(card["savings_c"]), 4.0, rtol=1e-6)

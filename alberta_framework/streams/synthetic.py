@@ -13,6 +13,7 @@ from numbers import Real
 from typing import Any, SupportsIndex, cast
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -34,19 +35,7 @@ _FLOAT32_EXP_SAFE_LOG_MAX = float(
     np.nextafter(np.float32(math.log(_FLOAT32_MAX)), np.float32(-math.inf))
 )
 
-_ACTUAL_INT_TYPES: tuple[type, ...] = (
-    int,
-    np.int8,
-    np.int16,
-    np.int32,
-    np.int64,
-    np.uint8,
-    np.uint16,
-    np.uint32,
-    np.uint64,
-    np.longlong,
-    np.ulonglong,
-)
+_ACTUAL_INT_TYPES: tuple[type, ...] = (int, *(np.dtype(code).type for code in "bBhHiIlLqQpP"))
 
 
 def _require_positive_int(name: str, value: object) -> int:
@@ -63,6 +52,23 @@ def _require_exact_bool(name: str, value: object) -> bool:
     if type(value) is not bool:
         raise ValueError(f"{name} must be an exact bool")
     return value
+
+
+def _require_threefry_key(value: object, *, name: str = "key") -> Array:
+    """Require one typed scalar Threefry key before splitting a stream root."""
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array) or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError(f"{name} must be a typed scalar Threefry JAX key")
+    trusted = cast(Array, value)
+    try:
+        words = jr.key_data(trusted)
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a typed scalar Threefry JAX key") from error
+    if trusted.shape != () or words.shape != (2,) or words.dtype != jnp.dtype(jnp.uint32):
+        raise TypeError(f"{name} must be a typed scalar Threefry JAX key")
+    return trusted
 
 
 def _require_float32_resource(
@@ -83,9 +89,19 @@ def _hidden_state_ar2_persistent_bytes(feature_dim: int) -> int:
     return 4 * (2 * feature_dim + 2)
 
 
+def _random_walk_persistent_bytes(feature_dim: int) -> int:
+    """Bytes in the true-weight vector and the two-word Threefry key."""
+    return 4 * (feature_dim + 2)
+
+
 def _sutton_experiment1_persistent_bytes(feature_dim: int) -> int:
     """Named persist already counted inside ``_require_float32_resource``."""
     return 4 * (feature_dim + 3)
+
+
+def _cyclic_persistent_bytes(feature_dim: int, num_configurations: int) -> int:
+    """Bytes in the configuration matrix, key words, and lifetime counter."""
+    return 4 * (feature_dim * num_configurations + 3)
 
 
 def _scale_stream_persistent_bytes(feature_dim: int) -> int:
@@ -140,11 +156,20 @@ def _require_normal_float32_scale(name: str, value: object) -> float:
 
 
 def _require_finite_nonnegative_float32(name: str, value: object) -> float:
-    """Require a finite non-negative float32 execution value."""
+    """Require a finite non-negative float32 execution value.
+
+    A strictly positive request that narrows to binary32 zero is rejected: the
+    step kernel would execute a stationary stream, a noise-free stream, or
+    identically zero observations while the constructor recorded a positive
+    scale. Exact zero and the smallest representable subnormal stay legal, so
+    this only forbids the silent collapse.
+    """
     message = f"{name} must be a finite non-negative float32 value"
     numerator, _, narrowed = _narrow_real_to_float32(name, value, message)
     if numerator < 0 or narrowed < 0.0:
         raise ValueError(message)
+    if numerator > 0 and narrowed == 0.0:
+        raise ValueError(f"{name} must not be a positive value that narrows to float32 zero")
     return narrowed
 
 
@@ -165,6 +190,33 @@ def _require_finite_float32(name: str, value: object) -> float:
     message = f"{name} must be a finite float32 value"
     _, _, narrowed = _narrow_real_to_float32(name, value, message)
     return narrowed
+
+
+def _skip_zero_scale(scale: Array, value: Array) -> Array:
+    """Return ``scale * value``, or exact zero where ``scale`` is zero.
+
+    A zero scale removes the term entirely, so it must contribute zero even
+    when ``value`` is non-finite.  Forming the raw product first turns
+    ``0 * inf`` into ``NaN``.
+    """
+    return jnp.where(scale == 0.0, jnp.zeros_like(value), scale * value)
+
+
+def _finite_float32_sum(values: Array) -> Array:
+    """Sum finite float32 values without an overflowing partial total.
+
+    ``jnp.sum`` turns a pair of large opposite values into ``inf`` when one
+    partial total leaves the float32 range, even though the real total is
+    finite.  A power-of-two scale keeps that total, including exact zero.
+    A finite direct sum stays bit for bit.
+    """
+    values = jnp.asarray(values, dtype=jnp.float32)
+    direct = jnp.sum(values)
+    exponent = jnp.frexp(jnp.max(jnp.abs(values)))[1]
+    scaled = jnp.ldexp(values, -exponent)
+    stable = jnp.ldexp(jnp.sum(scaled), exponent)
+    use_stable = jnp.isfinite(stable) & ~jnp.isfinite(direct)
+    return jnp.where(use_stable, stable, direct)
 
 
 @chex.dataclass(frozen=True)
@@ -211,6 +263,16 @@ class RandomWalkStream:
             feature_std: Std dev of feature values
         """
         self._feature_dim = _require_positive_int("feature_dim", feature_dim)
+        _require_float32_resource(
+            "RandomWalkStream state",
+            vector_scalars=self._feature_dim,
+            fixed_scalars=2,
+        )
+        _preflight_synthetic_step_working_set(
+            "RandomWalkStream",
+            _random_walk_persistent_bytes(self._feature_dim),
+            self._feature_dim,
+        )
         self._drift_rate = _require_finite_nonnegative_float32("drift_rate", drift_rate)
         self._noise_std = _require_finite_nonnegative_float32("noise_std", noise_std)
         self._feature_std = _require_finite_nonnegative_float32("feature_std", feature_std)
@@ -229,7 +291,7 @@ class RandomWalkStream:
         Returns:
             Initial stream state with random weights
         """
-        key, subkey = jr.split(key)
+        key, subkey = jr.split(_require_threefry_key(key))
         weights = jr.normal(subkey, (self._feature_dim,), dtype=jnp.float32)
         return RandomWalkState(key=key, true_weights=weights)
 
@@ -360,7 +422,7 @@ class HiddenStateAR2Stream:
 
     def init(self, key: Array) -> HiddenStateAR2State:
         """Initialize AR state."""
-        key, k1, k2 = jr.split(key, 3)
+        key, k1, k2 = jr.split(_require_threefry_key(key), 3)
         x_prev = jr.normal(k1, (self._feature_dim,), dtype=jnp.float32)
         x_prev2 = jr.normal(k2, (self._feature_dim,), dtype=jnp.float32)
         return HiddenStateAR2State(key=key, x_prev=x_prev, x_prev2=x_prev2)
@@ -379,7 +441,7 @@ class HiddenStateAR2Stream:
             dtype=jnp.float32,
         )
         x_t = self._phi1 * state.x_prev + self._phi2 * state.x_prev2 + innovation
-        visible_term = jnp.sum(x_t[: self._visible_dim])
+        visible_term = _finite_float32_sum(x_t[: self._visible_dim])
         h0 = x_t[self._visible_dim]
         h1 = x_t[self._visible_dim + 1]
         hidden_term = self._nonlinear_coeff * h0 * h1
@@ -457,7 +519,7 @@ class AbruptChangeStream:
         Returns:
             Initial stream state
         """
-        key, subkey = jr.split(key)
+        key, subkey = jr.split(_require_threefry_key(key))
         weights = jr.normal(subkey, (self._feature_dim,), dtype=jnp.float32)
         return AbruptChangeState(
             key=key,
@@ -599,6 +661,7 @@ class SuttonExperiment1Stream:
         Returns:
             Initial stream state with all +1 signs
         """
+        key = _require_threefry_key(key)
         signs = jnp.ones(self._num_relevant, dtype=jnp.float32)
         return SuttonExperiment1State(
             key=key,
@@ -716,6 +779,14 @@ class CyclicStream:
         self._num_configurations = _require_positive_int(
             "num_configurations", num_configurations
         )
+        _preflight_synthetic_step_working_set(
+            "CyclicStream",
+            _cyclic_persistent_bytes(
+                self._feature_dim,
+                self._num_configurations,
+            ),
+            self._feature_dim,
+        )
         self._noise_std = _require_finite_nonnegative_float32("noise_std", noise_std)
         self._feature_std = _require_finite_nonnegative_float32("feature_std", feature_std)
 
@@ -733,7 +804,7 @@ class CyclicStream:
         Returns:
             Initial stream state with pre-generated configurations
         """
-        key, key_configs = jr.split(key)
+        key, key_configs = jr.split(_require_threefry_key(key))
         configurations = jr.normal(
             key_configs,
             (self._num_configurations, self._feature_dim),
@@ -847,7 +918,7 @@ class PeriodicChangeStream:
         Returns:
             Initial stream state with random base weights and phases
         """
-        key, key_weights, key_phases = jr.split(key, 3)
+        key, key_weights, key_phases = jr.split(_require_threefry_key(key), 3)
         base_weights = jr.normal(key_weights, (self._feature_dim,), dtype=jnp.float32)
         # Random phases in [0, 2π) for each weight
         phases = jr.uniform(key_phases, (self._feature_dim,), minval=0.0, maxval=2.0 * jnp.pi)
@@ -872,7 +943,9 @@ class PeriodicChangeStream:
         key, key_x, key_noise = jr.split(state.key, 3)
 
         # Compute oscillating weights: w(t) = base + amplitude * sin(2π * t / period + phase)
-        t = state.step_count.astype(jnp.float32)
+        # Reduce the int32 clock modulo the integer period first: float32(t)
+        # loses the phase once t exceeds 2**24.
+        t = (state.step_count % self._period).astype(jnp.float32)
         oscillation = self._amplitude * jnp.sin(2.0 * jnp.pi * t / self._period + state.phases)
         true_weights = state.base_weights + oscillation
 
@@ -932,12 +1005,34 @@ class ScaledStreamWrapper:
             inner_stream: Stream to wrap (must implement ScanStream protocol)
             feature_scales: Array of scale factors, one per feature. Must have
                 shape (feature_dim,) matching the inner stream's feature_dim.
+                Values must be finite; a scale of exactly ``0.0`` suppresses
+                its channel and yields ``0.0`` regardless of what the wrapped
+                stream emitted there, including a non-finite feature.
 
         Raises:
             ValueError: If feature_scales length doesn't match inner stream's feature_dim
         """
         self._inner_stream: ScanStream[Any] = inner_stream
-        self._feature_scales = jnp.asarray(feature_scales, dtype=jnp.float32)
+        raw_feature_scales = jnp.asarray(feature_scales)
+        if jnp.issubdtype(raw_feature_scales.dtype, jnp.complexfloating):
+            raise ValueError("feature_scales must contain only real values")
+        self._feature_scales = jnp.asarray(raw_feature_scales, dtype=jnp.float32)
+        # A nonzero requested scale that narrows to binary32 zero would
+        # silently suppress its channel, exactly the collapse fixed for
+        # scalar stream parameters in #3315. Exact zero stays legal: it is
+        # the documented deliberate suppression. Reject only the silent
+        # nonzero-to-zero narrowing (either sign: -0.0 suppresses too).
+        try:
+            requested = np.asarray(feature_scales, dtype=np.float64)
+        except (TypeError, ValueError, OverflowError):
+            requested = None
+        if requested is not None and requested.shape == self._feature_scales.shape:
+            narrowed = np.asarray(self._feature_scales, dtype=np.float64)
+            if bool(np.any((requested != 0.0) & (narrowed == 0.0))):
+                raise ValueError(
+                    "feature_scales must not contain a nonzero value that "
+                    "narrows to float32 zero"
+                )
 
         if (
             self._feature_scales.ndim != 1
@@ -989,7 +1084,14 @@ class ScaledStreamWrapper:
         """
         timestep, new_inner_state = self._inner_stream.step(state.inner_state, idx)
 
-        scaled_observation = timestep.observation * self._feature_scales
+        # A zero scale suppresses the channel, so it must contribute exact
+        # zero even when the wrapped stream emits a non-finite feature.  The
+        # raw product turned that 0*inf into a NaN in a channel the caller
+        # asked to remove, and one NaN feature destroys every learner weight
+        # through the dot product.
+        scaled_observation = _skip_zero_scale(
+            self._feature_scales, timestep.observation
+        )
 
         scaled_timestep = TimeStep(
             observation=scaled_observation,
@@ -1160,7 +1262,7 @@ class DynamicScaleShiftStream:
         Returns:
             Initial stream state with random weights and scales
         """
-        key, k_weights, k_scales = jr.split(key, 3)
+        key, k_weights, k_scales = jr.split(_require_threefry_key(key), 3)
         weights = jr.normal(k_weights, (self._feature_dim,), dtype=jnp.float32)
         # Initial scales: log-uniform between min and max
         log_scales = jr.uniform(
@@ -1321,7 +1423,7 @@ class ScaleDriftStream:
         Returns:
             Initial stream state with random weights and unit scales
         """
-        key, k_weights = jr.split(key)
+        key, k_weights = jr.split(_require_threefry_key(key))
         weights = jr.normal(k_weights, (self._feature_dim,), dtype=jnp.float32)
         # Initial log-scales at 0 (scale = 1)
         log_scales = jnp.zeros(self._feature_dim, dtype=jnp.float32)

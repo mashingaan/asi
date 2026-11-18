@@ -378,6 +378,29 @@ def test_summary_retains_failures_and_reports_valid_baseline_failure() -> None:
     assert summary["status"] == "valid_baseline_failure"
 
 
+def test_partial_arm_summary_marks_single_seed_stderr_undefined() -> None:
+    records = _summary_records()
+    retained_seed = SEED_ROSTER[0]
+    for record in records:
+        if record["arm"] == "prototype" and record["seed"] != retained_seed:
+            record["status"] = "failed"
+            record["outcome"] = None
+            record["failure"] = {
+                "stage": "step",
+                "type": "RuntimeError",
+                "message": "synthetic shard failure",
+            }
+
+    summary = scorecard._summarize_validated_run_records(
+        build_development_plan(), records
+    )
+
+    prototype = summary["environments"]["switching_two_state"]["arms"]["prototype"]
+    assert prototype["completed_seed_count"] == 1
+    assert prototype["failed_seed_count"] == len(SEED_ROSTER) - 1
+    assert prototype["reward_sum_stderr"] is None
+
+
 @pytest.mark.skipif(
     not hasattr(os, "O_TMPFILE"),
     reason="write_new_json publishes through Linux O_TMPFILE and linkat(AT_EMPTY_PATH)",
@@ -418,6 +441,34 @@ def test_new_json_publication_rejects_a_symlinked_parent(tmp_path: Path) -> None
     assert not (real_parent / "plan.json").exists()
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "O_TMPFILE"),
+    reason="write_new_json publishes through Linux O_TMPFILE and linkat(AT_EMPTY_PATH)",
+)
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root bypasses directory read permission",
+)
+def test_new_json_publication_traverses_a_search_only_ancestor(tmp_path: Path) -> None:
+    # A shared root such as a 0711 home or tenant mount grants search, not read.
+    shared = tmp_path / "shared"
+    output_dir = shared / "scorecard"
+    output_dir.mkdir(parents=True)
+    destination = output_dir / "plan.json"
+    payload = build_development_plan().to_payload()
+    shared.chmod(0o111)
+    try:
+        assert scorecard.preflight_new_output(destination) == destination
+        write_new_json(destination, payload)
+        with pytest.raises(FileExistsError, match="refusing to overwrite"):
+            scorecard.preflight_new_output(destination)
+        with pytest.raises(FileExistsError, match="refusing to overwrite"):
+            write_new_json(destination, {"different": math.pi})
+    finally:
+        shared.chmod(0o755)
+    assert json.loads(destination.read_bytes()) == payload
+
+
 def test_failed_shard_is_retained_and_digest_tampering_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -450,6 +501,101 @@ def test_failed_shard_is_retained_and_digest_tampering_is_rejected(
     tampered["failure"]["message"] = "forged"
     with pytest.raises(ValueError, match="content digest mismatch"):
         scorecard.validate_scorecard_run_record(tampered)
+
+
+def test_init_failure_after_setup_is_retained_with_setup_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = {"schema": "test.identity.v1", "value": "fixed"}
+    monkeypatch.setattr(scorecard, "_checkpoint_source_identity", lambda: identity)
+    monkeypatch.setattr(scorecard, "_checkpoint_runtime_identity", lambda: identity)
+    monkeypatch.setattr(scorecard, "_checkpoint_dependency_identity", lambda: identity)
+    monkeypatch.setattr(
+        scorecard,
+        "_agent_resource_payload",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("intentional resource-accounting failure")
+        ),
+    )
+
+    plan = build_development_plan()
+    record = scorecard.run_scorecard_shard(plan, scorecard.iter_run_specs(plan)[0])
+
+    assert record["failure"]["stage"] == "init"
+    assert record["telemetry"]["setup_seconds"] is not None
+    assert record["telemetry"]["cold_step_seconds"] is None
+    assert scorecard.validate_scorecard_run_record(record, plan=plan)["valid"] is True
+
+
+def test_failed_step_telemetry_is_bound_to_accepted_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = {"schema": "test.identity.v1", "value": "fixed"}
+    monkeypatch.setattr(scorecard, "_checkpoint_source_identity", lambda: identity)
+    monkeypatch.setattr(scorecard, "_checkpoint_runtime_identity", lambda: identity)
+    monkeypatch.setattr(scorecard, "_checkpoint_dependency_identity", lambda: identity)
+    original_build = scorecard.build_scorecard_runner
+
+    class FailOnFourthStep:
+        def __init__(self, runner: Any) -> None:
+            self._runner = runner
+            self.agent_adapter = runner.agent_adapter
+            self.environment_adapter = runner.environment_adapter
+            self.config = runner.config
+            self.calls = 0
+
+        def init(self) -> Any:
+            return self._runner.init()
+
+        def step(self, state: Any) -> Any:
+            self.calls += 1
+            if self.calls == 4:
+                raise RuntimeError("intentional fourth-step failure")
+            return self._runner.step(state)
+
+    monkeypatch.setattr(
+        scorecard,
+        "build_scorecard_runner",
+        lambda plan, spec: FailOnFourthStep(original_build(plan, spec)),
+    )
+    plan = build_development_plan()
+    spec = next(
+        item
+        for item in scorecard.iter_run_specs(plan)
+        if item.environment_kind == "switching_two_state" and item.arm == "random"
+    )
+    record = scorecard.run_scorecard_shard(plan, spec)
+
+    assert record["failure"]["stage"] == "step"
+    assert record["failure"]["accepted_events"] == 3
+    assert record["telemetry"]["warmed_step_count"] == 2
+    assert scorecard.validate_scorecard_run_record(record, plan=plan)["valid"] is True
+
+    timed_rejection = copy.deepcopy(record)
+    timed_rejection["telemetry"].update(
+        {
+            "warmed_step_seconds_total": 0.0,
+            "warmed_step_count": 3,
+            "warmed_step_seconds_mean": 0.0,
+        }
+    )
+    _redigest(timed_rejection)
+    assert (
+        scorecard.validate_scorecard_run_record(timed_rejection, plan=plan)["valid"]
+        is True
+    )
+
+    forged = copy.deepcopy(record)
+    forged["telemetry"].update(
+        {
+            "warmed_step_seconds_total": 0.0,
+            "warmed_step_count": 99,
+            "warmed_step_seconds_mean": 0.0,
+        }
+    )
+    _redigest(forged)
+    with pytest.raises(ValueError, match="timed step count"):
+        scorecard.validate_scorecard_run_record(forged, plan=plan)
 
 
 def _completed_outcome(
@@ -694,6 +840,159 @@ def test_completed_shard_rejects_impossible_reward_lattice_total() -> None:
         scorecard.validate_scorecard_run_record(record)
 
 
+def test_completed_riverswim_shard_rejects_right_rewards_without_high_end_visits() -> None:
+    plan = build_development_plan()
+    spec = next(
+        item
+        for item in scorecard.iter_run_specs(plan)
+        if item.environment_kind == "riverswim"
+        and item.arm == "random"
+        and item.seed == SEED_ROSTER[0]
+    )
+    record = _completed_record(plan, spec)
+    outcome = record["outcome"]
+    horizon = outcome["accepted_events"]
+    outcome["reward_sum"] = float(horizon)
+    outcome["mean_reward"] = 1.0
+    outcome["phase_reward_sums"] = [float(horizon), 0.0]
+    outcome["regret_sum"] = outcome["oracle_reward_sum"] - float(horizon)
+    outcome["high_end_visit_count"] = 0
+    outcome["high_end_visit_rate"] = 0.0
+    _redigest(record)
+
+    with pytest.raises(ValueError, match="right-end rewards exceed high-end visits"):
+        scorecard.validate_scorecard_run_record(record)
+
+
+def test_partial_riverswim_shard_rejects_right_reward_before_reaching_high_end() -> None:
+    plan = build_development_plan()
+    spec = next(
+        item
+        for item in scorecard.iter_run_specs(plan)
+        if item.environment_kind == "riverswim"
+        and item.arm == "random"
+        and item.seed == SEED_ROSTER[0]
+    )
+    record = _completed_record(plan, spec)
+    horizon = plan.protocol("riverswim")["horizon"]
+    oracle_reward = record["outcome"]["oracle_reward_sum"] / horizon
+    record.update(
+        {
+            "status": "failed",
+            "failure": {
+                "stage": "step",
+                "type": "RuntimeError",
+                "message": "synthetic post-step failure",
+                "accepted_events": 1,
+            },
+            "outcome": None,
+            "partial_outcome": {
+                "summary_mode": "streaming_o1_no_retained_events",
+                "configured_horizon": horizon,
+                "accepted_events": 1,
+                "reward_sum": 1.0,
+                "mean_reward": 1.0,
+                "oracle_reward_sum": oracle_reward,
+                "regret_sum": oracle_reward - 1.0,
+                "parameter_change_events": 0,
+                "phase_event_counts": [1, 0],
+                "phase_reward_sums": [1.0, 0.0],
+                "windows": {
+                    "early": {
+                        "event_count": 1,
+                        "reward_sum": 1.0,
+                        "mean_reward": 1.0,
+                        "mean_oracle_regret": oracle_reward - 1.0,
+                    },
+                    "late": None,
+                },
+                "high_end_visit_count": 0,
+                "high_end_visit_rate": 0.0,
+            },
+        }
+    )
+    record["telemetry"].update(
+        {
+            "warmed_step_seconds_total": 0.0,
+            "warmed_step_count": 0,
+            "warmed_step_seconds_mean": None,
+        }
+    )
+    _redigest(record)
+
+    with pytest.raises(ValueError, match="right-end rewards exceed high-end visits"):
+        scorecard.validate_scorecard_run_record(record)
+
+
+@pytest.mark.parametrize("environment", ENVIRONMENT_ROSTER)
+def test_failed_shard_rejects_window_reward_exceeding_partial_total(
+    environment: str,
+) -> None:
+    plan = build_development_plan()
+    spec = next(
+        item
+        for item in scorecard.iter_run_specs(plan)
+        if item.environment_kind == environment
+        and item.arm == "random"
+        and item.seed == SEED_ROSTER[0]
+    )
+    record = _completed_record(plan, spec)
+    horizon = plan.protocol(environment)["horizon"]
+    oracle_reward = record["outcome"]["oracle_reward_sum"] / horizon
+    window = {
+        "event_count": 1,
+        "reward_sum": 1.0,
+        "mean_reward": 1.0,
+        "mean_oracle_regret": oracle_reward - 1.0,
+    }
+    if environment == "switching_two_state":
+        windows = {"initial_a": window, "first_b": None, "return_a": None}
+        high_end_visit_count = None
+        high_end_visit_rate = None
+    else:
+        windows = {"early": window, "late": None}
+        high_end_visit_count = 0
+        high_end_visit_rate = 0.0
+    record.update(
+        {
+            "status": "failed",
+            "failure": {
+                "stage": "step",
+                "type": "RuntimeError",
+                "message": "synthetic post-step failure",
+                "accepted_events": 1,
+            },
+            "outcome": None,
+            "partial_outcome": {
+                "summary_mode": "streaming_o1_no_retained_events",
+                "configured_horizon": horizon,
+                "accepted_events": 1,
+                "reward_sum": 0.0,
+                "mean_reward": 0.0,
+                "oracle_reward_sum": oracle_reward,
+                "regret_sum": oracle_reward,
+                "parameter_change_events": 0,
+                "phase_event_counts": [1, 0],
+                "phase_reward_sums": [0.0, 0.0],
+                "windows": windows,
+                "high_end_visit_count": high_end_visit_count,
+                "high_end_visit_rate": high_end_visit_rate,
+            },
+        }
+    )
+    record["telemetry"].update(
+        {
+            "warmed_step_seconds_total": 0.0,
+            "warmed_step_count": 0,
+            "warmed_step_seconds_mean": None,
+        }
+    )
+    _redigest(record)
+
+    with pytest.raises(ValueError, match="windows exceed"):
+        scorecard.validate_scorecard_run_record(record)
+
+
 def test_completed_shard_rejects_self_asserted_zero_resource_payload() -> None:
     plan = build_development_plan()
     spec = scorecard.iter_run_specs(plan)[0]
@@ -890,6 +1189,138 @@ def test_aggregate_rejects_hard_links_using_opened_file_identity(
         scorecard.summarize_shard_files(paths)
 
 
+def _aggregate_shard_paths(tmp_path: Path, count: int) -> list[Path]:
+    paths = []
+    for index in range(count):
+        path = tmp_path / f"shard-{index:03d}.json"
+        path.write_text(json.dumps({"schedule_index": index}), encoding="utf-8")
+        paths.append(path)
+    return paths
+
+
+@pytest.mark.parametrize("marked_index", [5, {3, 7}])
+def test_aggregate_reports_every_failed_record_in_one_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marked_index: int | set[int],
+) -> None:
+    """The aggregate names every failed record instead of stopping at the first.
+
+    The 2026-09-15 aggregate run (34950746882) died on the first of 26
+    mismatching RiverSwim records, so the surviving failures had to be found
+    by re-downloading all 144 public artifacts and diffing them by hand.
+    Reporting every failure at once turns that forensic pass into one log
+    scan. Rejection semantics are unchanged: the aggregate still refuses to
+    build.
+    """
+    marked = {marked_index} if type(marked_index) is int else marked_index
+    paths = _aggregate_shard_paths(tmp_path, 144)
+
+    def selective_validator(payload: Any, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        if payload["schedule_index"] in marked:
+            raise ValueError("simulated $.resolved drift")
+        return {"valid": True}
+
+    monkeypatch.setattr(scorecard, "validate_scorecard_run_record", selective_validator)
+
+    with pytest.raises(ValueError) as raised:
+        scorecard.summarize_shard_files(paths)
+    message = str(raised.value)
+    assert f"{len(marked)} of 144 shard records failed validation" in message
+    for index in sorted(marked):
+        assert f"shard-{index:03d}.json" in message
+    assert message.count("simulated $.resolved drift") == len(marked)
+
+
+def test_resolved_mismatch_error_names_the_diverging_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical resolved-components mismatch names its diverging fields.
+
+    The production failure behind this diagnostic was one float64 ulp of
+    LAPACK kernel noise in ``oracle_average_reward``, visible only after the
+    recorded and canonical manifests were structurally diffed by hand. The
+    error must carry that diff itself: the exact JSON path plus both bit
+    patterns, and the digest identities the ulp flipped.
+    """
+    plan = build_development_plan()
+    spec = next(
+        candidate
+        for candidate in scorecard.iter_run_specs(plan)
+        if candidate.environment_kind == "riverswim" and candidate.arm == "prototype"
+    )
+    runner = scorecard.build_scorecard_runner(plan, spec)
+    record = _completed_record(plan, spec, runner=runner)
+    descriptor = runner.environment_adapter.manifest.descriptor()
+    config = descriptor["config"]
+    recorded_gain = config["oracle_average_reward"]
+    drifted_gain = math.nextafter(recorded_gain, math.inf)
+    assert drifted_gain != recorded_gain
+    drifted_manifest = scorecard.ReferenceEnvironmentManifest.from_config(
+        implementation_id=descriptor["implementation_id"],
+        state_schema=descriptor["state_schema"],
+        config={**config, "oracle_average_reward": drifted_gain},
+        observation_spec=scorecard._space_from_descriptor(
+            descriptor["observation_spec"], path="drift.observation_spec"
+        ),
+        action_spec=scorecard._space_from_descriptor(
+            descriptor["action_spec"], path="drift.action_spec"
+        ),
+        max_executions=descriptor["max_executions"],
+    )
+
+    class _DriftedEnvironmentAdapter:
+        manifest = drifted_manifest
+
+    class _DriftedRunner:
+        agent_adapter = runner.agent_adapter
+        environment_adapter = _DriftedEnvironmentAdapter()
+        config = runner.config
+
+    monkeypatch.setattr(
+        scorecard, "build_scorecard_runner", lambda *args, **kwargs: _DriftedRunner()
+    )
+
+    with pytest.raises(ValueError) as raised:
+        scorecard.validate_scorecard_run_record(record, plan=plan)
+    message = str(raised.value)
+    assert "does not match the canonical resolved components" in message
+    assert "$.resolved.environment_manifest.config.oracle_average_reward" in message
+    assert repr(recorded_gain) in message
+    assert repr(drifted_gain) in message
+    assert "$.resolved.environment_manifest.config_sha256" in message
+    assert "$.resolved.environment_manifest.manifest_id" in message
+    assert scorecard._json_exact_equal(
+        record["resolved"]["life_config"],
+        scorecard._resolved_components(plan, spec, runner)["life_config"],
+    )
+
+
+def test_resolved_mismatch_report_is_bounded() -> None:
+    recorded = {f"field_{index}": index for index in range(10)}
+    canonical = {f"field_{index}": index + 1 for index in range(10)}
+    report = scorecard._resolved_mismatch_report(
+        recorded, canonical, path="$.resolved"
+    )
+    assert len(report) == scorecard._MAX_REPORTED_RESOLVED_MISMATCHES + 1
+    assert report[-1] == scorecard._MISMATCH_TRUNCATION_NOTICE
+    assert sum("field_" in entry for entry in report) == (
+        scorecard._MAX_REPORTED_RESOLVED_MISMATCHES
+    )
+    exact = scorecard._resolved_mismatch_report(
+        {"a": 1.0}, {"a": 1.0}, path="$.resolved"
+    )
+    assert exact == []
+    # The float branch compares bit patterns, mirroring _json_exact_equal:
+    # a plain ``!=`` mutant silently accepts 0.0 versus -0.0.
+    negative_zero = scorecard._resolved_mismatch_report(
+        {"a": 0.0}, {"a": -0.0}, path="$.resolved"
+    )
+    assert len(negative_zero) == 1
+    assert "$.resolved.a" in negative_zero[0]
+
+
 @pytest.fixture(scope="module")
 def completed_artifact() -> dict[str, Any]:
     plan = build_development_plan()
@@ -941,15 +1372,29 @@ def test_failed_record_requires_exact_partial_schema_and_stage(
     )
     plan = build_development_plan()
     record = scorecard.run_scorecard_shard(plan, scorecard.iter_run_specs(plan)[0])
-    for mutation in ("extra_partial", "unknown_stage", "build_count"):
+    for mutation in (
+        "extra_partial",
+        "unknown_stage",
+        "build_count",
+        "prestep_telemetry",
+    ):
         altered = copy.deepcopy(record)
         if mutation == "extra_partial":
             altered["partial_outcome"]["extra"] = 1
         elif mutation == "unknown_stage":
             altered["failure"]["stage"] = "unknown"
-        else:
+        elif mutation == "build_count":
             altered["failure"]["accepted_events"] = 1
             altered["partial_outcome"]["accepted_events"] = 1
+        else:
+            altered["telemetry"].update(
+                {
+                    "setup_seconds": 0.0,
+                    "cold_step_seconds": 0.0,
+                    "warmed_step_count": 7,
+                    "warmed_step_seconds_mean": 0.0,
+                }
+            )
         _redigest(altered)
         with pytest.raises(ValueError):
             scorecard.validate_scorecard_run_record(altered, plan=plan)

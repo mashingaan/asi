@@ -60,21 +60,7 @@ _FEATURE_DISCOVERY_LOOP_MAX_STEPS = 10_000
 _FEATURE_DISCOVERY_LOOP_BUDGET = ScanBudget(
     "feature-discovery learning-loop", _FEATURE_DISCOVERY_LOOP_MAX_STEPS
 )
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.longlong,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 def _require_int32(name: str, value: object, *, minimum: int) -> int:
@@ -1036,8 +1022,16 @@ class FixedBudgetFeatureLearner:
         finite: Array,
     ) -> Array:
         """Exponentiated-gradient preference update for utility scores."""
-        finite_mass = jnp.maximum(jnp.sum(jnp.where(finite, allocation, 0.0)), 1e-12)
-        masked_allocation = jnp.where(finite, allocation / finite_mass, 0.0)
+        masked = jnp.where(finite, allocation, 0.0)
+        max_val = jnp.max(masked)
+        _, exp_val = jnp.frexp(max_val)
+        scaled = jnp.ldexp(masked, -exp_val)
+        scaled_sum = jnp.sum(scaled)
+        positive = (max_val > 0.0) & (scaled_sum > 0.0) & jnp.isfinite(scaled_sum)
+        normalized = scaled / jnp.where(positive, scaled_sum, 1.0)
+        valid_count = jnp.maximum(jnp.sum(finite.astype(jnp.float32)), 1.0)
+        uniform = jnp.where(finite, 1.0 / valid_count, 0.0)
+        masked_allocation = jnp.where(positive, normalized, uniform)
         baseline = jnp.sum(masked_allocation * jnp.where(finite, scores, 0.0))
         advantages = jnp.where(finite, scores - baseline, 0.0)
         advantages = jnp.clip(
@@ -1099,7 +1093,12 @@ class FixedBudgetFeatureLearner:
         random_w = self._init_scale * noise / dim_scale
         random_b = jnp.array(0.0, dtype=jnp.float32)
 
-        parent_logits = jnp.log(utilities + 1e-3)
+        # Utilities are a non-negative EMA on the public path, but a restored
+        # or hand-built state can carry negative values; log() of those is
+        # NaN and categorical sampling over NaN logits silently collapses
+        # to slot 0 for every key. Clamp first, matching the compositional
+        # learner's log(maximum(utility_scores, 1e-6)) parent logits.
+        parent_logits = jnp.log(jnp.maximum(utilities, 0.0) + 1e-3)
         parent_idx = jr.categorical(key_parent, parent_logits).astype(jnp.int32)
         parent_w = active_weights[parent_idx]
         parent_b = active_biases[parent_idx]
@@ -1107,7 +1106,16 @@ class FixedBudgetFeatureLearner:
         mutate_b = parent_b
 
         obs_norm = jnp.linalg.norm(observation) + 1e-6
-        imprint_w = observation / obs_norm + self._mutation_scale * noise / dim_scale
+        _, observation_exponent = jnp.frexp(jnp.max(jnp.abs(observation)))
+        scaled_observation = jnp.ldexp(observation, -observation_exponent)
+        scaled_norm = jnp.linalg.norm(scaled_observation)
+        stable_imprint = scaled_observation / jnp.where(scaled_norm > 0.0, scaled_norm, 1.0)
+        normalized_observation = jnp.where(
+            jnp.isfinite(obs_norm),
+            observation / obs_norm,
+            stable_imprint,
+        )
+        imprint_w = normalized_observation + self._mutation_scale * noise / dim_scale
         imprint_b = -0.5 * jnp.dot(imprint_w, observation)
 
         def random_branch() -> tuple[Array, Array, Array, Array, Array]:
@@ -1793,6 +1801,12 @@ class FixedBudgetFeatureLearner:
             )
 
             if self._candidate_count > 0:
+                # Measure pressure on the curated bank: a promotion has just
+                # refilled the pre-curation worst slot with an age-0 feature.
+                eligible_active_for_pressure = ages >= self._min_feature_age
+                worst_active_for_pressure = jnp.argmin(
+                    jnp.where(eligible_active_for_pressure, ranking_utilities, jnp.inf)
+                ).astype(jnp.int32)
                 eligible_candidates_for_pressure = candidate_ages >= self._candidate_min_age
                 candidate_pressure_scores = jnp.where(
                     eligible_candidates_for_pressure,
@@ -1803,13 +1817,13 @@ class FixedBudgetFeatureLearner:
                     jnp.int32
                 )
                 has_candidate_for_pressure = jnp.any(eligible_candidates_for_pressure)
-                worst_active_utility = ranking_utilities[worst_active]
+                worst_active_utility = ranking_utilities[worst_active_for_pressure]
                 best_candidate_utility = ranking_candidate_utilities[best_candidate_for_pressure]
                 pressure_raw = (
                     best_candidate_utility - promotion_margin * worst_active_utility
                 ) / (jnp.abs(worst_active_utility) + 1e-6)
                 pressure = jnp.where(
-                    has_active_slot & has_candidate_for_pressure,
+                    jnp.any(eligible_active_for_pressure) & has_candidate_for_pressure,
                     jnp.tanh(pressure_raw),
                     jnp.array(0.0, dtype=jnp.float32),
                 )
@@ -1908,7 +1922,11 @@ class FixedBudgetFeatureLearner:
             uptime_s=state.uptime_s,
         )
 
-        loss = jnp.sum(errors**2) / active_count
+        squared_errors = errors**2
+        loss = jnp.sum(squared_errors) / active_count
+        # Recover reduction overflow only when each squared error is finite.
+        recover = jnp.isinf(loss) & jnp.all(jnp.isfinite(squared_errors))
+        loss = jnp.where(recover, jnp.sum(squared_errors / active_count), loss)
         mean_abs_error = jnp.sum(jnp.abs(errors)) / active_count
         max_candidate_utility = (
             jnp.max(ranking_candidate_utilities)
@@ -1973,8 +1991,16 @@ def run_feature_discovery_arrays(
 
     t0 = time.time()
     final_state, (metrics, updates_applied) = jax.lax.scan(step_fn, state, (observations, targets))
+    if not isinstance(metrics, jax.core.Tracer):
+        metrics.block_until_ready()
     elapsed = time.time() - t0
-    final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
+    # The scan carries host clocks through the traced update and narrows them
+    # to float32. Restore the incoming Python values and add this scan's time
+    # to the host uptime base.
+    final_state = final_state.replace(  # type: ignore[attr-defined]
+        birth_timestamp=state.birth_timestamp,
+        uptime_s=state.uptime_s + elapsed,
+    )
     return FeatureDiscoveryLearningResult(
         state=final_state,
         metrics=metrics,
@@ -2012,8 +2038,15 @@ def run_feature_discovery_loop(
     (final_state, _), (metrics, updates_applied) = jax.lax.scan(
         step_fn, (learner_state, stream_state), jnp.arange(num_steps)
     )
+    if not isinstance(metrics, jax.core.Tracer):
+        metrics.block_until_ready()
     elapsed = time.time() - t0
-    final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]
+    # Restore the incoming host clocks narrowed by the scan, as in
+    # run_feature_discovery_arrays.
+    final_state = final_state.replace(  # type: ignore[attr-defined]
+        birth_timestamp=learner_state.birth_timestamp,
+        uptime_s=learner_state.uptime_s + elapsed,
+    )
     return FeatureDiscoveryLearningResult(
         state=final_state,
         metrics=metrics,

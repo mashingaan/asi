@@ -5,6 +5,7 @@ and markdown, suitable for academic publications.
 """
 
 import csv
+import hashlib
 import io
 import json
 import math
@@ -18,8 +19,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from alberta_framework._seed_validation import require_unique_jax_seeds
-from alberta_framework.utils.experiments import AggregatedResults, MetricSummary
-from alberta_framework.utils.statistics import SignificanceResult
+from alberta_framework.utils.experiments import (
+    AggregatedResults,
+    MetricSummary,
+    _scaled_mean,
+    _scaled_std,
+)
+from alberta_framework.utils.statistics import SignificanceResult, common_final_window
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -29,25 +35,25 @@ _INT32_MAX = 2**31 - 1
 _MAX_EXPORT_STRING_BYTES = 256
 _MAX_EXPORT_FILENAME_BYTES = 200
 _PATH_TYPES = frozenset({Path, type(Path())})
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 _ACTUAL_FLOAT_TYPES = frozenset(
     {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
 )
 _ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+_LATEX_METHOD_NAME_ESCAPES = str.maketrans(
+    {
+        "\\": r"\textbackslash{}",
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+    }
+)
 
 
 def _require_path(value: object, *, name: str = "path") -> Path:
@@ -245,6 +251,20 @@ def _preflight_export_results(
                     f"{qualified_name} seed counts disagree: seeds={seed_count}, "
                     f"n_seeds={summary.n_seeds}, values={value_count}"
                 )
+            metric_values = aggregate.metric_arrays[metric_name]
+            final_window = min(100, metric_values.shape[1])
+            final_steps = metric_values[:, -final_window:]
+            # aggregate_metrics reduces with _scaled_mean, which can differ from
+            # np.mean in the last bit; both are exact reductions of this trace.
+            with np.errstate(over="ignore", invalid="ignore"):
+                plain_values = np.mean(final_steps, axis=1)
+            if not (
+                np.array_equal(summary.values, plain_values)
+                or np.array_equal(summary.values, _scaled_mean(final_steps, axis=1))
+            ):
+                raise ValueError(
+                    f"{qualified_name} values do not match the raw metric trace"
+                )
             for statistic in (summary.mean, summary.std, summary.min, summary.max):
                 _exported_number(statistic)
             with np.errstate(over="ignore", invalid="ignore"):
@@ -254,13 +274,34 @@ def _preflight_export_results(
                     float(np.min(summary.values)),
                     float(np.max(summary.values)),
                 )
+            # aggregate_metrics reduces with _scaled_mean/_scaled_std, which also
+            # recovers reductions whose intermediate sum/squares leave float64.
+            scaled_statistics = (
+                float(_scaled_mean(summary.values, axis=0)),
+                float(_scaled_std(summary.values, axis=0)) if seed_count > 1 else 0.0,
+                expected_statistics[2],
+                expected_statistics[3],
+            )
             actual_statistics = tuple(
                 float(_exported_number(value))
                 for value in (summary.mean, summary.std, summary.min, summary.max)
             )
-            if actual_statistics != expected_statistics:
+            if actual_statistics not in (expected_statistics, scaled_statistics):
                 raise ValueError(f"{qualified_name} statistics do not match values")
             export_cells = _checked_export_cells(export_cells, int(summary.values.size))
+
+    if metric is not None:
+        # A metric-ranked export compares the configs' final-value summaries,
+        # each averaged over min(100, n_steps) steps by aggregate_metrics; the
+        # comparison is only meaningful when that window agrees across configs.
+        common_final_window(
+            {
+                name: int(aggregate.metric_arrays[metric].shape[1])
+                for name, aggregate in results.items()
+            },
+            100,
+            metric,
+        )
 
 
 def _write_text_atomically(filepath: Path, payload: str) -> None:
@@ -444,13 +485,30 @@ def _finite_table_summaries(
     return summaries
 
 
+def _escape_latex_method_name(name: str) -> str:
+    """Render method names in one row without re-escaping inserted LaTeX commands."""
+    normalized = name.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    return normalized.translate(_LATEX_METHOD_NAME_ESCAPES)
+
+
+def _escape_markdown_method_name(name: str) -> str:
+    """Keep method names in one table cell, preserving backslashes and line breaks."""
+    return (
+        name.replace("\\", "\\\\")
+        .replace("|", r"\|")
+        .replace("\r\n", "<br>")
+        .replace("\r", "<br>")
+        .replace("\n", "<br>")
+    )
+
+
 def generate_latex_table(
     results: dict[str, "AggregatedResults"],
     significance_results: dict[tuple[str, str], "SignificanceResult"] | None = None,
     metric: str = "squared_error",
     caption: str = "Experimental Results",
     label: str = "tab:results",
-    metric_label: str = "Error",
+    metric_label: str | None = None,
     lower_is_better: bool = True,
 ) -> str:
     """Generate a LaTeX table of results.
@@ -461,7 +519,7 @@ def generate_latex_table(
         metric: Metric to display
         caption: Table caption
         label: LaTeX label for the table
-        metric_label: Human-readable name for the metric
+        metric_label: Explicit display label, or the selected metric name by default
         lower_is_better: Whether lower metric values are better
 
     Returns:
@@ -470,10 +528,28 @@ def generate_latex_table(
     _require_exact_str("metric", metric)
     _require_exact_str("caption", caption)
     _require_exact_str("label", label)
-    _require_exact_str("metric_label", metric_label)
+    if metric_label is not None:
+        _require_exact_str("metric_label", metric_label)
     lower_is_better = _require_exact_bool("lower_is_better", lower_is_better)
     if significance_results is not None:
         _preflight_significance_results(significance_results)
+    return _render_latex_table(
+        results, significance_results, metric, caption, label, metric_label, lower_is_better
+    )
+
+
+def _render_latex_table(
+    results: dict[str, "AggregatedResults"],
+    significance_results: dict[tuple[str, str], "SignificanceResult"] | None,
+    metric: str,
+    caption: str,
+    label: str,
+    metric_label: str | None,
+    lower_is_better: bool,
+) -> str:
+    """Render validated metadata, including escaped text derived by the report wrapper."""
+    if metric_label is None:
+        metric_label = "Error" if metric == "squared_error" else _escape_latex_method_name(metric)
     lines = []
     lines.append(r"\begin{table}[ht]")
     lines.append(r"\centering")
@@ -507,8 +583,7 @@ def generate_latex_table(
             sig_marker = _get_significance_marker(name, best_name, significance_results)
             value_str += sig_marker
 
-        # Escape underscores in method name
-        escaped_name = name.replace("_", r"\_")
+        escaped_name = _escape_latex_method_name(name)
         lines.append(rf"{escaped_name} & {value_str} & {summary.n_seeds} \\")
 
     lines.append(r"\bottomrule")
@@ -516,11 +591,82 @@ def generate_latex_table(
 
     if significance_results:
         lines.append(r"\vspace{0.5em}")
-        lines.append(r"\footnotesize{$^*$ $p < 0.05$, $^{**}$ $p < 0.01$, $^{***}$ $p < 0.001$}")
+        lines.append(_significance_legend_latex(significance_results))
 
     lines.append(r"\end{table}")
 
     return "\n".join(lines)
+
+
+_LEGACY_MD_LEGEND = "\\* p < 0.05, \\*\\* p < 0.01, \\*\\*\\* p < 0.001"
+_LEGACY_LATEX_LEGEND = (
+    r"\footnotesize{$^*$ $p < 0.05$, $^{**}$ $p < 0.01$, $^{***}$ $p < 0.001$}"
+)
+_LATEX_STARS = ("", r"$^{*}$", r"$^{**}$", r"$^{***}$")
+
+
+def _all_default_alpha(
+    significance_results: dict[tuple[str, str], "SignificanceResult"],
+) -> bool:
+    """True when every stored decision threshold is the historical 0.05."""
+    return all(result.alpha == 0.05 for result in significance_results.values())
+
+
+def _significance_star_count(p_value: float, alpha: float) -> int:
+    """Star tier for one significant result, keyed to its own threshold.
+
+    The historical 0.05 threshold retains its raw-p tiers independently of
+    other comparisons. Other thresholds scale by orders of magnitude.
+    """
+    if alpha == 0.05:
+        if p_value < 0.001:
+            return 3
+        if p_value < 0.01:
+            return 2
+        return 1
+    if p_value < alpha / 100.0:
+        return 3
+    if p_value < alpha / 10.0:
+        return 2
+    return 1
+
+
+def _distinct_alphas(
+    significance_results: dict[tuple[str, str], "SignificanceResult"],
+) -> list[float]:
+    return sorted({result.alpha for result in significance_results.values()})
+
+
+def _significance_legend_markdown(
+    significance_results: dict[tuple[str, str], "SignificanceResult"],
+) -> str:
+    """Legend stating each tier's actual boundary for the alphas present."""
+    if _all_default_alpha(significance_results):
+        return _LEGACY_MD_LEGEND
+    segments = []
+    for alpha in _distinct_alphas(significance_results):
+        tier2, tier3 = (0.01, 0.001) if alpha == 0.05 else (alpha / 10.0, alpha / 100.0)
+        segments.append(
+            f"alpha = {alpha:g}: \\* p < {alpha:g}, \\*\\* p < {tier2:g}, "
+            f"\\*\\*\\* p < {tier3:g}"
+        )
+    return "; ".join(segments)
+
+
+def _significance_legend_latex(
+    significance_results: dict[tuple[str, str], "SignificanceResult"],
+) -> str:
+    """LaTeX legend stating each tier's actual boundary for the alphas present."""
+    if _all_default_alpha(significance_results):
+        return _LEGACY_LATEX_LEGEND
+    segments = []
+    for alpha in _distinct_alphas(significance_results):
+        tier2, tier3 = (0.01, 0.001) if alpha == 0.05 else (alpha / 10.0, alpha / 100.0)
+        segments.append(
+            f"alpha = {alpha:g}: $^*$ $p < {alpha:g}$, $^{{**}}$ $p < {tier2:g}$, "
+            f"$^{{***}}$ $p < {tier3:g}$"
+        )
+    return r"\footnotesize{" + "; ".join(segments) + "}"
 
 
 def _get_significance_marker(
@@ -546,21 +692,18 @@ def _get_significance_marker(
     if not result.significant:
         return ""
 
-    p = result.p_value
-    if p < 0.001:
-        return r"$^{***}$"
-    elif p < 0.01:
-        return r"$^{**}$"
-    elif p < 0.05:
-        return r"$^{*}$"
-    return ""
+    stars = _significance_star_count(
+        result.p_value,
+        result.alpha,
+    )
+    return _LATEX_STARS[stars]
 
 
 def generate_markdown_table(
     results: dict[str, "AggregatedResults"],
     significance_results: dict[tuple[str, str], "SignificanceResult"] | None = None,
     metric: str = "squared_error",
-    metric_label: str = "Error",
+    metric_label: str | None = None,
     lower_is_better: bool = True,
 ) -> str:
     """Generate a markdown table of results.
@@ -569,14 +712,19 @@ def generate_markdown_table(
         results: Dictionary mapping config name to AggregatedResults
         significance_results: Optional pairwise significance test results
         metric: Metric to display
-        metric_label: Human-readable name for the metric
+        metric_label: Explicit display label, or the selected metric name by default
         lower_is_better: Whether lower metric values are better
 
     Returns:
         Markdown table as a string
     """
     _require_exact_str("metric", metric)
-    _require_exact_str("metric_label", metric_label)
+    if metric_label is None:
+        metric_label = (
+            "Error" if metric == "squared_error" else _escape_markdown_method_name(metric)
+        )
+    else:
+        _require_exact_str("metric_label", metric_label)
     lower_is_better = _require_exact_bool("lower_is_better", lower_is_better)
     if significance_results is not None:
         _preflight_significance_results(significance_results)
@@ -607,11 +755,12 @@ def generate_markdown_table(
             sig_marker = _get_md_significance_marker(name, best_name, significance_results)
             value_str += sig_marker
 
-        lines.append(f"| {name} | {value_str} | {summary.n_seeds} |")
+        escaped_name = _escape_markdown_method_name(name)
+        lines.append(f"| {escaped_name} | {value_str} | {summary.n_seeds} |")
 
     if significance_results:
         lines.append("")
-        lines.append("\\* p < 0.05, \\*\\* p < 0.01, \\*\\*\\* p < 0.001")
+        lines.append(_significance_legend_markdown(significance_results))
 
     return "\n".join(lines)
 
@@ -638,14 +787,11 @@ def _get_md_significance_marker(
     if not result.significant:
         return ""
 
-    p = result.p_value
-    if p < 0.001:
-        return " ***"
-    elif p < 0.01:
-        return " **"
-    elif p < 0.05:
-        return " *"
-    return ""
+    stars = _significance_star_count(
+        result.p_value,
+        result.alpha,
+    )
+    return " " + "*" * stars
 
 
 def generate_significance_table(
@@ -685,8 +831,8 @@ def _generate_significance_latex(
 
     for (name_a, name_b), result in significance_results.items():
         sig_str = "Yes" if result.significant else "No"
-        escaped_a = name_a.replace("_", r"\_")
-        escaped_b = name_b.replace("_", r"\_")
+        escaped_a = _escape_latex_method_name(name_a)
+        escaped_b = _escape_latex_method_name(name_b)
         lines.append(
             rf"{escaped_a} & {escaped_b} & {result.statistic:.3f} & "
             rf"{result.p_value:.4f} & {result.effect_size:.3f} & {sig_str} \\"
@@ -709,8 +855,10 @@ def _generate_significance_markdown(
 
     for (name_a, name_b), result in significance_results.items():
         sig_str = "Yes" if result.significant else "No"
+        escaped_a = _escape_markdown_method_name(name_a)
+        escaped_b = _escape_markdown_method_name(name_b)
         lines.append(
-            f"| {name_a} | {name_b} | {result.statistic:.3f} | "
+            f"| {escaped_a} | {escaped_b} | {result.statistic:.3f} | "
             f"{result.p_value:.4f} | {result.effect_size:.3f} | {sig_str} |"
         )
 
@@ -723,6 +871,7 @@ def save_experiment_report(
     experiment_name: str,
     significance_results: dict[tuple[str, str], "SignificanceResult"] | None = None,
     metric: str = "squared_error",
+    lower_is_better: bool = True,
 ) -> dict[str, Path]:
     """Save a complete experiment report with all artifacts.
 
@@ -732,6 +881,7 @@ def save_experiment_report(
         experiment_name: Name for the experiment (used in filenames)
         significance_results: Optional pairwise significance test results
         metric: Primary metric to report
+        lower_is_better: Whether lower primary metric values are better
 
     Returns:
         Dictionary mapping artifact type to file path
@@ -740,6 +890,7 @@ def save_experiment_report(
     output_dir = _require_path(output_dir, name="output_dir")
     experiment_name = _require_filename_component(experiment_name)
     _require_exact_str("metric", metric)
+    lower_is_better = _require_exact_bool("lower_is_better", lower_is_better)
     if significance_results is not None:
         _preflight_significance_results(significance_results)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -758,12 +909,17 @@ def save_experiment_report(
 
     # Generate LaTeX table
     latex_path = output_dir / f"{experiment_name}_table.tex"
-    latex_content = generate_latex_table(
+    label = f"tab:{experiment_name}"
+    if any(character in "\\%#$&{}~^" or character.isspace() for character in experiment_name):
+        label = "tab:experiment-" + hashlib.sha256(experiment_name.encode("utf-8")).hexdigest()
+    latex_content = _render_latex_table(
         results,
         significance_results=significance_results,
         metric=metric,
-        caption=f"{experiment_name} Results",
-        label=f"tab:{experiment_name}",
+        caption=f"{_escape_latex_method_name(experiment_name)} Results",
+        label=label,
+        metric_label=None,
+        lower_is_better=lower_is_better,
     )
     _write_text_atomically(latex_path, latex_content)
     artifacts["latex_table"] = latex_path
@@ -774,6 +930,7 @@ def save_experiment_report(
         results,
         significance_results=significance_results,
         metric=metric,
+        lower_is_better=lower_is_better,
     )
     _write_text_atomically(md_path, md_content)
     artifacts["markdown_table"] = md_path

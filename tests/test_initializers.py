@@ -1,8 +1,12 @@
 """Tests for sparse initialization."""
 
+from fractions import Fraction
+
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 import pytest
 
 from alberta_framework import sparse_init
@@ -57,6 +61,27 @@ class TestSparseInit:
 
         assert not jnp.allclose(w1, w2)
 
+    @pytest.mark.parametrize(
+        "key",
+        [
+            jr.key(0, impl="rbg"),
+            jr.split(jr.key(0), 2),
+        ],
+    )
+    def test_rejects_non_scalar_or_non_threefry_key(self, key):
+        """Initializer roots must bind ASI runs to the Threefry algorithm."""
+        with pytest.raises(ValueError, match="scalar threefry2x32 key"):
+            sparse_init(key, (2, 4), sparsity=0.5)
+
+    def test_canonicalizes_legacy_threefry_key(self):
+        """Legacy Threefry callers retain their typed-key initialization stream."""
+        typed = sparse_init(jr.key(0), (2, 4), sparsity=0.5)
+        legacy_key = jr.PRNGKey(0)
+        with jax.default_prng_impl("rbg"):
+            legacy = sparse_init(legacy_key, (2, 4), sparsity=0.5)
+
+        chex.assert_trees_all_equal(legacy, typed)
+
     def test_zero_sparsity(self):
         """With sparsity=0, all weights should be non-zero."""
         key = jr.key(42)
@@ -104,6 +129,24 @@ class TestSparseInit:
         chex.assert_shape(weights, (32, 16))
         assert jnp.all(weights == 0)
 
+    def test_default_sparsity_keeps_one_connection_when_rounding_hits_fan_in(self):
+        """Default sparsity=0.9 on fan_in=5 must not wipe every incoming weight.
+
+        ``int(0.9 * 5 + 0.5)`` is 5, and the ``num_zeros >= fan_in`` branch
+        used to return an all-zero matrix. The constructor accepts any
+        positive ``fan_in``; it does not require
+        ``round(sparsity * fan_in) < fan_in``. One live connection per row
+        remains when the requested sparsity is below 1.
+        """
+        weights = sparse_init(jr.key(0), (4, 5), sparsity=0.9)
+
+        assert not bool(jnp.all(weights == 0))
+        zeros_per_row = jnp.sum(weights == 0, axis=1)
+        chex.assert_trees_all_close(zeros_per_row, jnp.full((4,), 4))
+        assert float(jnp.mean(weights == 0)) == pytest.approx(0.8)
+        nonzero_per_row = jnp.sum(weights != 0, axis=1)
+        chex.assert_trees_all_close(nonzero_per_row, jnp.ones((4,), dtype=nonzero_per_row.dtype))
+
     @pytest.mark.parametrize(
         "invalid_shape",
         [
@@ -146,3 +189,10 @@ class TestSparseInit:
         key = jr.key(42)
         with pytest.raises(ValueError, match="sparsity"):
             sparse_init(key, (32, 16), sparsity=invalid_sparsity)
+
+
+@pytest.mark.parametrize("sparsity", [Fraction(2**30 + 1, 2**30), np.float64(1 + 2**-30)])
+def test_sparse_init_rejects_exact_sparsity_above_one(sparsity):
+    """Out-of-range host values must not round into the valid float32 interval."""
+    with pytest.raises(ValueError, match="sparsity"):
+        sparse_init(jr.key(0), (2, 3), sparsity=sparsity)

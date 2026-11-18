@@ -8,6 +8,8 @@ tiny synthetic smoke run. Benchmark executions never happen inside pytest.
 from __future__ import annotations
 
 import json
+import sys
+from io import BytesIO
 
 import jax.numpy as jnp
 import jax.random as jr
@@ -390,6 +392,174 @@ class TestEMNISTArrayCache:
 
         with pytest.raises(RuntimeError, match="does not match its pinned digests"):
             upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+    def test_cache_rejects_oversize_npy_header_before_materialize(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        x_path, y_path, meta_path = upgd_label_emnist._npy_cache_paths(tmp_path)
+        header = BytesIO()
+        np.lib.format.write_array_header_2_0(
+            header,
+            {
+                "descr": np.lib.format.dtype_to_descr(np.dtype(np.float32)),
+                "fortran_order": False,
+                "shape": (upgd_label_emnist.EMNIST_TRAIN_ROWS + 1, 784),
+            },
+        )
+        x_path.write_bytes(header.getvalue())
+        np.save(y_path, np.asarray([0], dtype=np.int32))
+        meta_path.write_text("{}", encoding="utf-8")
+
+        def forbidden_load(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("np.load must not run after an oversized npy header")
+
+        monkeypatch.setattr(np, "load", forbidden_load)
+        with pytest.raises(ValueError, match="cache array exceeds its element budget"):
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+    def test_cache_rejects_wrong_dtype_before_materialize(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        x = np.asarray([[0.0]], dtype=np.float64)
+        y = np.asarray([0], dtype=np.int32)
+        self._write_cache(tmp_path, x, y, json.dumps(self._metadata(x, y)))
+
+        def forbidden_load(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("np.load must not run after a wrong-dtype npy header")
+
+        monkeypatch.setattr(np, "load", forbidden_load)
+        with pytest.raises(ValueError, match="cache array has an invalid dtype"):
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+    def test_cache_rejects_wrong_byte_extent_before_materialize(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        x = np.asarray([[0.0]], dtype=np.float32)
+        y = np.asarray([0], dtype=np.int32)
+        self._write_cache(tmp_path, x, y, json.dumps(self._metadata(x, y)))
+        x_path, _y_path, _meta_path = upgd_label_emnist._npy_cache_paths(tmp_path)
+        with x_path.open("ab") as handle:
+            handle.write(b"trailing data")
+
+        def forbidden_load(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("np.load must not run after a wrong npy byte extent")
+
+        monkeypatch.setattr(np, "load", forbidden_load)
+        with pytest.raises(ValueError, match="cache array has an invalid byte extent"):
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+    def test_cache_loads_with_pickle_disabled(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        x = np.asarray([[0.0]], dtype=np.float32)
+        y = np.asarray([0], dtype=np.int32)
+        self._write_cache(tmp_path, x, y, json.dumps(self._metadata(x, y)))
+        original_load = np.load
+        pickle_values: list[object] = []
+
+        def tracked_load(*args: object, **kwargs: object) -> object:
+            pickle_values.append(kwargs.get("allow_pickle"))
+            return original_load(*args, **kwargs)
+
+        monkeypatch.setattr(np, "load", tracked_load)
+        upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+        assert pickle_values == [False, False]
+
+    @pytest.mark.parametrize(
+        ("version", "declared_length"),
+        [
+            ((1, 0), 10_001),
+            ((1, 0), 2**16 - 1),
+            ((2, 0), 10_001),
+            ((2, 0), 2**32 - 1),
+            ((3, 0), 10_001),
+            ((3, 0), 2**32 - 1),
+        ],
+    )
+    def test_cache_rejects_excessive_header_length_before_parser(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch, version, declared_length
+    ) -> None:
+        x_path, y_path, meta_path = upgd_label_emnist._npy_cache_paths(tmp_path)
+        length_bytes = 2 if version == (1, 0) else 4
+        x_path.write_bytes(
+            np.lib.format.magic(*version) + declared_length.to_bytes(length_bytes, "little")
+        )
+        np.save(y_path, np.asarray([0], dtype=np.int32))
+        meta_path.write_text("{}", encoding="utf-8")
+
+        def forbidden_parser(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("NumPy must not read an unbounded declared header")
+
+        monkeypatch.setattr(np.lib.format, "read_array_header_1_0", forbidden_parser)
+        monkeypatch.setattr(np.lib.format, "read_array_header_2_0", forbidden_parser)
+        with pytest.raises(ValueError, match="header exceeds its byte budget"):
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+    @pytest.mark.parametrize("version", [(1, 0), (2, 0), (3, 0)])
+    @pytest.mark.parametrize("truncated", ["length", "body"])
+    def test_cache_rejects_truncated_header_before_parser(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch, version, truncated
+    ) -> None:
+        x_path, y_path, meta_path = upgd_label_emnist._npy_cache_paths(tmp_path)
+        length_bytes = 2 if version == (1, 0) else 4
+        prefix = (100).to_bytes(length_bytes, "little")
+        payload = prefix[:-1] if truncated == "length" else prefix + b"short"
+        x_path.write_bytes(np.lib.format.magic(*version) + payload)
+        np.save(y_path, np.asarray([0], dtype=np.int32))
+        meta_path.write_text("{}", encoding="utf-8")
+
+        def forbidden_parser(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("NumPy must not parse a truncated header")
+
+        monkeypatch.setattr(np.lib.format, "read_array_header_1_0", forbidden_parser)
+        monkeypatch.setattr(np.lib.format, "read_array_header_2_0", forbidden_parser)
+        with pytest.raises(ValueError, match="npy header is invalid"):
+            upgd_label_emnist.load_emnist_balanced_train(tmp_path)
+
+    @pytest.mark.parametrize("version", [(1, 0), (2, 0), (3, 0)])
+    def test_cache_loads_supported_npy_versions(self, tmp_path, version) -> None:
+        x = np.asfortranarray([[0.0, 1.0], [-1.0, 0.5]], dtype=np.float32)
+        y = np.asarray([1, 0], dtype=np.int32)
+        x_path, y_path, meta_path = upgd_label_emnist._npy_cache_paths(tmp_path)
+        for path, array in ((x_path, x), (y_path, y)):
+            with path.open("wb") as handle:
+                np.lib.format.write_array(handle, array, version=version, allow_pickle=False)
+        metadata = self._metadata(x, y)
+        meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        loaded_x, loaded_y, loaded_metadata = upgd_label_emnist.load_emnist_balanced_train(
+            tmp_path
+        )
+        np.testing.assert_array_equal(loaded_x, x)
+        np.testing.assert_array_equal(loaded_y, y)
+        assert loaded_x.flags.f_contiguous
+        assert loaded_metadata == metadata
+
+    def test_cache_loads_header_at_byte_budget(self, tmp_path) -> None:
+        x = np.asarray([[0.5]], dtype=np.float32)
+        y = np.asarray([0], dtype=np.int32)
+        x_path, y_path, meta_path = upgd_label_emnist._npy_cache_paths(tmp_path)
+        for path, array in ((x_path, x), (y_path, y)):
+            header = repr(
+                {"descr": array.dtype.str, "fortran_order": False, "shape": array.shape}
+            ).encode("ascii")
+            header = header + b" " * (10_000 - len(header) - 1) + b"\n"
+            path.write_bytes(
+                np.lib.format.magic(2, 0)
+                + len(header).to_bytes(4, "little")
+                + header
+                + array.tobytes()
+            )
+        metadata = self._metadata(x, y)
+        meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        loaded_x, loaded_y, loaded_metadata = upgd_label_emnist.load_emnist_balanced_train(
+            tmp_path
+        )
+        np.testing.assert_array_equal(loaded_x, x)
+        np.testing.assert_array_equal(loaded_y, y)
+        assert loaded_metadata == metadata
 
 
 @pytest.mark.parametrize(
@@ -900,6 +1070,134 @@ class TestPlanShardFloatAliasIntake:
         atomic_write_new_json(path, payload)
         with pytest.raises(ValueError, match="differ from the plan"):
             merge_partials(plan, [path], allow_incomplete=True)
+
+
+@pytest.mark.unit
+class TestPlanBodyAndShardMetricStrictness:
+    """Malformed plans and shards must fail closed through ``ValueError``.
+
+    ``load_plan`` read the plan body by direct indexing and never compared its
+    key set to the schema ``build_plan_payload`` writes, so an artifact that
+    dropped ``learner_ids``/``hyperparameters``/``planned_shard_count`` raised
+    ``KeyError``, an artifact that dropped ``dataset``/``deviations``/``notes``
+    was silently accepted, and a mapping ``learner_ids`` or float
+    ``planned_shard_count`` passed every comparison.  The shard gate likewise
+    accepted a JSON string metric and non-scalar or boolean curve entries, and
+    a missing metric raised ``KeyError`` instead of ``ValueError``.
+    """
+
+    def _write_plan(self, tmp_path, mutate):
+        from alberta_framework.benchmarks.upgd_ipmnist import atomic_write_new_json
+
+        payload = build_plan_payload(TINY, [0, 1], DATASET_META)
+        mutate(payload["plan"])
+        payload["plan_sha256"] = upgd_label_emnist.canonical_json_sha256(payload["plan"])
+        path = tmp_path / "plan.json"
+        atomic_write_new_json(path, payload)
+        return path
+
+    def _merge_mutated_shard(self, tmp_path, name, mutate):
+        from alberta_framework.benchmarks.upgd_ipmnist import atomic_write_new_json
+
+        plan = build_plan_payload(TINY, [0, 1], DATASET_META)
+        x, y = _tiny_data()
+        result = run_label_emnist(x, y, "adamw", seeds=[0], config=TINY)
+        payload = partial_payload(result, plan["plan_sha256"])
+        mutate(payload)
+        path = tmp_path / f"{name}.json"
+        atomic_write_new_json(path, payload)
+        return merge_partials(plan, [path], allow_incomplete=True)
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "learner_ids",
+            "hyperparameters",
+            "planned_shard_count",
+            "dataset",
+            "deviations",
+            "notes",
+        ],
+    )
+    def test_load_plan_rejects_missing_body_fields(self, tmp_path, field: str) -> None:
+        path = self._write_plan(tmp_path, lambda body: body.pop(field))
+        with pytest.raises(ValueError, match="plan body fields"):
+            load_plan(path)
+
+    def test_load_plan_rejects_mapping_learner_ids(self, tmp_path) -> None:
+        def mutate(body):
+            body["learner_ids"] = {
+                name: index for index, name in enumerate(body["learner_ids"])
+            }
+
+        path = self._write_plan(tmp_path, mutate)
+        with pytest.raises(ValueError, match="learner_ids"):
+            load_plan(path)
+
+    def test_load_plan_rejects_float_planned_shard_count(self, tmp_path) -> None:
+        path = self._write_plan(
+            tmp_path, lambda body: body.__setitem__("planned_shard_count", 4.0)
+        )
+        with pytest.raises(ValueError, match="planned_shard_count"):
+            load_plan(path)
+
+    def test_shard_rejects_string_average_online_accuracy(self, tmp_path) -> None:
+        def mutate(payload):
+            payload["average_online_accuracy"] = str(payload["average_online_accuracy"])
+
+        with pytest.raises(ValueError, match="average_online_accuracy"):
+            self._merge_mutated_shard(tmp_path, "string_mean", mutate)
+
+    def test_shard_rejects_missing_average_online_accuracy(self, tmp_path) -> None:
+        with pytest.raises(ValueError, match="average_online_accuracy"):
+            self._merge_mutated_shard(
+                tmp_path, "missing_mean", lambda payload: payload.pop("average_online_accuracy")
+            )
+
+    def test_shard_rejects_nested_per_task_curve(self, tmp_path) -> None:
+        def mutate(payload):
+            payload["per_task_accuracy"] = [
+                [value, value] for value in payload["per_task_accuracy"]
+            ]
+
+        with pytest.raises(ValueError, match="per_task_accuracy"):
+            self._merge_mutated_shard(tmp_path, "nested_curve", mutate)
+
+    def test_shard_rejects_boolean_per_task_curve(self, tmp_path) -> None:
+        def mutate(payload):
+            payload["per_task_accuracy"] = [True] * len(payload["per_task_accuracy"])
+            payload["average_online_accuracy"] = 1.0
+
+        with pytest.raises(ValueError, match="per_task_accuracy"):
+            self._merge_mutated_shard(tmp_path, "boolean_curve", mutate)
+
+    def test_shard_rejects_oversized_integer_per_task_accuracy(self, tmp_path) -> None:
+        previous = sys.get_int_max_str_digits()
+        sys.set_int_max_str_digits(0)  # allow the oversized JSON integer literal
+        try:
+            def mutate(payload):
+                payload["per_task_accuracy"] = [10**10000] + list(
+                    payload["per_task_accuracy"][1:]
+                )
+
+            with pytest.raises(ValueError, match="per_task_accuracy"):
+                self._merge_mutated_shard(tmp_path, "oversized_curve", mutate)
+        finally:
+            sys.set_int_max_str_digits(previous)
+
+    def test_shard_rejects_oversized_integer_average_online_accuracy(
+        self, tmp_path
+    ) -> None:
+        previous = sys.get_int_max_str_digits()
+        sys.set_int_max_str_digits(0)  # allow the oversized JSON integer literal
+        try:
+            def mutate(payload):
+                payload["average_online_accuracy"] = 10**10000
+
+            with pytest.raises(ValueError, match="average_online_accuracy"):
+                self._merge_mutated_shard(tmp_path, "oversized_mean", mutate)
+        finally:
+            sys.set_int_max_str_digits(previous)
 
 
 def _legal_label_emnist_run_result(**overrides: object) -> LabelEMNISTRunResult:

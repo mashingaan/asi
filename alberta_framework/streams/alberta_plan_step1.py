@@ -26,6 +26,7 @@ from numbers import Integral, Real
 from typing import cast
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -37,21 +38,7 @@ from alberta_framework.core.normalizers import _saturating_int32_counter_increme
 from alberta_framework.core.types import TimeStep
 
 _INT32_MAX = 2**31 - 1
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
-)
+_ACTUAL_INT_TYPES = frozenset({int, *(np.dtype(code).type for code in "bBhHiIlLqQpP")})
 
 
 def _finite_real_and_float32(name: str, value: object) -> tuple[Real, int, int, float]:
@@ -119,6 +106,52 @@ def _require_int(
     if maximum is not None and number > maximum:
         raise ValueError(f"{name} must be <= {maximum}")
     return number
+
+
+def _require_key(value: object, *, name: str) -> Array:
+    actual_type = type(value)
+    if not (
+        issubclass(actual_type, jax.Array) or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError(f"{name} must be a scalar typed Threefry JAX key")
+    trusted = cast(Array, value)
+    try:
+        words = jr.key_data(trusted)
+        implementation = str(jr.key_impl(trusted))
+    except (TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a scalar typed Threefry JAX key") from error
+    if (
+        trusted.shape != ()
+        or words.shape != (2,)
+        or words.dtype != jnp.dtype(jnp.uint32)
+        or implementation != "threefry2x32"
+    ):
+        raise TypeError(f"{name} must be a scalar typed Threefry JAX key")
+    return trusted
+
+
+def _step1_step_result_extras_bytes(feature_dim: int) -> int:
+    """Returned observation and scalar target bytes, excluding nested persist."""
+    return 4 * feature_dim + 4
+
+
+def _step1_step_working_set_bytes(*, persistent_bytes: int, feature_dim: int) -> int:
+    """Source, proposed, committed persist, and returned step-result leaves."""
+    return 3 * persistent_bytes + _step1_step_result_extras_bytes(feature_dim)
+
+
+def _preflight_step1_step_working_set(
+    name: str, *, persistent_bytes: int, feature_dim: int
+) -> None:
+    """Reject a public step envelope that cannot fit signed-int32 byte accounting."""
+    if (
+        _step1_step_working_set_bytes(
+            persistent_bytes=persistent_bytes,
+            feature_dim=feature_dim,
+        )
+        > _INT32_MAX
+    ):
+        raise ValueError(f"{name} step working set byte count must fit signed int32")
 
 
 @chex.dataclass(frozen=True)
@@ -204,6 +237,11 @@ class AlbertaPlanStep1Stream:
         drift_rate_b_val = _require_nonnegative_real("drift_rate_b", drift_rate_b)
         noise_std_val = _require_nonnegative_real("noise_std", noise_std)
         feature_std_val = _require_positive_real("feature_std", feature_std)
+        _preflight_step1_step_working_set(
+            "AlbertaPlanStep1Stream",
+            persistent_bytes=4 * (feature_dim_val + 4),
+            feature_dim=feature_dim_val,
+        )
 
         self._feature_dim = feature_dim_val
         self._num_relevant = num_relevant_val
@@ -250,7 +288,11 @@ class AlbertaPlanStep1Stream:
 
         Returns:
             Initial stream state with random relevant weights and zero bias.
+
+        Raises:
+            TypeError: If ``key`` is not a scalar typed Threefry JAX key.
         """
+        key = _require_key(key, name="key")
         key, k_init = jr.split(key)
         relevant_init = jr.normal(k_init, (self._num_relevant,), dtype=jnp.float32)
         weights = jnp.zeros(self._feature_dim, dtype=jnp.float32)
@@ -353,7 +395,8 @@ class XDistShiftStream:
         noise_std: Std dev of additive mean-zero target noise (default 0.1).
             Only added to the target when ``noise_in_target=True``.
         scale_change_interval: Steps between scale resamplings (default 2000)
-        scale_min: Minimum per-feature scale, inclusive (default 0.1)
+        scale_min: Minimum per-feature scale, inclusive; must remain a normal
+            float32 value (default 0.1)
         scale_max: Maximum per-feature scale, exclusive (default 10.0)
         noise_in_target: If True, add Gaussian noise to the target. If False,
             the target is exactly ``w* . x``.
@@ -408,6 +451,8 @@ class XDistShiftStream:
             )
         narrowed_scale_min = float(np.float32(scale_min_val))
         narrowed_scale_max = float(np.float32(scale_max_val))
+        if narrowed_scale_min < float(np.finfo(np.float32).tiny):
+            raise ValueError("scale_min must be representable as a normal float32 value")
         if narrowed_scale_min >= narrowed_scale_max:
             raise ValueError(
                 f"scale_min ({scale_min_val}) must remain less than "
@@ -418,6 +463,11 @@ class XDistShiftStream:
             noise_in_target_val = bool(noise_in_target)
         else:
             raise TypeError("noise_in_target must be a boolean")
+        _preflight_step1_step_working_set(
+            "XDistShiftStream",
+            persistent_bytes=4 * (2 * feature_dim_val + 3),
+            feature_dim=feature_dim_val,
+        )
 
         self._feature_dim = feature_dim_val
         self._num_relevant = num_relevant_val
@@ -471,7 +521,11 @@ class XDistShiftStream:
         Returns:
             Initial stream state with a fixed target function and an initial
             per-feature scale vector.
+
+        Raises:
+            TypeError: If ``key`` is not a scalar typed Threefry JAX key.
         """
+        key = _require_key(key, name="key")
         key, k_w, k_scales = jr.split(key, 3)
         relevant_w = jr.normal(k_w, (self._num_relevant,), dtype=jnp.float32)
         weights = jnp.zeros(self._feature_dim, dtype=jnp.float32)

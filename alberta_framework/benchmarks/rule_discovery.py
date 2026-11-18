@@ -452,8 +452,29 @@ def init_rule_state(params: dict[str, Array]) -> RuleState:
 
 
 def _rms_mix(hidden: Array, f_rms: Array) -> Array:
-    rms = jnp.sqrt(jnp.mean(hidden * hidden) + _EPS)
-    return f_rms * (hidden / rms) + (1.0 - f_rms) * hidden
+    """Scale hidden units by their root-mean-square when the flag is on.
+
+    If the mean of squares overflows for finite inputs, normalize the scaled
+    activations directly to preserve their relative values and gradients.
+    """
+    use_fallback = jnp.all(jnp.isfinite(hidden)) & ~jnp.isfinite(jnp.mean(hidden * hidden))
+
+    def scaled_direction(values: Array) -> Array:
+        _, exponent = jnp.frexp(jnp.max(jnp.abs(values)))
+        scaled = jnp.ldexp(values, -exponent)
+        epsilon = jnp.ldexp(jnp.asarray(_EPS, dtype=values.dtype), -2 * exponent)
+        return scaled / jnp.sqrt(jnp.mean(scaled * scaled) + epsilon)
+
+    direction = cast(
+        Array,
+        jax.lax.cond(
+            use_fallback,
+            scaled_direction,
+            lambda values: values / jnp.sqrt(jnp.mean(values * values) + _EPS),
+            hidden,
+        ),
+    )
+    return f_rms * direction + (1.0 - f_rms) * hidden
 
 
 def _loss_logits(
@@ -465,6 +486,64 @@ def _loss_logits(
     hidden = _rms_mix(hidden, f_rms)
     logits = hidden @ params["w3"] + params["b3"]
     return -jax.nn.log_softmax(logits)[y], (logits, hidden)
+
+
+def _nb_vote_log_probs(nb_ll: Array, scale: float) -> Array:
+    """Return the naive-Bayes ensemble-member vote log-probabilities.
+
+    Regression guard for the SlopDotCash/asi#2886 rule-discovery site: XLA
+    recomputes the quotient ``nb_ll / scale`` (an inexact reciprocal multiply
+    for a non-power-of-two ``scale``) inside both fusions that log-softmax
+    lowers to, so the compiled normalisation returns ``inf``/``0/0`` once
+    ``|nb_ll / scale|`` reaches about 2**31 while eager stays finite. The
+    compiled ``inf`` vote then wins ``argmax`` deterministically and silently
+    corrupts the member-accuracy EMAs and the arm's accuracy telemetry.
+    Subtracting a maximum on both sides of the scale blocks both
+    recomputations; log-softmax is shift invariant, so both subtractions are
+    exact rather than approximations. ``stop_gradient`` keeps the maxima fixed
+    points out of any differentiation through the vote.
+    """
+    centered = nb_ll - jax.lax.stop_gradient(jnp.max(nb_ll))
+    scaled = centered / scale
+    return jax.nn.log_softmax(scaled - jax.lax.stop_gradient(jnp.max(scaled)))
+
+
+def _naive_bayes_log_likelihood(
+    observation: Array,
+    mean: Array,
+    variance: Array,
+) -> Array:
+    """Return class log-likelihoods without an overflowing square sum.
+
+    Every finite direct sum stays ``-0.5 * sum`` bit for bit, and an
+    overflowing class stays ``-inf`` below them.  Only when every class
+    total overflows does ``-0.5 * inf`` make the whole vector ``-inf``;
+    log-softmax of that vector is NaN, so the vote selects class 0.  In that
+    case power-of-two scaling ranks the totals by their real magnitude.  The
+    ``log(variance)`` terms are dropped there, since they are negligible next
+    to a squared deviation above the float32 range.
+    """
+    delta = observation[None, :] - mean
+    terms = jnp.log(variance) + jnp.square(delta) / variance
+    direct = jnp.sum(terms, axis=-1)
+    finite_ll = jnp.asarray(-0.5, dtype=jnp.float32) * direct
+    max_abs = jnp.max(jnp.abs(delta), axis=-1)
+    present = max_abs > 0.0
+    safe_abs = jnp.where(present, max_abs, jnp.ones_like(max_abs))
+    exponent = jnp.frexp(safe_abs)[1]
+    scaled = jnp.ldexp(delta, -exponent[:, None])
+    scaled_sq = jnp.sum(jnp.square(scaled) / variance, axis=-1)
+    log_two = jnp.log(jnp.asarray(2.0, dtype=jnp.float32))
+    positive_sq = jnp.where(scaled_sq > 0.0, scaled_sq, jnp.ones_like(scaled_sq))
+    log_sq = jnp.log(positive_sq)
+    log_sq = log_sq + jnp.where(
+        present,
+        jnp.asarray(2.0, dtype=jnp.float32) * exponent.astype(jnp.float32) * log_two,
+        jnp.zeros_like(log_sq),
+    )
+    log_sq = jnp.where(scaled_sq > 0.0, log_sq, jnp.full_like(log_sq, -jnp.inf))
+    ranked = -log_sq
+    return jnp.where(jnp.any(jnp.isfinite(direct)), finite_ll, ranked)
 
 
 def rule_step(
@@ -553,14 +632,10 @@ def rule_step(
     rls_scores = jnp.clip(h_aug @ state.rls_w, -_RLS_SCORE_CLIP, _RLS_SCORE_CLIP)
     input_dim = x_used.shape[0]
     nb_var_safe = jnp.maximum(state.nb_var, _NB_VAR_FLOOR)
-    nb_ll = -0.5 * jnp.sum(
-        jnp.log(nb_var_safe)
-        + (x_used[None, :] - state.nb_mean) ** 2 / nb_var_safe,
-        axis=1,
-    )
+    nb_ll = _naive_bayes_log_likelihood(x_used, state.nb_mean, nb_var_safe)
     s_net = jax.nn.log_softmax(logits)
     s_rls = jax.nn.log_softmax(_RLS_VOTE_TEMP * rls_scores)
-    s_nb = jax.nn.log_softmax(nb_ll / float(input_dim))
+    s_nb = _nb_vote_log_probs(nb_ll, float(input_dim))
     w_net = state.member_acc[0]
     w_rls = f_rls * state.member_acc[1]
     w_nb = f_nb * state.member_acc[2]
@@ -604,8 +679,11 @@ def rule_step(
         # ratio**+1; exponent zero (flag off) is exactly 1.0.
         lr_name = lr_eff * jnp.power(p_lratio, f_layer * _LAYER_EXPONENT[name])
         decay_factor = 1.0 - lr_name * p_wd
+        # A blank input can leave the maximum utility at zero. Avoid 0/0
+        # even when the gate is disabled, since zero times NaN is still NaN.
+        utility_scale = jnp.where(global_max == 0.0, _EPS, global_max)
         gate = jax.nn.sigmoid(
-            p_beta * (utility[name] / bias_correction) / global_max
+            p_beta * (utility[name] / bias_correction) / utility_scale
         )
         stepped = (
             params[name] * decay_factor

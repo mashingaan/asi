@@ -2,7 +2,9 @@
 """Integrated Step 2-4 pipeline tests."""
 
 import json
+from dataclasses import replace
 from fractions import Fraction
+from types import SimpleNamespace
 
 import chex
 import jax
@@ -13,6 +15,7 @@ import pytest
 from jax import Array
 
 import alberta_framework as af
+import alberta_framework.pipeline as pipeline_module
 from alberta_framework.pipeline import (
     AlbertaPipeline,
     AlbertaPipelineConfig,
@@ -429,6 +432,149 @@ def test_pipeline_with_horde_ac_control_smoke() -> None:
     smoke = run_pipeline_smoke(config, steps=4, seed=2)
     assert smoke.finite
     assert smoke.q_values_shape == (4, 2)
+
+
+def _terminating_horde_ac_config() -> AlbertaPipelineConfig:
+    """Horde-AC config with a bootstrapping value head and a live actor trace."""
+    return AlbertaPipelineConfig(
+        features=Step2FeatureConfig.identity(observation_dim=3),
+        horde=Step3HordeConfig(
+            gammas=(0.9, 0.5),
+            lamdas=(0.0, 0.0),
+            hidden_sizes=(),
+            step_size=0.05,
+            use_obgd=True,
+            obgd_kappa=1.0,
+        ),
+        control=Step4SARSAConfig(
+            n_actions=2,
+            hidden_sizes=(),
+            epsilon_start=0.0,
+            epsilon_end=0.0,
+            step_size=0.05,
+            bounder_kappa=1.0,
+        ),
+        horde_ac=HordeActorCriticPipelineConfig(
+            n_actions=2,
+            actor_step_size=0.02,
+            actor_lamda=0.8,
+            value_head_index=0,
+        ),
+        control_mode="horde_ac",
+    )
+
+
+def test_pipeline_horde_ac_honors_terminated_discount() -> None:
+    """Regression for #2344: ``horde_ac`` must honor ``terminated``.
+
+    On the ``control_mode="horde_ac"`` path the pipeline previously dropped the
+    ``terminated`` flag, so the value head bootstrapped through episode
+    boundaries and the actor eligibility trace survived every termination. This
+    checks that at a terminal transition the value head's TD target collapses to
+    the bare reward and the actor trace is zeroed, that the auxiliary demon keeps
+    its own configured gamma, and that the non-terminal path is bit-identical to
+    the pre-fix behavior.
+    """
+    config = _terminating_horde_ac_config()
+    pipeline = make_alberta_pipeline(config)
+    value_index = config.horde_ac.value_head_index
+
+    state = pipeline.init(jr.key(0), jnp.asarray([0.2, -0.1, 0.4], dtype=jnp.float32))
+    obs = jnp.asarray([0.1, 0.3, -0.2], dtype=jnp.float32)
+    reward = jnp.asarray(0.5, dtype=jnp.float32)
+    cumulants = jnp.asarray([0.5, -0.2], dtype=jnp.float32)
+
+    non_terminal = pipeline.update(
+        state, obs, reward, jnp.asarray(0.0, dtype=jnp.float32), cumulants
+    )
+    terminal = pipeline.update(
+        state, obs, reward, jnp.asarray(1.0, dtype=jnp.float32), cumulants
+    )
+
+    # (a) At termination the value head does not bootstrap: target == reward.
+    assert float(terminal.horde_td_targets[value_index]) == float(reward)
+    # The non-terminal value target genuinely bootstraps (target != reward),
+    # so the terminal collapse is a real behavioral change, not a no-op.
+    assert float(non_terminal.horde_td_targets[value_index]) != float(reward)
+
+    # (b) The actor eligibility trace is zeroed at the episode boundary.
+    terminal_trace = terminal.state.control_state.actor_trace_weights
+    np.testing.assert_array_equal(terminal_trace, jnp.zeros_like(terminal_trace))
+    # The non-terminal trace still carries accumulated eligibility.
+    non_terminal_trace = non_terminal.state.control_state.actor_trace_weights
+    assert float(jnp.max(jnp.abs(non_terminal_trace))) > 0.0
+
+    # Only the value head's discount is a per-transition control quantity:
+    # the auxiliary demon keeps its configured gamma across the boundary.
+    aux_index = 1 - value_index
+    chex.assert_trees_all_equal(
+        terminal.horde_td_targets[aux_index],
+        non_terminal.horde_td_targets[aux_index],
+    )
+
+    # (c) The ``terminated=0.0`` path is bit-exact with the pre-fix behavior:
+    # passing the value head's own gamma reduces to omitting ``discount``.
+    np.testing.assert_array_equal(
+        np.asarray(non_terminal.horde_td_targets),
+        np.asarray([0.34537804, -0.18965168], dtype=np.float32),
+    )
+
+
+def test_pipeline_horde_ac_termination_clears_value_head_critic_trace() -> None:
+    """``terminated`` must also end the value head's critic eligibility.
+
+    With a value head that keeps a trace (lambda 0.8), the terminal transition
+    clears the actor trace and must clear the value head's critic trace too.
+    Otherwise the first update of the next episode moves the weight of a
+    feature that was only active in the finished episode.
+    """
+    config = AlbertaPipelineConfig(
+        features=Step2FeatureConfig.identity(observation_dim=3),
+        horde=Step3HordeConfig(
+            gammas=(0.0, 0.9),
+            lamdas=(0.0, 0.8),
+            hidden_sizes=(),
+            step_size=0.1,
+            use_obgd=False,
+            use_layer_norm=False,
+        ),
+        control=Step4SARSAConfig(n_actions=2, hidden_sizes=()),
+        horde_ac=HordeActorCriticPipelineConfig(
+            n_actions=2,
+            actor_step_size=0.02,
+            actor_lamda=0.8,
+            value_head_index=1,
+        ),
+        control_mode="horde_ac",
+    )
+    pipeline = make_alberta_pipeline(config)
+    cumulants = jnp.zeros(2, dtype=jnp.float32)
+    reward = jnp.asarray(1.0, dtype=jnp.float32)
+    state = pipeline.init(jr.key(0), jnp.asarray([1.0, 0.0, 0.0], dtype=jnp.float32))
+
+    # The finished episode's only state is feature 0; the next one starts at 1.
+    terminal = pipeline.update(
+        state,
+        jnp.asarray([0.0, 1.0, 0.0], dtype=jnp.float32),
+        reward,
+        jnp.asarray(1.0, dtype=jnp.float32),
+        cumulants,
+    )
+    w_trace, b_trace = terminal.state.horde_state.head_traces[1]
+    np.testing.assert_array_equal(w_trace, jnp.zeros_like(w_trace))
+    np.testing.assert_array_equal(b_trace, jnp.zeros_like(b_trace))
+    weight_before = terminal.state.horde_state.head_params.weights[1][0, 0]
+    assert float(weight_before) != 0.0
+
+    following = pipeline.update(
+        terminal.state,
+        jnp.asarray([0.0, 0.0, 1.0], dtype=jnp.float32),
+        reward,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        cumulants,
+    )
+    assert int(following.state.step_count) == 2
+    assert float(following.state.horde_state.head_params.weights[1][0, 0]) == float(weight_before)
 
 
 def test_pipeline_with_associative_step2_smoke() -> None:
@@ -1153,7 +1299,8 @@ def test_associative_pipeline_requires_exact_label_shapes() -> None:
 
 def test_associative_pipeline_rejects_wide_integer_dtypes_eager_and_jit() -> None:
     pipeline = make_alberta_pipeline(_small_associative_config())
-    with jax.enable_x64():
+    enable_x64 = jax.enable_x64 if hasattr(jax, "enable_x64") else jax.experimental.enable_x64
+    with enable_x64():
         wide_context = jnp.asarray([1, 2, 3, 4, 2**32], dtype=jnp.uint64)
         with pytest.raises(ValueError, match="representable as int32"):
             pipeline.init(jr.key(0), wide_context)
@@ -1196,3 +1343,129 @@ def test_associative_pipeline_narrows_only_statically_safe_integer_dtypes() -> N
 
 # silence the import lint warnings used in the test runner
 _ = jax
+
+
+def test_upgd_run_arrays_without_targets_keeps_the_trunk_frozen() -> None:
+    config = AlbertaPipelineConfig(
+        step2="upgd",
+        upgd=Step2UPGDConfig(observation_dim=4, n_heads=1, hidden_sizes=(8,)),
+    )
+    pipeline = make_alberta_pipeline(config)
+    steps = 40
+    observations = jr.normal(jr.key(1), (steps + 1, 4), dtype=jnp.float32)
+    state = pipeline.init(jr.key(0), observations[0])
+
+    result = pipeline.run_arrays(
+        state,
+        observations[1:],
+        jnp.tanh(observations[1:, 0]),
+        jnp.zeros((steps,), dtype=jnp.float32),
+        observations[1:, jnp.arange(config.horde.n_demons) % 4],
+    )
+
+    assert state.upgd_state is not None
+    assert result.state.upgd_state is not None
+    chex.assert_trees_all_equal(
+        result.state.upgd_state.trunk_params, state.upgd_state.trunk_params
+    )
+    chex.assert_trees_all_equal(
+        result.state.upgd_state.head_params, state.upgd_state.head_params
+    )
+
+
+def test_associative_pipeline_update_uses_float32_default_cumulants() -> None:
+    """Omitted cumulants fall back to float32 channels of integer token observations."""
+    pipeline = make_alberta_pipeline(_small_associative_config())
+    state = pipeline.init(jr.key(0), jnp.asarray([1, 2, 3, 4, 5], dtype=jnp.int32))
+
+    result = pipeline.update(
+        state,
+        jnp.asarray([2, 3, 4, 5, 6], dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+    )
+
+    assert int(result.state.step_count) == 1
+    # gamma=0 makes the single demon's TD target exactly its cumulant: channel 0.
+    chex.assert_trees_all_close(
+        result.horde_td_targets, jnp.asarray([2.0], dtype=jnp.float32)
+    )
+    cumulants = observation_channel_cumulant_fn(n_demons=3, observation_dim=2)(
+        jnp.asarray([7, 9], dtype=jnp.int32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    assert cumulants.dtype == jnp.float32
+    chex.assert_trees_all_close(cumulants, jnp.asarray([7.0, 9.0, 7.0], dtype=jnp.float32))
+
+
+
+def test_pipeline_array_horde_clocks_preserve_initialized_host_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter([100.0, 100.25, 100.25, 100.5])
+    monkeypatch.setattr(
+        pipeline_module,
+        "time",
+        SimpleNamespace(time=lambda: next(clock)),
+    )
+    pipeline = make_alberta_pipeline(_small_pipeline_config())
+    initial = pipeline.init(jr.key(0), jnp.zeros(3, dtype=jnp.float32))
+    initial = initial.replace(
+        horde_state=initial.horde_state.replace(uptime_s=7.0),
+    )
+    observations = jnp.ones((2, 3), dtype=jnp.float32)
+    rewards = jnp.asarray([0.5, -0.25], dtype=jnp.float32)
+    terminated = jnp.zeros(2, dtype=jnp.float32)
+    cumulants = jnp.ones((2, 2), dtype=jnp.float32)
+    assert type(initial.horde_state.birth_timestamp) is float
+    current = initial
+    expected_uptime = (7.25, 7.5)
+    for uptime in expected_uptime:
+        result = pipeline.run_arrays(current, observations, rewards, terminated, cumulants)
+        current = result.state
+        assert type(current.horde_state.birth_timestamp) is float
+        assert current.horde_state.birth_timestamp == initial.horde_state.birth_timestamp
+        assert type(current.horde_state.uptime_s) is float
+        assert current.horde_state.uptime_s == uptime
+    assert int(current.step_count) == 4
+
+
+@pytest.mark.parametrize(
+    "make_config",
+    [_small_pipeline_config, _small_upgd_config, _small_horde_ac_config],
+)
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_pipeline_init_rejects_nonfinite_first_features(
+    make_config,
+    bad_value: float,
+) -> None:
+    config = make_config()
+    if config.step2 == "temporal_context":
+        config = replace(config, step2="identity")
+    pipeline = make_alberta_pipeline(config)
+    observation = jnp.full((config.features.observation_dim,), 0.5, dtype=jnp.float32)
+
+    with pytest.raises(ValueError, match="initial features must contain only finite"):
+        pipeline.init(jr.key(0), observation.at[0].set(bad_value))
+
+
+def test_pipeline_init_accepts_context_features_that_reject_a_nonfinite_observation() -> None:
+    config = AlbertaPipelineConfig(
+        features=Step2FeatureConfig(observation_dim=3),
+        horde=_small_pipeline_config().horde,
+        control=_small_pipeline_config().control,
+    )
+    pipeline = make_alberta_pipeline(config)
+    good = jnp.full((3,), 0.5, dtype=jnp.float32)
+
+    state = pipeline.init(jr.key(0), good.at[0].set(jnp.nan))
+    result = pipeline.update(
+        state,
+        good,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.asarray(0.0, dtype=jnp.float32),
+    )
+
+    assert int(result.action) >= 0
+    assert int(result.state.step_count) == 1
